@@ -38,9 +38,9 @@ mod tests {
             default_ttl: Some(Duration::from_secs(3600)),
             default_tti: None,
             raft: RaftConfig {
-                election_tick: 5,        // 5 ticks = 500ms with 100ms tick
-                heartbeat_tick: 2,       // 2 ticks = 200ms
-                tick_interval_ms: 100,   // 100ms per tick
+                election_tick: 5,      // 5 ticks = 500ms with 100ms tick
+                heartbeat_tick: 2,     // 2 ticks = 200ms
+                tick_interval_ms: 100, // 100ms per tick
                 max_size_per_msg: 1024 * 1024,
                 max_inflight_msgs: 256,
                 pre_vote: true,
@@ -84,12 +84,7 @@ mod tests {
             raft: RaftConfig {
                 // 改进点：使用 100ms 作为基础 Tick
                 tick_interval_ms: 100,
-
-                // 改进点：确保 election_tick 远大于 heartbeat_tick
-                // 建议：base + (node_id 扰动) + (随机扰动)
-                // 这里为了简单，先用 node_id 拉开差距，防止同时超时
                 election_tick: base_election_tick + (node_id as usize * 5),
-
                 heartbeat_tick: 2,
                 max_size_per_msg: 1024 * 1024,
                 max_inflight_msgs: 256,
@@ -343,7 +338,11 @@ mod tests {
         let result3 = cache
             .put_with_ttl("key3", "value3", Duration::from_secs(60))
             .await;
-        assert!(result3.is_ok(), "Put with TTL should succeed: {:?}", result3);
+        assert!(
+            result3.is_ok(),
+            "Put with TTL should succeed: {:?}",
+            result3
+        );
 
         // Verify data is readable
         let val1 = cache.get(b"key1").await;
@@ -502,9 +501,18 @@ mod tests {
         assert!(became_leader, "Node should become leader");
 
         // Add some data
-        cache.put("key1", "value1").await.expect("Put should succeed");
-        cache.put("key2", "value2").await.expect("Put should succeed");
-        cache.put("key3", "value3").await.expect("Put should succeed");
+        cache
+            .put("key1", "value1")
+            .await
+            .expect("Put should succeed");
+        cache
+            .put("key2", "value2")
+            .await
+            .expect("Put should succeed");
+        cache
+            .put("key3", "value3")
+            .await
+            .expect("Put should succeed");
 
         // Run pending tasks to ensure Moka cache reflects updates
         cache.run_pending_tasks().await;

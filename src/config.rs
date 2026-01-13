@@ -272,6 +272,14 @@ pub struct MemberlistConfig {
 
     /// Whether to automatically remove failed peers from Raft transport.
     pub auto_remove_peers: bool,
+
+    /// Whether to automatically propose ConfChange to add discovered nodes as Raft voters.
+    /// Only the leader will propose ConfChange. Requires auto_add_peers to be true.
+    pub auto_add_voters: bool,
+
+    /// Whether to automatically propose ConfChange to remove failed nodes from Raft voters.
+    /// Only the leader will propose ConfChange. Requires auto_remove_peers to be true.
+    pub auto_remove_voters: bool,
 }
 
 impl Default for MemberlistConfig {
@@ -284,6 +292,8 @@ impl Default for MemberlistConfig {
             node_name: None,
             auto_add_peers: true,
             auto_remove_peers: false, // Conservative default
+            auto_add_voters: false,   // Conservative default - requires explicit opt-in
+            auto_remove_voters: false, // Conservative default
         }
     }
 }
@@ -331,6 +341,20 @@ impl MemberlistConfig {
     /// Enable automatic peer removal.
     pub fn with_auto_remove_peers(mut self, enabled: bool) -> Self {
         self.auto_remove_peers = enabled;
+        self
+    }
+
+    /// Enable automatic voter addition via Raft ConfChange.
+    /// When enabled, the leader will propose ConfChange to add newly discovered nodes as voters.
+    pub fn with_auto_add_voters(mut self, enabled: bool) -> Self {
+        self.auto_add_voters = enabled;
+        self
+    }
+
+    /// Enable automatic voter removal via Raft ConfChange.
+    /// When enabled, the leader will propose ConfChange to remove failed nodes from voters.
+    pub fn with_auto_remove_voters(mut self, enabled: bool) -> Self {
+        self.auto_remove_voters = enabled;
         self
     }
 

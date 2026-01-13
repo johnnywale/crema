@@ -93,7 +93,7 @@ impl DistributedCache {
         // Add peers to transport using their actual node IDs
         for (peer_id, addr) in &config.seed_nodes {
             if *peer_id != config.node_id {
-                raft.transport().add_peer(*peer_id, *addr);
+                raft.transport().add_peer(*peer_id, *addr).await;
             }
         }
 
@@ -177,6 +177,8 @@ impl DistributedCache {
                     let ml_for_events = memberlist.clone();
                     let auto_add = config.memberlist.auto_add_peers;
                     let auto_remove = config.memberlist.auto_remove_peers;
+                    let auto_add_voters = config.memberlist.auto_add_voters;
+                    let auto_remove_voters = config.memberlist.auto_remove_voters;
 
                     tokio::spawn(async move {
                         Self::run_memberlist_event_loop(
@@ -185,6 +187,8 @@ impl DistributedCache {
                             ml_shutdown_rx,
                             auto_add,
                             auto_remove,
+                            auto_add_voters,
+                            auto_remove_voters,
                         )
                         .await;
                     });
@@ -224,6 +228,8 @@ impl DistributedCache {
         mut shutdown_rx: mpsc::Receiver<()>,
         auto_add_peers: bool,
         auto_remove_peers: bool,
+        auto_add_voters: bool,
+        auto_remove_voters: bool,
     ) {
         info!("Starting memberlist event processing loop");
 
@@ -247,7 +253,9 @@ impl DistributedCache {
                             &raft,
                             auto_add_peers,
                             auto_remove_peers,
-                        );
+                            auto_add_voters,
+                            auto_remove_voters,
+                        ).await;
                     }
                 }
             }
@@ -255,11 +263,13 @@ impl DistributedCache {
     }
 
     /// Handle a single memberlist event.
-    fn handle_memberlist_event(
+    async fn handle_memberlist_event(
         event: &MemberlistEvent,
         raft: &Arc<RaftNode>,
         auto_add_peers: bool,
         auto_remove_peers: bool,
+        auto_add_voters: bool,
+        auto_remove_voters: bool,
     ) {
         match event {
             MemberlistEvent::NodeJoin {
@@ -275,8 +285,29 @@ impl DistributedCache {
 
                 if auto_add_peers {
                     // Add to Raft transport so we can communicate
-                    raft.transport().add_peer(*raft_id, *raft_addr);
+                    raft.transport().add_peer(*raft_id, *raft_addr).await;
                     debug!(raft_id = *raft_id, "Added peer to Raft transport");
+                }
+
+                // Propose ConfChange to add as voter if we're the leader
+                if auto_add_voters && raft.is_leader() {
+                    info!(
+                        raft_id = *raft_id,
+                        raft_addr = %raft_addr,
+                        "Leader proposing ConfChange to add new voter"
+                    );
+                    match raft.add_voter(*raft_id, *raft_addr).await {
+                        Ok(()) => {
+                            info!(raft_id = *raft_id, "Successfully proposed adding voter");
+                        }
+                        Err(e) => {
+                            warn!(
+                                raft_id = *raft_id,
+                                error = %e,
+                                "Failed to propose adding voter"
+                            );
+                        }
+                    }
                 }
             }
 
@@ -287,6 +318,26 @@ impl DistributedCache {
                     // Remove from Raft transport
                     raft.transport().remove_peer(*raft_id);
                     debug!(raft_id = *raft_id, "Removed peer from Raft transport");
+                }
+
+                // Propose ConfChange to remove voter if we're the leader
+                if auto_remove_voters && raft.is_leader() {
+                    info!(
+                        raft_id = *raft_id,
+                        "Leader proposing ConfChange to remove voter"
+                    );
+                    match raft.remove_voter(*raft_id).await {
+                        Ok(()) => {
+                            info!(raft_id = *raft_id, "Successfully proposed removing voter");
+                        }
+                        Err(e) => {
+                            warn!(
+                                raft_id = *raft_id,
+                                error = %e,
+                                "Failed to propose removing voter"
+                            );
+                        }
+                    }
                 }
             }
 
@@ -301,6 +352,26 @@ impl DistributedCache {
                         "Removed failed peer from Raft transport"
                     );
                 }
+
+                // Propose ConfChange to remove voter if we're the leader
+                if auto_remove_voters && raft.is_leader() {
+                    info!(
+                        raft_id = *raft_id,
+                        "Leader proposing ConfChange to remove failed voter"
+                    );
+                    match raft.remove_voter(*raft_id).await {
+                        Ok(()) => {
+                            info!(raft_id = *raft_id, "Successfully proposed removing voter");
+                        }
+                        Err(e) => {
+                            warn!(
+                                raft_id = *raft_id,
+                                error = %e,
+                                "Failed to propose removing voter"
+                            );
+                        }
+                    }
+                }
             }
 
             MemberlistEvent::NodeUpdate { raft_id, metadata } => {
@@ -312,7 +383,9 @@ impl DistributedCache {
 
                 // Update address in case it changed
                 if auto_add_peers {
-                    raft.transport().add_peer(*raft_id, metadata.raft_addr);
+                    raft.transport()
+                        .add_peer(*raft_id, metadata.raft_addr)
+                        .await;
                 }
             }
         }
@@ -324,7 +397,29 @@ impl DistributedCache {
     ///
     /// This reads directly from the local Moka cache. On followers, this may
     /// return stale data. For strongly consistent reads, use `get_consistent`.
+    ///
+    /// Note: This method implements a Read-Index style wait to ensure the local
+    /// state machine has caught up to the known commit index before reading.
+    /// This helps avoid stale reads in test scenarios (TC23 fix).
     pub async fn get(&self, key: &[u8]) -> Option<Bytes> {
+        // Read-Index: Wait for state machine to apply up to commit_index
+        let commit_index = self.raft.commit_index();
+        let start = std::time::Instant::now();
+        let max_wait = Duration::from_secs(1);
+
+        while self.raft.applied_index() < commit_index {
+            if start.elapsed() > max_wait {
+                warn!(
+                    "Read-Index wait timeout: applied={} commit={}",
+                    self.raft.applied_index(),
+                    commit_index
+                );
+                break;
+            }
+            // Use yield_now() for minimal latency instead of sleep
+            tokio::task::yield_now().await;
+        }
+
         self.storage.get(key).await
     }
 
@@ -359,8 +454,24 @@ impl DistributedCache {
         let key = key.into();
         let value = value.into();
 
+        let key_preview = String::from_utf8_lossy(&key[..std::cmp::min(key.len(), 32)]);
+        info!(
+            node_id = self.config.node_id,
+            key = %key_preview,
+            value_len = value.len(),
+            "PUT: Submitting to Raft for replication"
+        );
+
         let command = CacheCommand::put(key.to_vec(), value.to_vec());
-        self.raft.propose(command).await?;
+        let result = self.raft.propose(command).await?;
+
+        info!(
+            node_id = self.config.node_id,
+            key = %key_preview,
+            raft_index = result.index,
+            raft_term = result.term,
+            "PUT: Successfully replicated via Raft"
+        );
 
         Ok(())
     }
@@ -375,8 +486,25 @@ impl DistributedCache {
         let key = key.into();
         let value = value.into();
 
+        let key_preview = String::from_utf8_lossy(&key[..std::cmp::min(key.len(), 32)]);
+        info!(
+            node_id = self.config.node_id,
+            key = %key_preview,
+            value_len = value.len(),
+            ttl_ms = ttl.as_millis(),
+            "PUT_TTL: Submitting to Raft for replication"
+        );
+
         let command = CacheCommand::put_with_ttl(key.to_vec(), value.to_vec(), ttl);
-        self.raft.propose(command).await?;
+        let result = self.raft.propose(command).await?;
+
+        info!(
+            node_id = self.config.node_id,
+            key = %key_preview,
+            raft_index = result.index,
+            raft_term = result.term,
+            "PUT_TTL: Successfully replicated via Raft"
+        );
 
         Ok(())
     }
@@ -385,16 +513,43 @@ impl DistributedCache {
     pub async fn delete(&self, key: impl Into<Bytes>) -> Result<()> {
         let key = key.into();
 
+        let key_preview = String::from_utf8_lossy(&key[..std::cmp::min(key.len(), 32)]);
+        info!(
+            node_id = self.config.node_id,
+            key = %key_preview,
+            "DELETE: Submitting to Raft for replication"
+        );
+
         let command = CacheCommand::delete(key.to_vec());
-        self.raft.propose(command).await?;
+        let result = self.raft.propose(command).await?;
+
+        info!(
+            node_id = self.config.node_id,
+            key = %key_preview,
+            raft_index = result.index,
+            raft_term = result.term,
+            "DELETE: Successfully replicated via Raft"
+        );
 
         Ok(())
     }
 
     /// Clear all entries from the cache.
     pub async fn clear(&self) -> Result<()> {
+        info!(
+            node_id = self.config.node_id,
+            "CLEAR: Submitting to Raft for replication"
+        );
+
         let command = CacheCommand::clear();
-        self.raft.propose(command).await?;
+        let result = self.raft.propose(command).await?;
+
+        info!(
+            node_id = self.config.node_id,
+            raft_index = result.index,
+            raft_term = result.term,
+            "CLEAR: Successfully replicated via Raft"
+        );
 
         Ok(())
     }
@@ -458,6 +613,17 @@ impl DistributedCache {
         self.config.node_id
     }
 
+    /// Get the current voters in the Raft cluster.
+    /// This is useful for debugging and verifying cluster configuration.
+    pub fn voters(&self) -> Vec<NodeId> {
+        self.raft.voters()
+    }
+
+    /// Check if a given node ID is a known voter in this cluster.
+    pub fn is_known_voter(&self, node_id: NodeId) -> bool {
+        self.raft.is_known_voter(node_id)
+    }
+
     // ==================== Memberlist ====================
 
     /// Check if memberlist gossip is enabled and running.
@@ -485,7 +651,10 @@ impl DistributedCache {
 
     /// Shutdown the distributed cache.
     pub async fn shutdown(&self) {
-        info!("Shutting down distributed cache");
+        info!(
+            node_id = self.config.node_id,
+            "Shutting down distributed cache"
+        );
 
         // Shutdown memberlist event loop first
         if let Some(ref tx) = self.memberlist_shutdown_tx {
@@ -496,10 +665,10 @@ impl DistributedCache {
         if let Some(ref ml) = self.memberlist {
             let mut ml = ml.lock();
             if let Err(e) = ml.leave().await {
-                warn!(error = %e, "Error leaving memberlist");
+                warn!(   node_id = self.config.node_id,error = %e, "Error leaving memberlist");
             }
             if let Err(e) = ml.shutdown().await {
-                warn!(error = %e, "Error shutting down memberlist");
+                warn!(   node_id = self.config.node_id,error = %e, "Error shutting down memberlist");
             }
         }
 

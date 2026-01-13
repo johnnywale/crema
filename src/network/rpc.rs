@@ -140,6 +140,32 @@ pub fn encode_message(msg: &Message) -> Result<Vec<u8>, bincode::Error> {
     bincode::serialize(msg)
 }
 
+/// Zero-copy encoding: encode message directly into a BytesMut buffer.
+/// Returns the number of bytes written.
+///
+/// This is more efficient than encode_message when you already have a BytesMut
+/// buffer to write into, as it avoids intermediate allocations.
+pub fn encode_message_into(msg: &Message, buffer: &mut bytes::BytesMut) -> Result<usize, bincode::Error> {
+    // First, calculate the serialized size
+    let size = bincode::serialized_size(msg)? as usize;
+
+    // Reserve space for length prefix + message
+    buffer.reserve(4 + size);
+
+    // Write length prefix
+    buffer.extend_from_slice(&(size as u32).to_be_bytes());
+
+    // Get the current length and extend buffer with zeros
+    let start = buffer.len();
+    buffer.resize(start + size, 0);
+
+    // Serialize directly into the buffer
+    let mut cursor = std::io::Cursor::new(&mut buffer[start..]);
+    bincode::serialize_into(&mut cursor, msg)?;
+
+    Ok(4 + size)
+}
+
 /// Decode a message from bytes.
 pub fn decode_message(data: &[u8]) -> Result<Message, bincode::Error> {
     bincode::deserialize(data)

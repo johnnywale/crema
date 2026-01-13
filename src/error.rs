@@ -129,6 +129,26 @@ pub enum StorageError {
     #[error("snapshot not found")]
     SnapshotNotFound,
 
+    /// Non-contiguous entries within a single append operation.
+    ///
+    /// This indicates that the entries slice itself contains a gap.
+    /// The prev_index is followed by curr_index, but they should be consecutive.
+    #[error("non-contiguous entries in append: index {prev_index} followed by {curr_index}")]
+    NonContiguous {
+        prev_index: u64,
+        curr_index: u64,
+    },
+
+    /// Log gap detected - entries are not contiguous with existing log.
+    ///
+    /// This indicates a critical bug in the upper layer or data corruption.
+    /// The last_index is the highest index currently in the log,
+    /// and first_new is the index of the first entry being appended.
+    #[error("log gap detected: last_index={last_index}, first_new={first_new}, expected contiguous append")]
+    LogGap {
+        last_index: u64,
+        first_new: u64,
+    },
     /// Log compacted, entry no longer available.
     #[error("log compacted at index {0}")]
     Compacted(u64),

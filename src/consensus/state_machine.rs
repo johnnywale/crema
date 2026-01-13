@@ -6,7 +6,7 @@ use bytes::Bytes;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
-use tracing::{debug, error};
+use tracing::{debug, error, info};
 
 /// The cache state machine that applies committed Raft entries.
 ///
@@ -69,6 +69,16 @@ impl CacheStateMachine {
         // Apply the command
         match command {
             CacheCommand::Put { key, value, ttl_ms } => {
+                let key_preview = String::from_utf8_lossy(&key[..std::cmp::min(key.len(), 32)]);
+                info!(
+                    raft_index = index,
+                    raft_term = term,
+                    key = %key_preview,
+                    value_len = value.len(),
+                    ttl_ms = ?ttl_ms,
+                    "STATE_MACHINE: Applying PUT to local storage"
+                );
+
                 let key = Bytes::from(key);
                 let value = Bytes::from(value);
 
@@ -80,17 +90,42 @@ impl CacheStateMachine {
                     self.storage.insert(key, value).await;
                 }
 
-                debug!(index, "Applied Put command");
+                info!(
+                    raft_index = index,
+                    "STATE_MACHINE: PUT applied successfully"
+                );
             }
 
             CacheCommand::Delete { key } => {
+                let key_preview = String::from_utf8_lossy(&key[..std::cmp::min(key.len(), 32)]);
+                info!(
+                    raft_index = index,
+                    raft_term = term,
+                    key = %key_preview,
+                    "STATE_MACHINE: Applying DELETE to local storage"
+                );
+
                 self.storage.invalidate(&key).await;
-                debug!(index, "Applied Delete command");
+
+                info!(
+                    raft_index = index,
+                    "STATE_MACHINE: DELETE applied successfully"
+                );
             }
 
             CacheCommand::Clear => {
+                info!(
+                    raft_index = index,
+                    raft_term = term,
+                    "STATE_MACHINE: Applying CLEAR to local storage"
+                );
+
                 self.storage.invalidate_all();
-                debug!(index, "Applied Clear command");
+
+                info!(
+                    raft_index = index,
+                    "STATE_MACHINE: CLEAR applied successfully"
+                );
             }
         }
 

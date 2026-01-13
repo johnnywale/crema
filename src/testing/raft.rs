@@ -1,11 +1,3 @@
-// Cargo.toml dependencies needed:
-// [dependencies]
-// raft = "0.7"
-// protobuf = "2.27"
-// slog = "2.7"
-// slog-stdlog = "4.1"
-// tokio = { version = "1", features = ["full"] }
-
 use crate::consensus::storage::MemStorage;
 use raft::{prelude::*, GetEntriesContext, StateRole};
 use slog::{o, Drain};
@@ -84,7 +76,11 @@ impl TestNode {
     /// Get entry data at a specific index (returns None if not found or not data entry)
     fn get_entry_data(&self, index: u64) -> Option<Vec<u8>> {
         let ctx = GetEntriesContext::empty(false);
-        let entries = self.raft.store().entries(index, index + 1, None, ctx).ok()?;
+        let entries = self
+            .raft
+            .store()
+            .entries(index, index + 1, None, ctx)
+            .ok()?;
         entries.first().map(|e| e.data.to_vec())
     }
 
@@ -561,7 +557,9 @@ mod tests {
 
         // Step 3: Node 1 receives propose(A) but cannot replicate it
         let data_a = b"entry_A_from_old_leader".to_vec();
-        cluster.propose(1, data_a.clone()).expect("Propose should succeed");
+        cluster
+            .propose(1, data_a.clone())
+            .expect("Propose should succeed");
 
         // Process the proposal on Node 1 (it will append to its log)
         let _msgs_from_node1 = cluster.process_ready(1);
@@ -632,7 +630,9 @@ mod tests {
 
         // Step 5: Node 2 proposes and commits entry B
         let data_b = b"entry_B_from_new_leader".to_vec();
-        cluster.propose(2, data_b.clone()).expect("Propose should succeed");
+        cluster
+            .propose(2, data_b.clone())
+            .expect("Propose should succeed");
 
         // Process messages between Node 2 and Node 3 until entry B is committed
         // We need to ensure proper replication by processing each message type properly
@@ -722,7 +722,8 @@ mod tests {
         // Verify Node 1 has NOT committed entry A (still uncommitted)
         let node1_final_committed = cluster.committed_index(1);
         assert!(
-            node1_final_committed <= committed_before_partition || entry_a_index > node1_final_committed,
+            node1_final_committed <= committed_before_partition
+                || entry_a_index > node1_final_committed,
             "Entry A should still be uncommitted on Node 1 (committed: {}, entry_a_index: {})",
             node1_final_committed,
             entry_a_index

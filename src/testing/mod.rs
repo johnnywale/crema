@@ -67,10 +67,13 @@
 
 mod chaos;
 
-mod cache_integration_tests;
+mod cache_integration_tests_basic;
+mod cache_integration_tests_edge_failed;
+mod cache_integration_tests_edge_pass;
+mod memberlist_cache_integration_tests;
 mod memberlist_cluster_tests;
 mod raft;
-mod cache_integration_tests_edge;
+mod utils;
 
 pub use chaos::{
     ChaosAction, ChaosConfig, ChaosController, ChaosRunner, ChaosScenario, ChaosStats,

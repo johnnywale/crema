@@ -103,7 +103,7 @@ pub mod types;
 
 // Re-export main types for convenience
 pub use cache::DistributedCache;
-pub use config::{CacheConfig, MembershipConfig, MembershipMode, RaftConfig};
+pub use config::{CacheConfig, MemberlistConfig, MembershipConfig, MembershipMode, RaftConfig};
 pub use error::{Error, Result};
 pub use types::{CacheCommand, CacheStats, ClusterStatus, NodeId, PeerInfo};
 

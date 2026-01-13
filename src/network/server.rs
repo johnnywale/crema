@@ -4,11 +4,14 @@ use crate::error::{NetworkError, Result};
 use crate::network::rpc::{decode_message, Message, PongResponse};
 use crate::types::NodeId;
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
-use tracing::{debug, error, info};
+use tokio_util::sync::CancellationToken;
+use tracing::{debug, error, info, warn};
 
 /// Handler for incoming messages.
 pub trait MessageHandler: Send + Sync + 'static {
@@ -29,6 +32,12 @@ pub struct NetworkServer {
 
     /// Shutdown signal receiver.
     shutdown_rx: mpsc::Receiver<()>,
+
+    /// Cancellation token for graceful shutdown of connection handlers.
+    cancellation_token: CancellationToken,
+
+    /// Counter for active connections (used for graceful shutdown).
+    active_connections: Arc<AtomicUsize>,
 }
 
 impl NetworkServer {
@@ -39,12 +48,16 @@ impl NetworkServer {
         handler: Arc<dyn MessageHandler>,
     ) -> (Self, mpsc::Sender<()>) {
         let (shutdown_tx, shutdown_rx) = mpsc::channel(1);
+        let cancellation_token = CancellationToken::new();
+        let active_connections = Arc::new(AtomicUsize::new(0));
 
         let server = Self {
             bind_addr,
             node_id,
             handler,
             shutdown_rx,
+            cancellation_token,
+            active_connections,
         };
 
         (server, shutdown_tx)
@@ -66,8 +79,24 @@ impl NetworkServer {
                             debug!(peer = %peer_addr, "Accepted connection");
                             let handler = self.handler.clone();
                             let node_id = self.node_id;
+                            let cancel_token = self.cancellation_token.clone();
+                            let active_conns = self.active_connections.clone();
+
+                            // Increment active connection count
+                            active_conns.fetch_add(1, Ordering::SeqCst);
+
                             tokio::spawn(async move {
-                                if let Err(e) = Self::handle_connection(stream, handler, node_id).await {
+                                let result = Self::handle_connection(
+                                    stream,
+                                    handler,
+                                    node_id,
+                                    cancel_token,
+                                ).await;
+
+                                // Decrement active connection count
+                                active_conns.fetch_sub(1, Ordering::SeqCst);
+
+                                if let Err(e) = result {
                                     debug!(error = %e, "Connection handler error");
                                 }
                             });
@@ -78,7 +107,28 @@ impl NetworkServer {
                     }
                 }
                 _ = self.shutdown_rx.recv() => {
-                    info!("Network server shutting down");
+                    info!("Network server shutting down, cancelling {} active connections",
+                          self.active_connections.load(Ordering::SeqCst));
+
+                    // Cancel all connection handlers
+                    self.cancellation_token.cancel();
+
+                    // Wait for active connections to finish (with timeout)
+                    let shutdown_timeout = Duration::from_millis(500);
+                    let start = std::time::Instant::now();
+
+                    while self.active_connections.load(Ordering::SeqCst) > 0 {
+                        if start.elapsed() > shutdown_timeout {
+                            warn!(
+                                "Shutdown timeout: {} connections still active, forcing close",
+                                self.active_connections.load(Ordering::SeqCst)
+                            );
+                            break;
+                        }
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+
+                    info!("Network server shutdown complete");
                     break;
                 }
             }
@@ -91,17 +141,38 @@ impl NetworkServer {
         mut stream: TcpStream,
         handler: Arc<dyn MessageHandler>,
         _node_id: NodeId,
+        cancel_token: CancellationToken,
     ) -> Result<()> {
         loop {
-            // Read message length (4 bytes)
+            // Read message length (4 bytes), with cancellation check
             let mut len_buf = [0u8; 4];
-            match stream.read_exact(&mut len_buf).await {
-                Ok(_) => {}
-                Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
-                    // Connection closed
+
+            tokio::select! {
+                biased;
+
+                // Check for cancellation first (higher priority)
+                _ = cancel_token.cancelled() => {
+                    debug!("Connection handler cancelled during read");
                     return Ok(());
                 }
-                Err(e) => return Err(NetworkError::Io(e).into()),
+
+                // Read from stream
+                result = stream.read_exact(&mut len_buf) => {
+                    match result {
+                        Ok(_) => {}
+                        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
+                            // Connection closed
+                            return Ok(());
+                        }
+                        Err(e) => return Err(NetworkError::Io(e).into()),
+                    }
+                }
+            }
+
+            // Check cancellation again before processing
+            if cancel_token.is_cancelled() {
+                debug!("Connection handler cancelled before message processing");
+                return Ok(());
             }
 
             let len = u32::from_be_bytes(len_buf) as usize;
@@ -116,6 +187,12 @@ impl NetworkServer {
                 .read_exact(&mut data)
                 .await
                 .map_err(|e| NetworkError::Io(e))?;
+
+            // Check cancellation before handling message
+            if cancel_token.is_cancelled() {
+                debug!("Connection handler cancelled before message handling");
+                return Ok(());
+            }
 
             // Decode message
             let msg = decode_message(&data)?;
