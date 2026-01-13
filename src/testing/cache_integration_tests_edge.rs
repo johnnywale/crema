@@ -24,10 +24,11 @@ mod multi_node_tests {
     use std::collections::{HashMap, HashSet};
     use std::net::SocketAddr;
     use std::sync::atomic::{AtomicU16, Ordering};
-    use std::sync::{Arc, Mutex};
+    use std::sync::{Arc, Mutex, Once};
     use std::time::{Duration, Instant};
+    use test_log::test;
     use tokio::time::sleep;
-
+    use tracing::info; // 改用这个！
     /// Port counter to ensure unique ports across tests
     static PORT_COUNTER: AtomicU16 = AtomicU16::new(25000);
 
@@ -36,9 +37,9 @@ mod multi_node_tests {
         PORT_COUNTER.fetch_add(count * 3, Ordering::SeqCst)
     }
     pub async fn wait_for_result<F, Fut, T, P>(
-        mut action: F,      // 获取结果的异步闭包
-        predicate: P,       // 验证结果的闭包
-        timeout: Duration,  // 总超时时间
+        mut action: F,     // 获取结果的异步闭包
+        predicate: P,      // 验证结果的闭包
+        timeout: Duration, // 总超时时间
     ) -> Option<T>
     where
         F: FnMut() -> Fut,
@@ -202,7 +203,7 @@ mod multi_node_tests {
     // ========================================================================
     // TC-11: Standard Quorum Election (多数派存在时的选举)
     // ========================================================================
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
     async fn tc11_standard_quorum_election() {
         let base_port = allocate_ports(3);
         let peer_configs = vec![(1, base_port), (2, base_port + 1), (3, base_port + 2)];
@@ -256,11 +257,10 @@ mod multi_node_tests {
         cache3.shutdown().await;
     }
 
-
     // ========================================================================
     // TC-12: Log Replication Consistency (日志复制一致性)
     // ========================================================================
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
     async fn tc12_log_replication_consistency() {
         let base_port = allocate_ports(3);
         let peer_configs = vec![(1, base_port), (2, base_port + 1), (3, base_port + 2)];
@@ -276,10 +276,10 @@ mod multi_node_tests {
         let caches = [&cache1, &cache2, &cache3];
 
         // Wait for leader election with longer timeout
-        println!("Waiting for leader election...");
+        info!("Waiting for leader election...");
         let leader_id = wait_for_single_leader(&caches, Duration::from_secs(10)).await;
         assert!(leader_id.is_some(), "Should elect a leader");
-        println!("Leader elected: {:?}", leader_id);
+        info!("Leader elected: {:?}", leader_id);
 
         // Find the leader
         let leader = caches.iter().find(|c| c.is_leader()).unwrap();
@@ -294,8 +294,9 @@ mod multi_node_tests {
             // Use timeout to prevent hanging
             let put_result = tokio::time::timeout(
                 Duration::from_secs(5),
-                leader.put(bytes::Bytes::from(key.clone()), bytes::Bytes::from(value))
-            ).await;
+                leader.put(bytes::Bytes::from(key.clone()), bytes::Bytes::from(value)),
+            )
+            .await;
 
             match put_result {
                 Ok(Ok(_)) => {
@@ -323,7 +324,8 @@ mod multi_node_tests {
         sleep(Duration::from_secs(3)).await;
 
         // Verify all nodes have consistent commit_index
-        let commit_indices: Vec<u64> = caches.iter()
+        let commit_indices: Vec<u64> = caches
+            .iter()
             .map(|c| c.cluster_status().commit_index)
             .collect();
 
@@ -334,7 +336,9 @@ mod multi_node_tests {
             assert!(
                 commit >= max_commit - 5,
                 "Node {} commit_index {} too far behind max {}",
-                i + 1, commit, max_commit
+                i + 1,
+                commit,
+                max_commit
             );
         }
 
@@ -345,7 +349,11 @@ mod multi_node_tests {
             let expected = Some(bytes::Bytes::from(format!("value-{}", i)));
 
             let consistent = verify_data_consistency(&caches, key.as_bytes(), expected).await;
-            assert!(consistent, "Data for {} should be consistent across nodes", key);
+            assert!(
+                consistent,
+                "Data for {} should be consistent across nodes",
+                key
+            );
 
             if i % 25 == 0 {
                 println!("Verified consistency up to key-{}", i);
@@ -359,11 +367,11 @@ mod multi_node_tests {
         cache3.shutdown().await;
     }
 
-
     // ========================================================================
     // TC-13: Heartbeat Stability (Leader自动续期)
     // ========================================================================
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
+    #[cfg(test)]
     async fn tc13_heartbeat_stability() {
         let base_port = allocate_ports(3);
         let peer_configs = vec![(1, base_port), (2, base_port + 1), (3, base_port + 2)];
@@ -412,7 +420,7 @@ mod multi_node_tests {
     // ========================================================================
     // TC-14: Minority Failure (少数派故障)
     // ========================================================================
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
     async fn tc14_minority_failure() {
         let base_port = allocate_ports(3);
         let peer_configs = vec![(1, base_port), (2, base_port + 1), (3, base_port + 2)];
@@ -478,7 +486,7 @@ mod multi_node_tests {
     // ========================================================================
     // TC-15: Leader Failover (Leader宕机切换)
     // ========================================================================
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
     async fn tc15_leader_failover() {
         let base_port = allocate_ports(3);
         let peer_configs = vec![(1, base_port), (2, base_port + 1), (3, base_port + 2)];
@@ -550,7 +558,7 @@ mod multi_node_tests {
     // ========================================================================
     // TC-16: Node Rejoin (节点重新加入)
     // ========================================================================
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
     async fn tc16_node_rejoin() {
         let base_port = allocate_ports(3);
         let peer_configs = vec![(1, base_port), (2, base_port + 1), (3, base_port + 2)];
@@ -620,7 +628,7 @@ mod multi_node_tests {
     // ========================================================================
     // TC-17: Network Partition - Majority/Minority Split (对称分区)
     // ========================================================================
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
     async fn tc17_network_partition_majority_minority() {
         let base_port = allocate_ports(5);
         let peer_configs = vec![
@@ -699,7 +707,7 @@ mod multi_node_tests {
     // ========================================================================
     // TC-18: Stale Leader Replacement (旧Leader回归)
     // ========================================================================
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
     async fn tc18_stale_leader_replacement() {
         let base_port = allocate_ports(3);
         let peer_configs = vec![(1, base_port), (2, base_port + 1), (3, base_port + 2)];
@@ -722,7 +730,9 @@ mod multi_node_tests {
         wait_for_single_leader(&caches, Duration::from_secs(10)).await;
 
         // 2. 确认初始 Leader 并关闭它
-        let initial_leader = caches.iter().find(|c| c.is_leader())
+        let initial_leader = caches
+            .iter()
+            .find(|c| c.is_leader())
             .expect("Leader should be elected quickly with low tick counts");
         let initial_leader_id = initial_leader.node_id();
         let term1 = initial_leader.cluster_status().term;
@@ -730,19 +740,32 @@ mod multi_node_tests {
         initial_leader.shutdown().await;
 
         // 3. 等待新 Leader 选举
-        let remaining: Vec<&DistributedCache> = caches.iter()
-            .filter(|c| c.node_id() != initial_leader_id).copied().collect();
+        let remaining: Vec<&DistributedCache> = caches
+            .iter()
+            .filter(|c| c.node_id() != initial_leader_id)
+            .copied()
+            .collect();
 
         // 给予足够的时间让剩余节点触发新的选举
         sleep(Duration::from_secs(3)).await;
 
-        let new_leader = remaining.iter().find(|c| c.is_leader())
+        let new_leader = remaining
+            .iter()
+            .find(|c| c.is_leader())
             .expect("New leader should be elected from remaining nodes");
         let term2 = new_leader.cluster_status().term;
-        assert!(term2 > term1, "Term should have increased: {} -> {}", term1, term2);
+        assert!(
+            term2 > term1,
+            "Term should have increased: {} -> {}",
+            term1,
+            term2
+        );
 
         // 4. 写入新数据
-        new_leader.put("new-leader-key", "new-leader-value").await.unwrap();
+        new_leader
+            .put("new-leader-key", "new-leader-value")
+            .await
+            .unwrap();
 
         // 5. 【关键点】重启旧 Leader 时调大其选举超时
         // 这样它回归后会更“耐心”地等待心跳，而不是立即发起 Pre-Vote
@@ -759,26 +782,39 @@ mod multi_node_tests {
         }
 
         // 6. 验证旧 Leader 降级并追平 Term
-        let success = wait_for(|| {
-            let status = cache1_reconnected.cluster_status();
-            // 核心检查：Term 是否追上，且角色是否变为 Follower (is_leader == false)
-            status.term >= term2 && !cache1_reconnected.is_leader()
-        }, Duration::from_secs(10), Duration::from_millis(200)).await;
+        let success = wait_for(
+            || {
+                let status = cache1_reconnected.cluster_status();
+                // 核心检查：Term 是否追上，且角色是否变为 Follower (is_leader == false)
+                status.term >= term2 && !cache1_reconnected.is_leader()
+            },
+            Duration::from_secs(10),
+            Duration::from_millis(200),
+        )
+        .await;
 
         if !success {
             let status = cache1_reconnected.cluster_status();
-            panic!("Sync failed! Node {} is at Term {}, Leader: {}",
-                   initial_leader_id, status.term, cache1_reconnected.is_leader());
+            panic!(
+                "Sync failed! Node {} is at Term {}, Leader: {}",
+                initial_leader_id,
+                status.term,
+                cache1_reconnected.is_leader()
+            );
         }
 
         // 7. 验证数据同步
         let synced_value = wait_for_result(
             || async { cache1_reconnected.get(b"new-leader-key").await },
             |res| res.as_ref().map(|b| b.as_ref()) == Some("new-leader-value".as_bytes()),
-            Duration::from_secs(5)
-        ).await;
+            Duration::from_secs(5),
+        )
+        .await;
 
-        assert!(synced_value.is_some(), "Old leader should have synced data from the current cluster");
+        assert!(
+            synced_value.is_some(),
+            "Old leader should have synced data from the current cluster"
+        );
 
         // 8. 清理
         cache1_reconnected.shutdown().await;
@@ -790,7 +826,7 @@ mod multi_node_tests {
     // ========================================================================
     // TC-19: Split Vote Recovery (选票瓜分)
     // ========================================================================
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
     async fn tc19_split_vote_recovery() {
         let base_port = allocate_ports(3);
         let peer_configs = vec![(1, base_port), (2, base_port + 1), (3, base_port + 2)];
@@ -832,7 +868,7 @@ mod multi_node_tests {
     // ========================================================================
     // TC-20: No Dual Leader (验证不会出现双Leader)
     // ========================================================================
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
     async fn tc20_no_dual_leader() {
         let base_port = allocate_ports(5);
         let peer_configs = vec![
@@ -904,7 +940,7 @@ mod multi_node_tests {
     // ========================================================================
     // TC-21: Disk IO Stall Simulation (磁盘IO阻塞)
     // ========================================================================
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
     async fn tc21_disk_io_stall() {
         // Note: This is a simplified version since we can't easily simulate
         // disk IO stalls without modifying the storage layer
@@ -958,7 +994,7 @@ mod multi_node_tests {
     // ========================================================================
     // TC-22: Message Reordering Tolerance (消息乱序与重复)
     // ========================================================================
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
     async fn tc22_message_reordering_tolerance() {
         // Note: Without modifying the transport layer to inject delays and
         // reordering, this test verifies basic consistency guarantees
@@ -1036,7 +1072,7 @@ mod multi_node_tests {
     // ========================================================================
 
     /// Verify quorum check - only nodes with majority votes can become leader
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
     async fn tc_extra_quorum_verification() {
         let base_port = allocate_ports(5);
         let peer_configs = vec![
@@ -1092,7 +1128,7 @@ mod multi_node_tests {
     }
 
     /// Verify term monotonicity across cluster
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
     async fn tc_extra_term_monotonicity_cluster() {
         let base_port = allocate_ports(3);
         let peer_configs = vec![(1, base_port), (2, base_port + 1), (3, base_port + 2)];
@@ -1140,7 +1176,7 @@ mod multi_node_tests {
     }
 
     /// Verify linearizability - once leader confirms write, all reads see it
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
     async fn tc_extra_linearizability_check() {
         let base_port = allocate_ports(3);
         let peer_configs = vec![(1, base_port), (2, base_port + 1), (3, base_port + 2)];

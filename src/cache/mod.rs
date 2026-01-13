@@ -59,6 +59,12 @@ impl DistributedCache {
     /// 4. Begin the Raft tick loop
     /// 5. Start memberlist gossip (if enabled)
     pub async fn new(config: CacheConfig) -> Result<Self> {
+        info!(
+            node_id = config.node_id,
+            raft_addr = %config.raft_addr,
+            seed_nodes = ?config.seed_nodes,
+            "Starting distributed cache"
+        );
         info!(node_id = config.node_id, "Starting distributed cache");
 
         // Create local cache storage
@@ -96,16 +102,11 @@ impl DistributedCache {
             ClusterMembership::new(config.node_id, config.membership.clone());
 
         // Create message handler
-        let handler = CacheMessageHandler {
-            raft: raft.clone(),
-        };
+        let handler = CacheMessageHandler { raft: raft.clone() };
 
         // Create and start network server
-        let (server, shutdown_tx) = NetworkServer::new(
-            config.raft_addr,
-            config.node_id,
-            Arc::new(handler),
-        );
+        let (server, shutdown_tx) =
+            NetworkServer::new(config.raft_addr, config.node_id, Arc::new(handler));
 
         tokio::spawn(async move {
             if let Err(e) = server.run().await {
@@ -125,8 +126,11 @@ impl DistributedCache {
             let memberlist_bind_addr = config.memberlist.get_bind_addr(config.raft_addr);
 
             // Build memberlist config
-            let mut ml_config =
-                MemberlistClusterConfig::new(config.node_id, memberlist_bind_addr, config.raft_addr);
+            let mut ml_config = MemberlistClusterConfig::new(
+                config.node_id,
+                memberlist_bind_addr,
+                config.raft_addr,
+            );
 
             // Add seed addresses from config
             if !config.memberlist.seed_addrs.is_empty() {
@@ -292,14 +296,14 @@ impl DistributedCache {
                 if auto_remove_peers {
                     // Remove from Raft transport
                     raft.transport().remove_peer(*raft_id);
-                    debug!(raft_id = *raft_id, "Removed failed peer from Raft transport");
+                    debug!(
+                        raft_id = *raft_id,
+                        "Removed failed peer from Raft transport"
+                    );
                 }
             }
 
-            MemberlistEvent::NodeUpdate {
-                raft_id,
-                metadata,
-            } => {
+            MemberlistEvent::NodeUpdate { raft_id, metadata } => {
                 debug!(
                     raft_id = *raft_id,
                     raft_addr = %metadata.raft_addr,
@@ -536,19 +540,18 @@ mod tests {
     fn test_config(node_id: NodeId) -> CacheConfig {
         CacheConfig {
             node_id,
-            raft_addr: format!("127.0.0.1:{}", 19000 + node_id)
-                .parse()
-                .unwrap(),
+            raft_addr: format!("127.0.0.1:{}", 19000 + node_id).parse().unwrap(),
             ..Default::default()
         }
     }
 
-    fn test_config_with_peers(node_id: NodeId, seed_nodes: Vec<(NodeId, SocketAddr)>) -> CacheConfig {
+    fn test_config_with_peers(
+        node_id: NodeId,
+        seed_nodes: Vec<(NodeId, SocketAddr)>,
+    ) -> CacheConfig {
         CacheConfig {
             node_id,
-            raft_addr: format!("127.0.0.1:{}", 19000 + node_id)
-                .parse()
-                .unwrap(),
+            raft_addr: format!("127.0.0.1:{}", 19000 + node_id).parse().unwrap(),
             seed_nodes,
             ..Default::default()
         }
@@ -618,7 +621,10 @@ mod tests {
 
         // Peer 2 (self) should NOT be registered
         let peer2_addr = transport.get_peer(2);
-        assert!(peer2_addr.is_none(), "Self (peer 2) should not be registered");
+        assert!(
+            peer2_addr.is_none(),
+            "Self (peer 2) should not be registered"
+        );
     }
 
     #[tokio::test]
@@ -651,9 +657,15 @@ mod tests {
 
         // Old buggy behavior would have registered peers 1 and 2 instead
         let peer1_addr = transport.get_peer(1);
-        assert!(peer1_addr.is_none(), "Peer 1 should NOT be registered (bug regression)");
+        assert!(
+            peer1_addr.is_none(),
+            "Peer 1 should NOT be registered (bug regression)"
+        );
         let peer2_addr = transport.get_peer(2);
-        assert!(peer2_addr.is_none(), "Peer 2 should NOT be registered (bug regression)");
+        assert!(
+            peer2_addr.is_none(),
+            "Peer 2 should NOT be registered (bug regression)"
+        );
     }
 
     #[tokio::test]
@@ -666,7 +678,10 @@ mod tests {
 
         // No peers should be registered
         let peer_ids = transport.peer_ids();
-        assert!(peer_ids.is_empty(), "No peers should be registered for single-node cluster");
+        assert!(
+            peer_ids.is_empty(),
+            "No peers should be registered for single-node cluster"
+        );
     }
 
     #[tokio::test]
@@ -693,8 +708,14 @@ mod tests {
         let config = test_config(1);
         let cache = DistributedCache::new(config).await.unwrap();
 
-        assert!(!cache.memberlist_enabled(), "Memberlist should be disabled by default");
-        assert!(cache.memberlist_members().is_empty(), "No memberlist members when disabled");
+        assert!(
+            !cache.memberlist_enabled(),
+            "Memberlist should be disabled by default"
+        );
+        assert!(
+            cache.memberlist_members().is_empty(),
+            "No memberlist members when disabled"
+        );
     }
 
     #[tokio::test]

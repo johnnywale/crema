@@ -79,7 +79,7 @@ impl RaftNode {
         // IMPORTANT: RawNode needs to see our storage updates, so we must use the same instance
         let storage = MemStorage::new_with_conf_state(voters.clone());
 
-        eprintln!("RAFT_NODE: Creating node {} with voters {:?}", id, voters);
+        info!("RAFT_NODE: Creating node {} with voters {:?}", id, voters);
 
         // Create raft config
         let raft_config = config.to_raft_config(id);
@@ -93,7 +93,7 @@ impl RaftNode {
 
         // Debug: print what raft-rs sees as voters
         let prs_voters: Vec<_> = node.raft.prs().conf().voters().ids().iter().collect();
-        eprintln!("RAFT_NODE: node {} ProgressTracker voters: {:?}", id, prs_voters);
+        info!("RAFT_NODE: node {} ProgressTracker voters: {:?}", id, prs_voters);
 
         // Create transport
         let transport = Arc::new(RaftTransport::new(id));
@@ -253,7 +253,7 @@ impl RaftNode {
     ///
     /// This will return when the command is committed (not just proposed).
     pub async fn propose(&self, command: CacheCommand) -> Result<ProposalResult> {
-        eprintln!("PROPOSE: Starting proposal, is_leader={}", self.is_leader());
+        info!("PROPOSE: Starting proposal, is_leader={}", self.is_leader());
         if !self.is_leader() {
             return Err(RaftError::NotLeader {
                 leader: self.leader_id(),
@@ -266,7 +266,7 @@ impl RaftNode {
 
         // Generate proposal ID
         let proposal_id = self.next_proposal_id.fetch_add(1, Ordering::SeqCst);
-        eprintln!("PROPOSE: Generated proposal_id={}", proposal_id);
+        info!("PROPOSE: Generated proposal_id={}", proposal_id);
 
         // Serialize command
         let data = command.to_bytes()?;
@@ -285,25 +285,25 @@ impl RaftNode {
             let mut node = self.node.lock();
             // Use proposal_id as context for tracking
             let context = proposal_id.to_le_bytes().to_vec();
-            eprintln!("PROPOSE: Calling node.propose()");
+            info!("PROPOSE: Calling node.propose()");
             if let Err(e) = node.propose(context, data) {
                 // Remove pending proposal
                 self.pending.lock().remove(&proposal_id);
-                eprintln!("PROPOSE: node.propose() failed: {}", e);
+                info!("PROPOSE: node.propose() failed: {}", e);
                 return Err(RaftError::Internal(e.to_string()).into());
             }
-            eprintln!("PROPOSE: node.propose() succeeded");
+            info!("PROPOSE: node.propose() succeeded");
         }
 
         // Wait for commit
-        eprintln!("PROPOSE: Waiting for commit on proposal_id={}", proposal_id);
+        info!("PROPOSE: Waiting for commit on proposal_id={}", proposal_id);
         match rx.await {
             Ok(result) => {
-                eprintln!("PROPOSE: Commit received for proposal_id={}", proposal_id);
+                info!("PROPOSE: Commit received for proposal_id={}", proposal_id);
                 result
             }
             Err(_) => {
-                eprintln!("PROPOSE: Proposal dropped for proposal_id={}", proposal_id);
+                info!("PROPOSE: Proposal dropped for proposal_id={}", proposal_id);
                 Err(RaftError::ProposalDropped.into())
             }
         }
@@ -335,11 +335,11 @@ impl RaftNode {
 
     /// Handle an incoming Raft message from a peer.
     pub fn step(&self, msg: RaftMessage) -> Result<()> {
-        eprintln!("STEP: node={} received msg type={:?} from={} to={}", self.id, msg.msg_type, msg.from, msg.to);
+        info!("STEP: node={} received msg type={:?} from={} to={}", self.id, msg.msg_type, msg.from, msg.to);
 
         if msg.get_msg_type() == raft::prelude::MessageType::MsgRequestVoteResponse
             || msg.get_msg_type() == raft::prelude::MessageType::MsgRequestPreVoteResponse {
-            eprintln!("STEP: Node {} got vote response from {}, rejected={}",
+            info!("STEP: Node {} got vote response from {}, rejected={}",
                       self.id, msg.from, msg.reject);
         }
 
@@ -383,7 +383,7 @@ impl RaftNode {
         node.tick();
         let after_msg_count = node.raft.msgs.len();
         if after_msg_count > before_msg_count {
-            eprintln!("TICK: node={} generated {} messages", self.id, after_msg_count - before_msg_count);
+            info!("TICK: node={} generated {} messages", self.id, after_msg_count - before_msg_count);
         }
     }
 
@@ -408,17 +408,17 @@ impl RaftNode {
             let msgs_after_check = node.raft.msgs.len();
             let raft_state = node.raft.state;
             let leader = node.raft.leader_id;
-            eprintln!("PROCESS_READY: node={} has ready, state={:?}, leader={}, msgs_before={}, msgs_after_check={}",
+            info!("PROCESS_READY: node={} has ready, state={:?}, leader={}, msgs_before={}, msgs_after_check={}",
                 self.id, raft_state, leader, msgs_before, msgs_after_check);
             let ready = node.ready();
             // Check messages after ready
             let msgs_after_ready = node.raft.msgs.len();
-            eprintln!("PROCESS_READY: node={} msgs_after_ready={}", self.id, msgs_after_ready);
+            info!("PROCESS_READY: node={} msgs_after_ready={}", self.id, msgs_after_ready);
             ready
         };
 
         // Debug: print what's in ready
-        eprintln!("PROCESS_READY: node={} entries={}, committed={}, has_hs={}, has_ss={}, msg_count={}, persisted_msg_count={}",
+        info!("PROCESS_READY: node={} entries={}, committed={}, has_hs={}, has_ss={}, msg_count={}, persisted_msg_count={}",
             self.id,
             ready.entries().len(),
             ready.committed_entries().len(),
@@ -431,7 +431,7 @@ impl RaftNode {
         // 1. Append entries to storage FIRST (must persist before commit)
         let entries: Vec<_> = ready.take_entries();
         if !entries.is_empty() {
-            eprintln!("READY: Appending {} entries to storage", entries.len());
+            info!("READY: Appending {} entries to storage", entries.len());
             if let Err(e) = self.storage.append(&entries) {
                 error!(error = %e, "Failed to append entries");
             }
@@ -452,14 +452,14 @@ impl RaftNode {
         // 4. Send messages (both immediate and persisted messages)
         let messages: Vec<_> = ready.take_messages();
         if !messages.is_empty() {
-            eprintln!("PROCESS_READY: node={} sending {} immediate messages", self.id, messages.len());
+            info!("PROCESS_READY: node={} sending {} immediate messages", self.id, messages.len());
         }
         self.transport.send_messages(messages);
 
         // Also send persisted messages (messages that require persistence first)
         let persisted_messages: Vec<_> = ready.take_persisted_messages();
         if !persisted_messages.is_empty() {
-            eprintln!("PROCESS_READY: node={} sending {} persisted messages", self.id, persisted_messages.len());
+            info!("PROCESS_READY: node={} sending {} persisted messages", self.id, persisted_messages.len());
         }
         self.transport.send_messages(persisted_messages);
 
@@ -476,14 +476,14 @@ impl RaftNode {
         // 5. Apply committed entries to state machine
         let committed_entries: Vec<_> = ready.take_committed_entries();
         if !committed_entries.is_empty() {
-            eprintln!("READY: Processing {} committed entries", committed_entries.len());
+            info!("READY: Processing {} committed entries", committed_entries.len());
         }
         for entry in &committed_entries {
-            eprintln!("READY: Committed entry index={}, term={}, data_len={}, context_len={}",
+            info!("READY: Committed entry index={}, term={}, data_len={}, context_len={}",
                 entry.index, entry.term, entry.data.len(), entry.context.len());
             if entry.data.is_empty() {
                 // Noop entry
-                eprintln!("READY: Skipping noop entry");
+                info!("READY: Skipping noop entry");
                 continue;
             }
 
@@ -494,7 +494,7 @@ impl RaftNode {
             } else {
                 0
             };
-            eprintln!("READY: Entry has proposal_id={}", proposal_id);
+            info!("READY: Entry has proposal_id={}", proposal_id);
 
             // Apply to state machine
             self.state_machine
@@ -507,15 +507,15 @@ impl RaftNode {
             // Notify pending proposal
             if proposal_id > 0 {
                 let pending_count = self.pending.lock().len();
-                eprintln!("READY: Looking for proposal_id={} in {} pending proposals", proposal_id, pending_count);
+                info!("READY: Looking for proposal_id={} in {} pending proposals", proposal_id, pending_count);
                 if let Some(pending) = self.pending.lock().remove(&proposal_id) {
-                    eprintln!("READY: Found and notifying proposal_id={}", proposal_id);
+                    info!("READY: Found and notifying proposal_id={}", proposal_id);
                     let _ = pending.tx.send(Ok(ProposalResult {
                         index: entry.index,
                         term: entry.term,
                     }));
                 } else {
-                    eprintln!("READY: proposal_id={} NOT FOUND in pending", proposal_id);
+                    info!("READY: proposal_id={} NOT FOUND in pending", proposal_id);
                 }
             }
         }
@@ -533,14 +533,14 @@ impl RaftNode {
         // Apply more committed entries from light_ready
         let committed_entries: Vec<_> = light_ready.take_committed_entries();
         if !committed_entries.is_empty() {
-            eprintln!("LIGHT_READY: Processing {} committed entries", committed_entries.len());
+            info!("LIGHT_READY: Processing {} committed entries", committed_entries.len());
         }
         for entry in &committed_entries {
-            eprintln!("LIGHT_READY: Committed entry index={}, term={}, data_len={}, context_len={}",
+            info!("LIGHT_READY: Committed entry index={}, term={}, data_len={}, context_len={}",
                 entry.index, entry.term, entry.data.len(), entry.context.len());
             if entry.data.is_empty() {
                 // Noop entry
-                eprintln!("LIGHT_READY: Skipping noop entry");
+                info!("LIGHT_READY: Skipping noop entry");
                 continue;
             }
 
@@ -551,7 +551,7 @@ impl RaftNode {
             } else {
                 0
             };
-            eprintln!("LIGHT_READY: Entry has proposal_id={}", proposal_id);
+            info!("LIGHT_READY: Entry has proposal_id={}", proposal_id);
 
             // Apply to state machine
             self.state_machine
@@ -564,15 +564,15 @@ impl RaftNode {
             // Notify pending proposal
             if proposal_id > 0 {
                 let pending_count = self.pending.lock().len();
-                eprintln!("LIGHT_READY: Looking for proposal_id={} in {} pending proposals", proposal_id, pending_count);
+                info!("LIGHT_READY: Looking for proposal_id={} in {} pending proposals", proposal_id, pending_count);
                 if let Some(pending) = self.pending.lock().remove(&proposal_id) {
-                    eprintln!("LIGHT_READY: Found and notifying proposal_id={}", proposal_id);
+                    info!("LIGHT_READY: Found and notifying proposal_id={}", proposal_id);
                     let _ = pending.tx.send(Ok(ProposalResult {
                         index: entry.index,
                         term: entry.term,
                     }));
                 } else {
-                    eprintln!("LIGHT_READY: proposal_id={} NOT FOUND in pending", proposal_id);
+                    info!("LIGHT_READY: proposal_id={} NOT FOUND in pending", proposal_id);
                 }
             }
         }
@@ -594,7 +594,7 @@ impl RaftNode {
             tokio::select! {
                 _ = interval.tick() => {
                     tick_count += 1;
-                    eprintln!("TICK_LOOP: node={} tick #{}, term={}, is_leader={}",
+                    info!("TICK_LOOP: node={} tick #{}, term={}, is_leader={}",
                         self.id, tick_count, self.term(), self.is_leader());
                     self.tick();
                     self.process_ready().await;
