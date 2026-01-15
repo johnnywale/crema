@@ -30,7 +30,7 @@ struct PendingProposal {
 /// The Raft node wrapper.
 pub struct RaftNode {
     /// The underlying raft-rs RawNode.
-    node: Mutex<RawNode<MemStorage>>,
+    node: Arc<Mutex<RawNode<MemStorage>>>,
 
     /// Raft storage (shared reference for access outside RawNode).
     storage: MemStorage,
@@ -42,10 +42,10 @@ pub struct RaftNode {
     transport: Arc<RaftTransport>,
 
     /// Pending proposals indexed by proposal ID.
-    pending: Mutex<HashMap<u64, PendingProposal>>,
+    pending: Arc<Mutex<HashMap<u64, PendingProposal>>>,
 
     /// Next proposal ID.
-    next_proposal_id: AtomicU64,
+    next_proposal_id: Arc<AtomicU64>,
 
     /// This node's ID.
     id: NodeId,
@@ -162,12 +162,12 @@ impl RaftNode {
         });
 
         let raft_node = Arc::new(Self {
-            node: Mutex::new(node),
+            node: Arc::new(Mutex::new(node)),
             storage,
             state_machine,
             transport,
-            pending: Mutex::new(HashMap::new()),
-            next_proposal_id: AtomicU64::new(1),
+            pending: Arc::new(Mutex::new(HashMap::new())),
+            next_proposal_id: Arc::new(AtomicU64::new(1)),
             id,
             leader_id: AtomicU64::new(0),
             has_leader: AtomicBool::new(false),
@@ -258,10 +258,17 @@ impl RaftNode {
     }
 
     /// Record an entry for checkpoint threshold tracking.
-    pub fn record_checkpoint_entry(&self) {
+    ///
+    /// Returns `true` if the entry was recorded, `false` if backpressure was applied.
+    pub fn record_checkpoint_entry(&self) -> bool {
         if let Some(manager) = self.checkpoint_manager.read().as_ref() {
-            manager.record_entry();
+            if let Err(_e) = manager.record_entry() {
+                // Backpressure - snapshot is taking too long
+                // We still allow the operation but log the event
+                return false;
+            }
         }
+        true
     }
 
     /// Check if a snapshot should be created based on configured thresholds.
@@ -704,8 +711,185 @@ impl RaftNode {
                     leader_id: self.leader_id(),
                 }))
             }
+            Message::ForwardedCommand(fwd) => {
+                self.handle_forwarded_command(fwd);
+                None // Response sent asynchronously
+            }
             _ => None,
         }
+    }
+
+    /// Handle a forwarded command from a follower.
+    ///
+    /// This is called on the leader when it receives a ForwardedCommand.
+    /// The leader proposes the command to Raft and sends back a ForwardResponse.
+    fn handle_forwarded_command(&self, fwd: crate::network::rpc::ForwardedCommand) {
+        use crate::network::rpc::ForwardResponse;
+
+        let request_id = fwd.request_id;
+        let origin_node_id = fwd.origin_node_id;
+        let command = fwd.command;
+        let ttl = fwd.ttl;
+
+        info!(
+            node_id = self.id,
+            request_id = request_id,
+            origin = origin_node_id,
+            ttl = ttl,
+            "FORWARD: Received ForwardedCommand from follower"
+        );
+
+        // TTL check to prevent infinite forwarding loops
+        if ttl == 0 {
+            warn!(
+                node_id = self.id,
+                request_id = request_id,
+                "FORWARD: TTL expired, rejecting"
+            );
+            let response = Message::ForwardResponse(ForwardResponse::error(
+                request_id,
+                "TTL expired",
+            ));
+            let transport = self.transport.clone();
+            tokio::spawn(async move {
+                if let Err(e) = transport.send_message(origin_node_id, response).await {
+                    warn!(error = %e, "Failed to send ForwardResponse (TTL expired)");
+                }
+            });
+            return;
+        }
+
+        // Check if we're the leader
+        if !self.is_leader() {
+            warn!(
+                node_id = self.id,
+                request_id = request_id,
+                leader = ?self.leader_id(),
+                "FORWARD: Not leader, rejecting"
+            );
+            let response = Message::ForwardResponse(ForwardResponse::error(
+                request_id,
+                format!("not leader, leader is {:?}", self.leader_id()),
+            ));
+            let transport = self.transport.clone();
+            tokio::spawn(async move {
+                if let Err(e) = transport.send_message(origin_node_id, response).await {
+                    warn!(error = %e, "Failed to send ForwardResponse (not leader)");
+                }
+            });
+            return;
+        }
+
+        // Propose the command asynchronously
+        let transport = self.transport.clone();
+        let pending = self.pending.clone();
+        let next_proposal_id = self.next_proposal_id.clone();
+        let node_id = self.id;
+        let node_lock = self.node.clone();
+        let config = self.config.clone();
+
+        // Spawn task to handle the proposal
+        tokio::spawn(async move {
+            // Pre-validate command
+            if let Err(e) = Self::validate_command(&command) {
+                let response = Message::ForwardResponse(ForwardResponse::error(
+                    request_id,
+                    e.to_string(),
+                ));
+                if let Err(e) = transport.send_message(origin_node_id, response).await {
+                    warn!(error = %e, "Failed to send ForwardResponse (validation failed)");
+                }
+                return;
+            }
+
+            // Serialize command
+            let data = match command.to_bytes() {
+                Ok(d) => d,
+                Err(e) => {
+                    let response = Message::ForwardResponse(ForwardResponse::error(
+                        request_id,
+                        e.to_string(),
+                    ));
+                    if let Err(e) = transport.send_message(origin_node_id, response).await {
+                        warn!(error = %e, "Failed to send ForwardResponse (serialization failed)");
+                    }
+                    return;
+                }
+            };
+
+            // Generate proposal ID
+            let proposal_id = next_proposal_id.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+
+            // Create completion channel
+            let (tx, rx) = tokio::sync::oneshot::channel();
+
+            // Store pending proposal
+            pending.lock().insert(proposal_id, PendingProposal { tx });
+
+            // Propose to Raft
+            {
+                let mut node = node_lock.lock();
+                let context = proposal_id.to_le_bytes().to_vec();
+                if let Err(e) = node.propose(context, data) {
+                    pending.lock().remove(&proposal_id);
+                    let response = Message::ForwardResponse(ForwardResponse::error(
+                        request_id,
+                        e.to_string(),
+                    ));
+                    if let Err(e) = transport.send_message(origin_node_id, response).await {
+                        warn!(error = %e, "Failed to send ForwardResponse (propose failed)");
+                    }
+                    return;
+                }
+            }
+
+            // Wait for commit with timeout
+            let election_timeout_ms = config.election_tick as u64 * config.tick_interval_ms;
+            let min_timeout_ms = 5000u64;
+            let timeout_ms = std::cmp::max(election_timeout_ms * 3, min_timeout_ms);
+            let timeout_duration = std::time::Duration::from_millis(timeout_ms);
+
+            let result = tokio::select! {
+                result = rx => {
+                    match result {
+                        Ok(Ok(_)) => Ok(()),
+                        Ok(Err(e)) => Err(e.to_string()),
+                        Err(_) => Err("proposal dropped".to_string()),
+                    }
+                }
+                _ = tokio::time::sleep(timeout_duration) => {
+                    pending.lock().remove(&proposal_id);
+                    Err("proposal timeout".to_string())
+                }
+            };
+
+            // Send response back to origin
+            let response = match result {
+                Ok(()) => {
+                    info!(
+                        node_id = node_id,
+                        request_id = request_id,
+                        origin = origin_node_id,
+                        "FORWARD: Command committed successfully"
+                    );
+                    Message::ForwardResponse(ForwardResponse::success(request_id))
+                }
+                Err(e) => {
+                    warn!(
+                        node_id = node_id,
+                        request_id = request_id,
+                        origin = origin_node_id,
+                        error = %e,
+                        "FORWARD: Command failed"
+                    );
+                    Message::ForwardResponse(ForwardResponse::error(request_id, e))
+                }
+            };
+
+            if let Err(e) = transport.send_message(origin_node_id, response).await {
+                warn!(error = %e, "Failed to send ForwardResponse");
+            }
+        });
     }
 
     /// Tick the Raft node (called periodically).

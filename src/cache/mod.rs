@@ -8,15 +8,18 @@ use crate::cluster::memberlist_cluster::{
 use crate::cluster::ClusterMembership;
 use crate::config::CacheConfig;
 use crate::consensus::{CacheStateMachine, RaftNode};
-use crate::error::Result;
+use crate::error::{Error, Result};
+use crate::network::rpc::{ForwardedCommand, ForwardResponse};
 use crate::network::{Message, MessageHandler, NetworkServer};
 use crate::types::{CacheCommand, CacheStats, ClusterStatus, NodeId};
 use bytes::Bytes;
+use dashmap::DashMap;
 use parking_lot::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use storage::CacheStorage;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use tracing::{debug, info, warn};
 
 /// The main distributed cache instance.
@@ -47,6 +50,13 @@ pub struct DistributedCache {
 
     /// Memberlist event loop shutdown sender.
     memberlist_shutdown_tx: Option<mpsc::Sender<()>>,
+
+    /// Pending forwarded requests awaiting leader response.
+    /// Maps request_id -> oneshot sender for the response.
+    pending_forwards: Arc<DashMap<u64, oneshot::Sender<Result<()>>>>,
+
+    /// Counter for generating unique forward request IDs.
+    next_forward_id: AtomicU64,
 }
 
 impl DistributedCache {
@@ -101,8 +111,15 @@ impl DistributedCache {
         let (membership, _event_rx) =
             ClusterMembership::new(config.node_id, config.membership.clone());
 
+        // Create pending forwards map (shared with message handler)
+        let pending_forwards = Arc::new(DashMap::new());
+
         // Create message handler
-        let handler = CacheMessageHandler { raft: raft.clone() };
+        let handler = CacheMessageHandler {
+            raft: raft.clone(),
+            pending_forwards: pending_forwards.clone(),
+            node_id: config.node_id,
+        };
 
         // Create and start network server
         let (server, shutdown_tx) =
@@ -215,6 +232,8 @@ impl DistributedCache {
             shutdown_tx,
             tick_shutdown_tx,
             memberlist_shutdown_tx,
+            pending_forwards,
+            next_forward_id: AtomicU64::new(1),
         })
     }
 
@@ -449,31 +468,45 @@ impl DistributedCache {
     /// Put a key-value pair into the cache.
     ///
     /// This operation goes through Raft consensus and will be replicated
-    /// to all nodes in the cluster.
+    /// to all nodes in the cluster. If this node is not the leader and
+    /// forwarding is enabled, the request will be forwarded to the leader.
     pub async fn put(&self, key: impl Into<Bytes>, value: impl Into<Bytes>) -> Result<()> {
         let key = key.into();
         let value = value.into();
 
         let key_preview = String::from_utf8_lossy(&key[..std::cmp::min(key.len(), 32)]);
-        info!(
-            node_id = self.config.node_id,
-            key = %key_preview,
-            value_len = value.len(),
-            "PUT: Submitting to Raft for replication"
-        );
-
         let command = CacheCommand::put(key.to_vec(), value.to_vec());
-        let result = self.raft.propose(command).await?;
 
-        info!(
-            node_id = self.config.node_id,
-            key = %key_preview,
-            raft_index = result.index,
-            raft_term = result.term,
-            "PUT: Successfully replicated via Raft"
-        );
+        // Try local propose if leader, otherwise forward
+        if self.raft.is_leader() {
+            info!(
+                node_id = self.config.node_id,
+                key = %key_preview,
+                value_len = value.len(),
+                "PUT: Submitting to Raft for replication (leader)"
+            );
 
-        Ok(())
+            let result = self.raft.propose(command).await?;
+
+            info!(
+                node_id = self.config.node_id,
+                key = %key_preview,
+                raft_index = result.index,
+                raft_term = result.term,
+                "PUT: Successfully replicated via Raft"
+            );
+
+            Ok(())
+        } else {
+            info!(
+                node_id = self.config.node_id,
+                key = %key_preview,
+                value_len = value.len(),
+                "PUT: Forwarding to leader (not leader)"
+            );
+
+            self.forward_to_leader(command).await
+        }
     }
 
     /// Put a key-value pair with a custom TTL.
@@ -487,26 +520,39 @@ impl DistributedCache {
         let value = value.into();
 
         let key_preview = String::from_utf8_lossy(&key[..std::cmp::min(key.len(), 32)]);
-        info!(
-            node_id = self.config.node_id,
-            key = %key_preview,
-            value_len = value.len(),
-            ttl_ms = ttl.as_millis(),
-            "PUT_TTL: Submitting to Raft for replication"
-        );
-
         let command = CacheCommand::put_with_ttl(key.to_vec(), value.to_vec(), ttl);
-        let result = self.raft.propose(command).await?;
 
-        info!(
-            node_id = self.config.node_id,
-            key = %key_preview,
-            raft_index = result.index,
-            raft_term = result.term,
-            "PUT_TTL: Successfully replicated via Raft"
-        );
+        if self.raft.is_leader() {
+            info!(
+                node_id = self.config.node_id,
+                key = %key_preview,
+                value_len = value.len(),
+                ttl_ms = ttl.as_millis(),
+                "PUT_TTL: Submitting to Raft for replication (leader)"
+            );
 
-        Ok(())
+            let result = self.raft.propose(command).await?;
+
+            info!(
+                node_id = self.config.node_id,
+                key = %key_preview,
+                raft_index = result.index,
+                raft_term = result.term,
+                "PUT_TTL: Successfully replicated via Raft"
+            );
+
+            Ok(())
+        } else {
+            info!(
+                node_id = self.config.node_id,
+                key = %key_preview,
+                value_len = value.len(),
+                ttl_ms = ttl.as_millis(),
+                "PUT_TTL: Forwarding to leader (not leader)"
+            );
+
+            self.forward_to_leader(command).await
+        }
     }
 
     /// Delete a key from the cache.
@@ -514,44 +560,203 @@ impl DistributedCache {
         let key = key.into();
 
         let key_preview = String::from_utf8_lossy(&key[..std::cmp::min(key.len(), 32)]);
-        info!(
-            node_id = self.config.node_id,
-            key = %key_preview,
-            "DELETE: Submitting to Raft for replication"
-        );
-
         let command = CacheCommand::delete(key.to_vec());
-        let result = self.raft.propose(command).await?;
 
-        info!(
-            node_id = self.config.node_id,
-            key = %key_preview,
-            raft_index = result.index,
-            raft_term = result.term,
-            "DELETE: Successfully replicated via Raft"
-        );
+        if self.raft.is_leader() {
+            info!(
+                node_id = self.config.node_id,
+                key = %key_preview,
+                "DELETE: Submitting to Raft for replication (leader)"
+            );
 
-        Ok(())
+            let result = self.raft.propose(command).await?;
+
+            info!(
+                node_id = self.config.node_id,
+                key = %key_preview,
+                raft_index = result.index,
+                raft_term = result.term,
+                "DELETE: Successfully replicated via Raft"
+            );
+
+            Ok(())
+        } else {
+            info!(
+                node_id = self.config.node_id,
+                key = %key_preview,
+                "DELETE: Forwarding to leader (not leader)"
+            );
+
+            self.forward_to_leader(command).await
+        }
     }
 
     /// Clear all entries from the cache.
     pub async fn clear(&self) -> Result<()> {
-        info!(
-            node_id = self.config.node_id,
-            "CLEAR: Submitting to Raft for replication"
-        );
-
         let command = CacheCommand::clear();
-        let result = self.raft.propose(command).await?;
 
-        info!(
+        if self.raft.is_leader() {
+            info!(
+                node_id = self.config.node_id,
+                "CLEAR: Submitting to Raft for replication (leader)"
+            );
+
+            let result = self.raft.propose(command).await?;
+
+            info!(
+                node_id = self.config.node_id,
+                raft_index = result.index,
+                raft_term = result.term,
+                "CLEAR: Successfully replicated via Raft"
+            );
+
+            Ok(())
+        } else {
+            info!(
+                node_id = self.config.node_id,
+                "CLEAR: Forwarding to leader (not leader)"
+            );
+
+            self.forward_to_leader(command).await
+        }
+    }
+
+    // ==================== Forwarding Logic ====================
+
+    /// Forward a command to the leader node.
+    ///
+    /// This is called when this node receives a write request but is not the leader.
+    /// The request is forwarded to the leader and we wait for the response.
+    async fn forward_to_leader(&self, command: CacheCommand) -> Result<()> {
+        // Check if forwarding is enabled
+        if !self.config.forwarding.enabled {
+            return Err(Error::Raft(crate::error::RaftError::NotLeader {
+                leader: self.raft.leader_id(),
+            }));
+        }
+
+        // Backpressure check
+        let pending_count = self.pending_forwards.len();
+        if pending_count >= self.config.forwarding.max_pending_forwards {
+            warn!(
+                node_id = self.config.node_id,
+                pending = pending_count,
+                max = self.config.forwarding.max_pending_forwards,
+                "FORWARD: Rejecting request due to backpressure"
+            );
+            return Err(Error::ServerBusy { pending: pending_count });
+        }
+
+        // Get leader ID
+        let leader_id = self.raft.leader_id().ok_or_else(|| {
+            warn!(
+                node_id = self.config.node_id,
+                "FORWARD: No leader available for forwarding"
+            );
+            Error::Raft(crate::error::RaftError::NotReady)
+        })?;
+
+        // Generate unique request ID
+        let request_id = self.next_forward_id.fetch_add(1, Ordering::SeqCst);
+
+        // Create completion channel
+        let (tx, rx) = oneshot::channel();
+        self.pending_forwards.insert(request_id, tx);
+
+        // Create forwarded command message
+        let msg = Message::ForwardedCommand(ForwardedCommand::new(
+            request_id,
+            self.config.node_id,
+            command,
+        ));
+
+        debug!(
             node_id = self.config.node_id,
-            raft_index = result.index,
-            raft_term = result.term,
-            "CLEAR: Successfully replicated via Raft"
+            request_id = request_id,
+            leader_id = leader_id,
+            "FORWARD: Sending ForwardedCommand to leader"
         );
 
-        Ok(())
+        // Send to leader via transport
+        if let Err(e) = self.raft.transport().send_message(leader_id, msg).await {
+            self.pending_forwards.remove(&request_id);
+            warn!(
+                node_id = self.config.node_id,
+                request_id = request_id,
+                leader_id = leader_id,
+                error = %e,
+                "FORWARD: Failed to send to leader"
+            );
+            return Err(Error::ForwardFailed(e.to_string()));
+        }
+
+        // Wait for response with timeout
+        let timeout = self.config.forwarding.timeout();
+        match tokio::time::timeout(timeout, rx).await {
+            Ok(Ok(result)) => {
+                debug!(
+                    node_id = self.config.node_id,
+                    request_id = request_id,
+                    success = result.is_ok(),
+                    "FORWARD: Received response from leader"
+                );
+                result
+            }
+            Ok(Err(_)) => {
+                // Channel closed unexpectedly
+                self.pending_forwards.remove(&request_id);
+                warn!(
+                    node_id = self.config.node_id,
+                    request_id = request_id,
+                    "FORWARD: Channel closed unexpectedly"
+                );
+                Err(Error::Internal("forward channel closed".into()))
+            }
+            Err(_) => {
+                // Timeout
+                self.pending_forwards.remove(&request_id);
+                warn!(
+                    node_id = self.config.node_id,
+                    request_id = request_id,
+                    timeout_ms = timeout.as_millis(),
+                    "FORWARD: Timeout waiting for leader response"
+                );
+                Err(Error::Timeout)
+            }
+        }
+    }
+
+    /// Handle a ForwardResponse from the leader.
+    ///
+    /// This is called when we receive a response to a forwarded request.
+    pub fn handle_forward_response(&self, response: &ForwardResponse) {
+        if let Some((_, tx)) = self.pending_forwards.remove(&response.request_id) {
+            let result = if response.success {
+                Ok(())
+            } else {
+                Err(Error::RemoteError(
+                    response.error.clone().unwrap_or_else(|| "unknown error".to_string()),
+                ))
+            };
+            debug!(
+                node_id = self.config.node_id,
+                request_id = response.request_id,
+                success = response.success,
+                "FORWARD: Completing pending forward"
+            );
+            let _ = tx.send(result);
+        } else {
+            warn!(
+                node_id = self.config.node_id,
+                request_id = response.request_id,
+                "FORWARD: Received response for unknown request ID"
+            );
+        }
+    }
+
+    /// Get the pending forwards map (for message handler access).
+    pub fn pending_forwards(&self) -> &Arc<DashMap<u64, oneshot::Sender<Result<()>>>> {
+        &self.pending_forwards
     }
 
     // ==================== Local Operations ====================
@@ -683,10 +888,42 @@ impl DistributedCache {
 /// Message handler that routes messages to the Raft node.
 struct CacheMessageHandler {
     raft: Arc<RaftNode>,
+    /// Pending forwarded requests awaiting leader response.
+    pending_forwards: Arc<DashMap<u64, oneshot::Sender<Result<()>>>>,
+    /// Node ID for logging.
+    node_id: NodeId,
 }
 
 impl MessageHandler for CacheMessageHandler {
     fn handle(&self, msg: Message) -> Option<Message> {
+        // Handle ForwardResponse separately - complete pending forwards
+        if let Message::ForwardResponse(ref response) = msg {
+            if let Some((_, tx)) = self.pending_forwards.remove(&response.request_id) {
+                let result = if response.success {
+                    Ok(())
+                } else {
+                    Err(Error::RemoteError(
+                        response.error.clone().unwrap_or_else(|| "unknown error".to_string()),
+                    ))
+                };
+                debug!(
+                    node_id = self.node_id,
+                    request_id = response.request_id,
+                    success = response.success,
+                    "FORWARD: Completing pending forward"
+                );
+                let _ = tx.send(result);
+            } else {
+                warn!(
+                    node_id = self.node_id,
+                    request_id = response.request_id,
+                    "FORWARD: Received response for unknown request ID"
+                );
+            }
+            return None;
+        }
+
+        // All other messages go to RaftNode
         self.raft.handle_message(msg)
     }
 }

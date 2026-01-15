@@ -130,12 +130,24 @@ pub struct CacheMetrics {
     // Checkpoint metrics
     /// Total snapshots created.
     pub snapshots_created: Counter,
+    /// Failed snapshot attempts.
+    pub snapshots_failed: Counter,
     /// Total snapshots loaded.
     pub snapshots_loaded: Counter,
     /// Snapshot creation duration.
     pub snapshot_duration: Histogram,
+    /// Snapshot load duration.
+    pub snapshot_load_duration: Histogram,
     /// Last snapshot size in bytes.
     pub last_snapshot_size: Gauge,
+    /// Last snapshot entry count.
+    pub last_snapshot_entries: Gauge,
+    /// Last snapshot compression ratio.
+    pub last_snapshot_compression_ratio: FloatGauge,
+    /// Entries since last snapshot.
+    pub entries_since_snapshot: Gauge,
+    /// Backpressure events.
+    pub checkpoint_backpressure: Counter,
 
     // Error counters by type
     /// Errors by type.
@@ -210,13 +222,32 @@ impl CacheMetrics {
 
             // Checkpoint metrics
             snapshots_created: Counter::new("snapshots_created", "Total snapshots created"),
+            snapshots_failed: Counter::new("snapshots_failed", "Failed snapshot attempts"),
             snapshots_loaded: Counter::new("snapshots_loaded", "Total snapshots loaded"),
             snapshot_duration: Histogram::with_buckets(
                 "snapshot_duration_seconds",
                 "Snapshot creation duration",
-                vec![0.1, 0.5, 1.0, 5.0, 10.0, 30.0, 60.0],
+                vec![0.1, 0.5, 1.0, 5.0, 10.0, 30.0, 60.0, 120.0, 300.0],
+            ),
+            snapshot_load_duration: Histogram::with_buckets(
+                "snapshot_load_duration_seconds",
+                "Snapshot load duration",
+                vec![0.1, 0.5, 1.0, 5.0, 10.0, 30.0, 60.0, 120.0, 300.0],
             ),
             last_snapshot_size: Gauge::new("last_snapshot_size_bytes", "Last snapshot size"),
+            last_snapshot_entries: Gauge::new("last_snapshot_entries", "Last snapshot entry count"),
+            last_snapshot_compression_ratio: FloatGauge::new(
+                "last_snapshot_compression_ratio",
+                "Last snapshot compression ratio",
+            ),
+            entries_since_snapshot: Gauge::new(
+                "entries_since_snapshot",
+                "Entries since last snapshot",
+            ),
+            checkpoint_backpressure: Counter::new(
+                "checkpoint_backpressure_total",
+                "Backpressure events during checkpointing",
+            ),
 
             // Errors
             errors: LabeledCounter::new("cache_errors_total", "Errors by type", ["type"]),
@@ -272,11 +303,36 @@ impl CacheMetrics {
         self.rebalance_entries_transferred.inc_by(entries);
     }
 
-    /// Record a snapshot operation.
-    pub fn record_snapshot(&self, duration: Duration, size: u64) {
+    /// Record a successful snapshot creation.
+    pub fn record_snapshot(&self, duration: Duration, size: u64, entries: u64, compression_ratio: f64) {
         self.snapshots_created.inc();
         self.snapshot_duration.observe_duration(duration);
         self.last_snapshot_size.set(size as i64);
+        self.last_snapshot_entries.set(entries as i64);
+        self.last_snapshot_compression_ratio.set(compression_ratio);
+        self.entries_since_snapshot.set(0);
+    }
+
+    /// Record a failed snapshot attempt.
+    pub fn record_snapshot_failure(&self) {
+        self.snapshots_failed.inc();
+    }
+
+    /// Record a snapshot load operation.
+    pub fn record_snapshot_load(&self, duration: Duration, entries: u64) {
+        self.snapshots_loaded.inc();
+        self.snapshot_load_duration.observe_duration(duration);
+        self.last_snapshot_entries.set(entries as i64);
+    }
+
+    /// Record a backpressure event.
+    pub fn record_backpressure(&self) {
+        self.checkpoint_backpressure.inc();
+    }
+
+    /// Update entries since snapshot.
+    pub fn update_entries_since_snapshot(&self, count: u64) {
+        self.entries_since_snapshot.set(count as i64);
     }
 
     /// Record an error.

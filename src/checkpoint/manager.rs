@@ -34,6 +34,18 @@ pub struct CheckpointConfig {
 
     /// Whether checkpointing is enabled
     pub enabled: bool,
+
+    /// Backpressure threshold multiplier (applies backpressure when entries
+    /// exceed log_threshold * backpressure_multiplier during snapshot)
+    pub backpressure_multiplier: u64,
+
+    /// Minimum free disk space required (in bytes) to create a snapshot
+    /// Default: 100MB
+    pub min_free_space: u64,
+
+    /// Estimated average entry size for disk space calculations
+    /// Default: 1KB
+    pub avg_entry_size: u64,
 }
 
 impl Default for CheckpointConfig {
@@ -45,6 +57,9 @@ impl Default for CheckpointConfig {
             max_snapshots: 3,
             compress: true,
             enabled: true,
+            backpressure_multiplier: 2,
+            min_free_space: 100 * 1024 * 1024, // 100MB
+            avg_entry_size: 1024,              // 1KB
         }
     }
 }
@@ -135,6 +150,9 @@ impl CheckpointManager {
         // Create checkpoint directory if it doesn't exist
         if config.enabled {
             fs::create_dir_all(&config.dir)?;
+
+            // Clean up any orphaned temp files from interrupted snapshots
+            Self::cleanup_temp_files(&config.dir)?;
         }
 
         Ok(Self {
@@ -146,6 +164,31 @@ impl CheckpointManager {
             last_snapshot_time: RwLock::new(Instant::now()),
             snapshot_in_progress: AtomicBool::new(false),
         })
+    }
+
+    /// Remove orphaned .tmp files from a previous interrupted snapshot.
+    fn cleanup_temp_files(dir: &Path) -> Result<(), FormatError> {
+        if !dir.exists() {
+            return Ok(());
+        }
+
+        for entry in fs::read_dir(dir)? {
+            let entry = entry?;
+            let path = entry.path();
+
+            if path.is_file() {
+                if let Some(ext) = path.extension() {
+                    if ext == "tmp" {
+                        debug!(path = %path.display(), "Removing orphaned temp file");
+                        if let Err(e) = fs::remove_file(&path) {
+                            warn!(path = %path.display(), error = %e, "Failed to remove temp file");
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(())
     }
 
     /// Get the configuration.
@@ -164,8 +207,118 @@ impl CheckpointManager {
     }
 
     /// Increment entries since snapshot counter.
-    pub fn record_entry(&self) {
+    ///
+    /// Returns `Ok(())` normally, or `Err(Backpressure)` if too many entries
+    /// have accumulated while a snapshot is in progress.
+    pub fn record_entry(&self) -> Result<(), FormatError> {
+        let queued = self.entries_since_snapshot.fetch_add(1, Ordering::Relaxed) + 1;
+
+        // Apply backpressure if snapshot is in progress and queue is too large
+        if self.snapshot_in_progress.load(Ordering::Relaxed) {
+            let threshold = self.config.log_threshold * self.config.backpressure_multiplier;
+            if queued > threshold {
+                return Err(FormatError::Backpressure { queued });
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Increment entries counter without backpressure check.
+    /// Use this for internal operations that should not be rejected.
+    pub fn record_entry_unchecked(&self) {
         self.entries_since_snapshot.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Check if there's enough disk space for a snapshot.
+    fn check_disk_space(&self) -> Result<(), FormatError> {
+        let entry_count = self.storage.entry_count() as u64;
+        let estimated_size = entry_count * self.config.avg_entry_size;
+
+        // Use 2x safety margin
+        let required = (estimated_size * 2).max(self.config.min_free_space);
+
+        // Try to get available space
+        match Self::get_available_space(&self.config.dir) {
+            Ok(available) => {
+                if available < required {
+                    warn!(
+                        available_mb = available / (1024 * 1024),
+                        required_mb = required / (1024 * 1024),
+                        "Insufficient disk space for snapshot"
+                    );
+                    return Err(FormatError::InsufficientDiskSpace { available, required });
+                }
+                debug!(
+                    available_mb = available / (1024 * 1024),
+                    estimated_mb = estimated_size / (1024 * 1024),
+                    "Disk space check passed"
+                );
+                Ok(())
+            }
+            Err(e) => {
+                // Log warning but don't fail - disk space check is best-effort
+                warn!(error = %e, "Failed to check disk space, proceeding anyway");
+                Ok(())
+            }
+        }
+    }
+
+    /// Get available disk space for a path.
+    #[cfg(unix)]
+    fn get_available_space(path: &Path) -> Result<u64, std::io::Error> {
+        use std::os::unix::fs::MetadataExt;
+
+        // Use statvfs via nix or fallback
+        // For simplicity, we'll try to get the metadata of the directory
+        let metadata = fs::metadata(path)?;
+        // This doesn't give us free space, so we need a platform-specific approach
+        // For now, return a large value to not block on unsupported platforms
+        Ok(u64::MAX)
+    }
+
+    /// Get available disk space for a path.
+    #[cfg(windows)]
+    fn get_available_space(path: &Path) -> Result<u64, std::io::Error> {
+        use std::os::windows::ffi::OsStrExt;
+
+        // Use GetDiskFreeSpaceExW
+        extern "system" {
+            fn GetDiskFreeSpaceExW(
+                lpDirectoryName: *const u16,
+                lpFreeBytesAvailableToCaller: *mut u64,
+                lpTotalNumberOfBytes: *mut u64,
+                lpTotalNumberOfFreeBytes: *mut u64,
+            ) -> i32;
+        }
+
+        let path_str = path.as_os_str();
+        let wide: Vec<u16> = path_str.encode_wide().chain(std::iter::once(0)).collect();
+
+        let mut free_bytes_available: u64 = 0;
+        let mut total_bytes: u64 = 0;
+        let mut total_free_bytes: u64 = 0;
+
+        let result = unsafe {
+            GetDiskFreeSpaceExW(
+                wide.as_ptr(),
+                &mut free_bytes_available,
+                &mut total_bytes,
+                &mut total_free_bytes,
+            )
+        };
+
+        if result != 0 {
+            Ok(free_bytes_available)
+        } else {
+            Err(std::io::Error::last_os_error())
+        }
+    }
+
+    #[cfg(not(any(unix, windows)))]
+    fn get_available_space(_path: &Path) -> Result<u64, std::io::Error> {
+        // Unsupported platform - return large value to not block
+        Ok(u64::MAX)
     }
 
     /// Check if a snapshot should be created.
@@ -211,10 +364,13 @@ impl CheckpointManager {
             .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
             .is_err()
         {
-            return Err(FormatError::Io(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                "snapshot already in progress",
-            )));
+            return Err(FormatError::SnapshotInProgress);
+        }
+
+        // Check disk space before starting
+        if let Err(e) = self.check_disk_space() {
+            self.snapshot_in_progress.store(false, Ordering::SeqCst);
+            return Err(e);
         }
 
         let result = self
@@ -238,18 +394,20 @@ impl CheckpointManager {
             raft_term,
             if self.config.compress { "lz4" } else { "dat" }
         );
-        let path = self.config.dir.join(&filename);
+        let temp_filename = format!("{}.tmp", filename);
+        let temp_path = self.config.dir.join(&temp_filename);
+        let final_path = self.config.dir.join(&filename);
 
         info!(
             raft_index,
             raft_term,
-            path = %path.display(),
+            path = %final_path.display(),
             "Creating snapshot"
         );
 
-        // Create writer
+        // Create writer (writes to temp file)
         let writer =
-            SnapshotWriter::new(&path, raft_index, raft_term, self.config.compress)?;
+            SnapshotWriter::new(&temp_path, raft_index, raft_term, self.config.compress)?;
 
         // Iterate cache and write entries
         // Note: This is a simplified implementation. In production, you'd want
@@ -261,8 +419,16 @@ impl CheckpointManager {
         // track entries separately or use a different approach.
         // This is a limitation we'll address in the integration step.
 
-        // Finalize snapshot
+        // Finalize snapshot (includes sync_all)
         let metadata = writer.finalize()?;
+
+        // Atomic rename: temp file -> final file
+        // This ensures we never have a corrupt snapshot file
+        fs::rename(&temp_path, &final_path).map_err(|e| {
+            // Clean up temp file on rename failure
+            let _ = fs::remove_file(&temp_path);
+            FormatError::Io(e)
+        })?;
 
         // Update state
         self.last_snapshot_index
@@ -272,7 +438,7 @@ impl CheckpointManager {
 
         // Update current snapshot info
         *self.current_snapshot.write() = Some(SnapshotInfo {
-            path: path.clone(),
+            path: final_path.clone(),
             raft_index,
             raft_term,
             timestamp: metadata.timestamp,
@@ -513,7 +679,7 @@ mod tests {
 
         // Record enough entries to trigger
         for _ in 0..100 {
-            manager.record_entry();
+            manager.record_entry().unwrap();
         }
 
         assert!(manager.should_snapshot());

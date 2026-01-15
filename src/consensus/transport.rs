@@ -478,6 +478,67 @@ impl RaftTransport {
         }
     }
 
+    /// Send an arbitrary Message to a peer (for forwarding, etc.).
+    ///
+    /// Unlike `send()` which takes RaftMessage, this method sends our custom
+    /// Message enum directly. Used for ForwardedCommand/ForwardResponse.
+    pub async fn send_message(&self, to: NodeId, msg: Message) -> Result<()> {
+        let pending = PendingMessage {
+            to,
+            msg,
+            enqueued_at: Instant::now(),
+        };
+
+        // Try to send via worker (use high priority for forwarded commands)
+        let worker = {
+            let workers = self.workers.read();
+            workers
+                .get(&to)
+                .map(|w| w.high_priority_tx.clone())
+        };
+
+        if let Some(tx) = worker {
+            match tx.try_send(pending) {
+                Ok(_) => {
+                    trace!(from = self.node_id, to, "Custom message queued");
+                    Ok(())
+                }
+                Err(_) => {
+                    Err(Error::from(NetworkError::SendFailed(
+                        "peer queue full".to_string(),
+                    )))
+                }
+            }
+        } else {
+            // Check if peer is known but worker not ready
+            let peer_known = self.peers.read().contains_key(&to);
+            if peer_known {
+                // Ensure worker exists
+                if let Some(addr) = self.get_peer(to) {
+                    self.ensure_worker(to, addr).await;
+                    // Retry send
+                    let worker = {
+                        let workers = self.workers.read();
+                        workers.get(&to).map(|w| w.high_priority_tx.clone())
+                    };
+                    if let Some(tx) = worker {
+                        match tx.try_send(pending) {
+                            Ok(_) => return Ok(()),
+                            Err(_) => {
+                                return Err(Error::from(NetworkError::SendFailed(
+                                    "peer queue full after worker creation".to_string(),
+                                )));
+                            }
+                        }
+                    }
+                }
+            }
+            Err(Error::from(NetworkError::SendFailed(
+                "unknown peer".to_string(),
+            )))
+        }
+    }
+
     pub async fn shutdown(&self) {
         info!(node_id = self.node_id, "Shutting down transport");
 
@@ -1157,7 +1218,7 @@ impl RaftTransport {
             if let Some(ref mut conn) = connection {
                 buffer.clear(); // 复用缓冲区
 
-                match Self::send_message(&mut conn.stream, &pending.msg, buffer, config).await {
+                match Self::send_message_to_stream(&mut conn.stream, &pending.msg, buffer, config).await {
                     Ok(_) => {
                         success = true;
                         metrics.messages_sent.fetch_add(1, Ordering::Relaxed);
@@ -1361,7 +1422,7 @@ impl RaftTransport {
     ///
     /// 使用 encode_message_into 直接写入复用的 BytesMut 缓冲区，
     /// 避免中间 Vec<u8> 分配。
-    async fn send_message(
+    async fn send_message_to_stream(
         stream: &mut TcpStream,
         msg: &Message,
         buffer: &mut BytesMut,

@@ -52,6 +52,22 @@ pub enum Error {
     /// Shard is not active.
     #[error("shard not active: {0}")]
     ShardNotActive(u32),
+
+    /// Server is busy, too many pending requests (backpressure).
+    #[error("server busy: too many pending requests ({pending})")]
+    ServerBusy { pending: usize },
+
+    /// Error from a remote node during forwarding.
+    #[error("remote error: {0}")]
+    RemoteError(String),
+
+    /// Request forwarding failed.
+    #[error("forward failed: {0}")]
+    ForwardFailed(String),
+
+    /// TTL expired during forwarding (too many hops).
+    #[error("forward TTL expired")]
+    ForwardTtlExpired,
 }
 
 /// Raft consensus related errors.

@@ -38,6 +38,9 @@ pub struct CacheConfig {
 
     /// Checkpoint configuration.
     pub checkpoint: CheckpointConfig,
+
+    /// Forwarding configuration for follower-to-leader request routing.
+    pub forwarding: ForwardingConfig,
 }
 
 impl Default for CacheConfig {
@@ -53,6 +56,7 @@ impl Default for CacheConfig {
             membership: MembershipConfig::default(),
             memberlist: MemberlistConfig::default(),
             checkpoint: CheckpointConfig::default(),
+            forwarding: ForwardingConfig::default(),
         }
     }
 }
@@ -137,6 +141,24 @@ impl CacheConfig {
     /// Set memberlist bind address.
     pub fn with_memberlist_addr(mut self, addr: SocketAddr) -> Self {
         self.memberlist.bind_addr = Some(addr);
+        self
+    }
+
+    /// Set forwarding configuration.
+    pub fn with_forwarding_config(mut self, forwarding: ForwardingConfig) -> Self {
+        self.forwarding = forwarding;
+        self
+    }
+
+    /// Enable or disable request forwarding.
+    pub fn with_forwarding_enabled(mut self, enabled: bool) -> Self {
+        self.forwarding.enabled = enabled;
+        self
+    }
+
+    /// Set forwarding timeout in milliseconds.
+    pub fn with_forwarding_timeout_ms(mut self, timeout_ms: u64) -> Self {
+        self.forwarding.forward_timeout_ms = timeout_ms;
         self
     }
 }
@@ -363,6 +385,67 @@ impl MemberlistConfig {
         self.bind_addr.unwrap_or_else(|| {
             SocketAddr::new(raft_addr.ip(), raft_addr.port() + 1000)
         })
+    }
+}
+
+/// Configuration for follower-to-leader request forwarding.
+#[derive(Debug, Clone)]
+pub struct ForwardingConfig {
+    /// Whether forwarding is enabled.
+    /// When disabled, followers will return NotLeader errors instead of forwarding.
+    pub enabled: bool,
+
+    /// Timeout for forwarded requests in milliseconds.
+    pub forward_timeout_ms: u64,
+
+    /// Maximum number of pending forwarded requests.
+    /// This provides backpressure to prevent memory exhaustion.
+    pub max_pending_forwards: usize,
+}
+
+impl Default for ForwardingConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            forward_timeout_ms: 3000, // 3 seconds
+            max_pending_forwards: 5000,
+        }
+    }
+}
+
+impl ForwardingConfig {
+    /// Create a new forwarding config with default values.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Enable or disable forwarding.
+    pub fn with_enabled(mut self, enabled: bool) -> Self {
+        self.enabled = enabled;
+        self
+    }
+
+    /// Set the forward timeout in milliseconds.
+    pub fn with_timeout_ms(mut self, timeout_ms: u64) -> Self {
+        self.forward_timeout_ms = timeout_ms;
+        self
+    }
+
+    /// Set the forward timeout as a Duration.
+    pub fn with_timeout(mut self, timeout: Duration) -> Self {
+        self.forward_timeout_ms = timeout.as_millis() as u64;
+        self
+    }
+
+    /// Set the maximum number of pending forwards.
+    pub fn with_max_pending(mut self, max: usize) -> Self {
+        self.max_pending_forwards = max;
+        self
+    }
+
+    /// Get the forward timeout as a Duration.
+    pub fn timeout(&self) -> Duration {
+        Duration::from_millis(self.forward_timeout_ms)
     }
 }
 

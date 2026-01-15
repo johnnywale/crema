@@ -49,6 +49,7 @@ mod tests {
             membership: Default::default(),
             memberlist: MemberlistConfig::default(), // Disabled by default
             checkpoint: Default::default(),
+            forwarding: Default::default(),
         }
     }
 
@@ -94,6 +95,7 @@ mod tests {
             membership: Default::default(),
             memberlist: MemberlistConfig::default(),
             checkpoint: Default::default(),
+            forwarding: Default::default(),
         }
     }
 

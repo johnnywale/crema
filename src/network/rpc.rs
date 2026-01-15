@@ -22,6 +22,12 @@ pub enum Message {
 
     /// Response to ping.
     Pong(PongResponse),
+
+    /// Forwarded command from follower to leader.
+    ForwardedCommand(ForwardedCommand),
+
+    /// Response to a forwarded command from leader to follower.
+    ForwardResponse(ForwardResponse),
 }
 
 /// Wrapper for Raft messages (since RaftMessage uses protobuf).
@@ -133,6 +139,93 @@ pub struct PongResponse {
 
     /// Current leader ID if known.
     pub leader_id: Option<NodeId>,
+}
+
+/// Forwarded command from a follower to the leader.
+///
+/// When a follower receives a write request, it can forward
+/// it to the leader instead of rejecting with NotLeader error.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ForwardedCommand {
+    /// Unique request ID for correlation.
+    pub request_id: u64,
+
+    /// Node ID of the follower that received the original request.
+    pub origin_node_id: NodeId,
+
+    /// The cache command to execute.
+    pub command: CacheCommand,
+
+    /// Time-to-live: remaining forwards allowed.
+    /// Prevents infinite forwarding loops.
+    /// Starts at 3, decrements on each forward, rejected when 0.
+    pub ttl: u8,
+}
+
+impl ForwardedCommand {
+    /// Create a new forwarded command.
+    pub fn new(request_id: u64, origin_node_id: NodeId, command: CacheCommand) -> Self {
+        Self {
+            request_id,
+            origin_node_id,
+            command,
+            ttl: 3,
+        }
+    }
+
+    /// Create with specific TTL.
+    pub fn with_ttl(request_id: u64, origin_node_id: NodeId, command: CacheCommand, ttl: u8) -> Self {
+        Self {
+            request_id,
+            origin_node_id,
+            command,
+            ttl,
+        }
+    }
+
+    /// Decrement TTL and return the new value.
+    /// Returns None if TTL is already 0.
+    pub fn decrement_ttl(&mut self) -> Option<u8> {
+        if self.ttl == 0 {
+            None
+        } else {
+            self.ttl -= 1;
+            Some(self.ttl)
+        }
+    }
+}
+
+/// Response to a forwarded command from the leader back to the follower.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ForwardResponse {
+    /// The request ID this is responding to.
+    pub request_id: u64,
+
+    /// Whether the command was successfully committed.
+    pub success: bool,
+
+    /// Error message if failed.
+    pub error: Option<String>,
+}
+
+impl ForwardResponse {
+    /// Create a success response.
+    pub fn success(request_id: u64) -> Self {
+        Self {
+            request_id,
+            success: true,
+            error: None,
+        }
+    }
+
+    /// Create an error response.
+    pub fn error(request_id: u64, error: impl Into<String>) -> Self {
+        Self {
+            request_id,
+            success: false,
+            error: Some(error.into()),
+        }
+    }
 }
 
 /// Encode a message to bytes.

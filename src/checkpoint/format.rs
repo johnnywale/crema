@@ -1,12 +1,12 @@
 //! Checkpoint file format definitions.
 //!
-//! # File Format
+//! # File Format (V2)
 //!
 //! ```text
 //! ┌─────────────────────────────────────────────────┐
 //! │ MAGIC_NUMBER: [u8; 4] = "MCRS" (Moka Cache RS)  │
 //! ├─────────────────────────────────────────────────┤
-//! │ VERSION: u32 = 1                                │
+//! │ VERSION: u32 = 2                                │
 //! ├─────────────────────────────────────────────────┤
 //! │ FLAGS: u32                                      │
 //! │   bit 0: compressed (LZ4)                       │
@@ -22,7 +22,9 @@
 //! ├─────────────────────────────────────────────────┤
 //! │ DATA_SIZE: u64 (uncompressed size)              │
 //! ├─────────────────────────────────────────────────┤
-//! │ RESERVED: [u8; 16]                              │
+//! │ HEADER_CRC: u32 (CRC of bytes 0-51)             │
+//! ├─────────────────────────────────────────────────┤
+//! │ RESERVED: [u8; 12]                              │
 //! ├─────────────────────────────────────────────────┤
 //! │                   DATA BLOCK                     │
 //! │ (possibly LZ4 compressed)                       │
@@ -34,23 +36,28 @@
 //! │ │  - Value: [u8]                              │ │
 //! │ │  - Has Expiration: u8 (0=No, 1=Yes)        │ │
 //! │ │  - Expires At: u64 (if has_expiration=1)   │ │
+//! │ │  - Entry CRC: u32 (CRC of this entry)      │ │
 //! │ ├─────────────────────────────────────────────┤ │
 //! │ │ Entry 2: ...                                │ │
 //! │ └─────────────────────────────────────────────┘ │
 //! ├─────────────────────────────────────────────────┤
-//! │ CRC32: u32                                      │
+//! │ DATA_CRC32: u32                                 │
 //! └─────────────────────────────────────────────────┘
 //!
 //! Total header size: 64 bytes
 //! ```
 
+use crc::{Crc, CRC_32_ISCSI};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+/// CRC-32 calculator (iSCSI polynomial)
+const CRC32: Crc<u32> = Crc::<u32>::new(&CRC_32_ISCSI);
 
 /// Magic number for checkpoint files: "MCRS" (Moka Cache RS)
 pub const MAGIC: [u8; 4] = [b'M', b'C', b'R', b'S'];
 
-/// Current format version
-pub const VERSION: u32 = 1;
+/// Current format version (V2 = streaming LZ4 frame compression)
+pub const VERSION: u32 = 2;
 
 /// Header size in bytes
 pub const HEADER_SIZE: usize = 64;
@@ -144,7 +151,13 @@ impl SnapshotHeader {
         // Data size (44-51)
         buf[44..52].copy_from_slice(&self.data_size.to_le_bytes());
 
-        // Reserved (52-63) - already zeros
+        // Header CRC (52-55) - CRC of bytes 0-51
+        let mut digest = CRC32.digest();
+        digest.update(&buf[0..52]);
+        let header_crc = digest.finalize();
+        buf[52..56].copy_from_slice(&header_crc.to_le_bytes());
+
+        // Reserved (56-63) - already zeros
 
         buf
     }
@@ -162,8 +175,21 @@ impl SnapshotHeader {
 
         // Parse fields
         let version = u32::from_le_bytes(buf[4..8].try_into().unwrap());
-        if version > VERSION {
+        if version != VERSION {
             return Err(FormatError::UnsupportedVersion(version));
+        }
+
+        // Verify header CRC before trusting any other fields
+        let stored_crc = u32::from_le_bytes(buf[52..56].try_into().unwrap());
+        let mut digest = CRC32.digest();
+        digest.update(&buf[0..52]);
+        let computed_crc = digest.finalize();
+
+        if stored_crc != computed_crc {
+            return Err(FormatError::HeaderCorrupted {
+                expected: stored_crc,
+                actual: computed_crc,
+            });
         }
 
         let flags = u32::from_le_bytes(buf[8..12].try_into().unwrap());
@@ -249,15 +275,16 @@ impl SnapshotEntry {
         })
     }
 
-    /// Serialized size of this entry
+    /// Serialized size of this entry (including CRC)
     pub fn serialized_size(&self) -> usize {
         4 + self.key.len() + // key length + key
         4 + self.value.len() + // value length + value
         1 + // has_expiration flag
-        if self.expires_at.is_some() { 8 } else { 0 } // expires_at
+        if self.expires_at.is_some() { 8 } else { 0 } + // expires_at
+        4 // entry CRC
     }
 
-    /// Serialize entry to bytes
+    /// Serialize entry to bytes with CRC for integrity checking
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut buf = Vec::with_capacity(self.serialized_size());
 
@@ -277,11 +304,20 @@ impl SnapshotEntry {
             buf.push(0);
         }
 
+        // Calculate and append entry CRC
+        let mut digest = CRC32.digest();
+        digest.update(&buf);
+        let entry_crc = digest.finalize();
+        buf.extend_from_slice(&entry_crc.to_le_bytes());
+
         buf
     }
 
     /// Parse entry from bytes, returns (entry, bytes_consumed)
+    ///
+    /// Verifies the per-entry CRC to detect corruption.
     pub fn from_bytes(buf: &[u8]) -> Result<(Self, usize), FormatError> {
+        let start_pos = 0;
         let mut pos = 0;
 
         // Key length + key
@@ -328,6 +364,24 @@ impl SnapshotEntry {
             None
         };
 
+        // Verify entry CRC
+        if buf.len() < pos + 4 {
+            return Err(FormatError::UnexpectedEof);
+        }
+        let stored_crc = u32::from_le_bytes(buf[pos..pos + 4].try_into().unwrap());
+        pos += 4;
+
+        let mut digest = CRC32.digest();
+        digest.update(&buf[start_pos..pos - 4]); // Exclude the CRC itself
+        let computed_crc = digest.finalize();
+
+        if stored_crc != computed_crc {
+            return Err(FormatError::EntryCorrupted {
+                expected: stored_crc,
+                actual: computed_crc,
+            });
+        }
+
         Ok((
             Self {
                 key,
@@ -351,14 +405,32 @@ pub enum FormatError {
     #[error("invalid header: {0}")]
     InvalidHeader(String),
 
+    #[error("header corrupted: expected CRC {expected:08x}, got {actual:08x}")]
+    HeaderCorrupted { expected: u32, actual: u32 },
+
+    #[error("entry corrupted: expected CRC {expected:08x}, got {actual:08x}")]
+    EntryCorrupted { expected: u32, actual: u32 },
+
     #[error("unexpected end of file")]
     UnexpectedEof,
 
-    #[error("checksum mismatch: expected {expected}, got {actual}")]
+    #[error("data checksum mismatch: expected {expected:08x}, got {actual:08x}")]
     ChecksumMismatch { expected: u32, actual: u32 },
 
     #[error("decompression failed: {0}")]
     DecompressionFailed(String),
+
+    #[error("compression failed: {0}")]
+    CompressionFailed(String),
+
+    #[error("insufficient disk space: {available} bytes available, {required} bytes required")]
+    InsufficientDiskSpace { available: u64, required: u64 },
+
+    #[error("snapshot already in progress")]
+    SnapshotInProgress,
+
+    #[error("backpressure: too many entries queued ({queued}) while snapshot in progress")]
+    Backpressure { queued: u64 },
 
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
@@ -419,5 +491,29 @@ mod tests {
 
         let result = SnapshotHeader::from_bytes(&bytes);
         assert!(matches!(result, Err(FormatError::InvalidMagic)));
+    }
+
+    #[test]
+    fn test_header_corruption_detected() {
+        let header = SnapshotHeader::new(100, 5);
+        let mut bytes = header.to_bytes();
+
+        // Corrupt a byte in the header data
+        bytes[20] ^= 0xFF;
+
+        let result = SnapshotHeader::from_bytes(&bytes);
+        assert!(matches!(result, Err(FormatError::HeaderCorrupted { .. })));
+    }
+
+    #[test]
+    fn test_entry_corruption_detected() {
+        let entry = SnapshotEntry::new(b"key".to_vec(), b"value".to_vec());
+        let mut bytes = entry.to_bytes();
+
+        // Corrupt a byte in the entry data
+        bytes[5] ^= 0xFF;
+
+        let result = SnapshotEntry::from_bytes(&bytes);
+        assert!(matches!(result, Err(FormatError::EntryCorrupted { .. })));
     }
 }
