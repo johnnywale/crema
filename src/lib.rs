@@ -103,7 +103,10 @@ pub mod types;
 
 // Re-export main types for convenience
 pub use cache::DistributedCache;
-pub use config::{CacheConfig, MemberlistConfig, MembershipConfig, MembershipMode, RaftConfig};
+pub use config::{
+    CacheConfig, MemberlistConfig, MembershipConfig, MembershipMode, MultiRaftCacheConfig,
+    RaftConfig,
+};
 pub use error::{Error, Result};
 pub use types::{CacheCommand, CacheStats, ClusterStatus, NodeId, PeerInfo};
 
@@ -142,5 +145,8 @@ pub use testing::{
 pub use multiraft::{
     BatchRouter, CoordinatorState, MultiRaftBuilder, MultiRaftConfig, MultiRaftCoordinator,
     MultiRaftStats, RouterConfig, RoutingDecision, Shard, ShardAssignment, ShardConfig, ShardId,
-    ShardInfo, ShardRange, ShardRouter, ShardState,
+    ShardInfo, ShardLeaderBroadcaster, ShardLeaderTracker, ShardRange, ShardRouter, ShardState,
 };
+
+// Re-export memberlist types for Multi-Raft integration
+pub use cluster::memberlist_cluster::ShardLeaderInfo;

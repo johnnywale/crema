@@ -95,11 +95,13 @@
 //! Read throughput is not affected by Raft and remains high (~500K/sec per node).
 
 mod coordinator;
+pub mod memberlist_integration;
 mod router;
 mod shard;
 
 pub use coordinator::{
     CoordinatorState, MultiRaftBuilder, MultiRaftConfig, MultiRaftCoordinator, MultiRaftStats,
 };
+pub use memberlist_integration::{ShardLeaderBroadcaster, ShardLeaderTracker};
 pub use router::{BatchRouter, RouterConfig, RoutingDecision, ShardRouter};
 pub use shard::{Shard, ShardAssignment, ShardConfig, ShardId, ShardInfo, ShardRange, ShardState};

@@ -8,5 +8,5 @@ pub use events::{MemberEvent, MemberEventListener};
 pub use membership::ClusterMembership;
 pub use memberlist_cluster::{
     MemberlistCluster, MemberlistClusterConfig, MemberlistError, MemberlistEvent, NodeRegistry,
-    RaftNodeMetadata,
+    RaftNodeMetadata, ShardLeaderInfo,
 };

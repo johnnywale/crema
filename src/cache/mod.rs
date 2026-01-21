@@ -1,5 +1,6 @@
 //! Distributed cache implementation.
 
+pub mod router;
 pub mod storage;
 
 use crate::cluster::memberlist_cluster::{
@@ -9,13 +10,16 @@ use crate::cluster::ClusterMembership;
 use crate::config::CacheConfig;
 use crate::consensus::{CacheStateMachine, RaftNode};
 use crate::error::{Error, Result};
+use crate::metrics::CacheMetrics;
+use crate::multiraft::{MultiRaftBuilder, MultiRaftCoordinator};
 use crate::network::rpc::{ForwardedCommand, ForwardResponse};
 use crate::network::{Message, MessageHandler, NetworkServer};
 use crate::types::{CacheCommand, CacheStats, ClusterStatus, NodeId};
 use bytes::Bytes;
 use dashmap::DashMap;
 use parking_lot::Mutex;
-use std::sync::atomic::{AtomicU64, Ordering};
+use router::CacheRouter;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use storage::CacheStorage;
@@ -26,11 +30,17 @@ use tracing::{debug, info, warn};
 ///
 /// This provides a strongly consistent distributed cache backed by Raft consensus.
 /// All write operations go through the Raft leader, while reads can be served locally.
+///
+/// When Multi-Raft mode is enabled, operations are routed to the appropriate shard
+/// based on key hash, allowing for horizontal scaling of write throughput.
 pub struct DistributedCache {
-    /// Local cache storage.
+    /// Cache router (single or multi-raft mode).
+    router: CacheRouter,
+
+    /// Local cache storage (for single mode, also accessible via router).
     storage: Arc<CacheStorage>,
 
-    /// Raft consensus node.
+    /// Raft consensus node (for single mode, also accessible via router).
     raft: Arc<RaftNode>,
 
     /// Cluster membership manager.
@@ -57,22 +67,33 @@ pub struct DistributedCache {
 
     /// Counter for generating unique forward request IDs.
     next_forward_id: AtomicU64,
+
+    /// Shutdown flag to stop accepting new requests.
+    shutdown_flag: AtomicBool,
 }
 
 impl DistributedCache {
     /// Create a new distributed cache instance.
     ///
     /// This will:
-    /// 1. Initialize the local Moka cache
-    /// 2. Set up the Raft consensus layer
-    /// 3. Start the network server
-    /// 4. Begin the Raft tick loop
-    /// 5. Start memberlist gossip (if enabled)
+    /// 1. Validate configuration
+    /// 2. Initialize the local Moka cache
+    /// 3. Set up the Raft consensus layer
+    /// 4. Start the network server
+    /// 5. Begin the Raft tick loop
+    /// 6. Start memberlist gossip (if enabled)
+    /// 7. Initialize Multi-Raft coordinator (if enabled)
     pub async fn new(config: CacheConfig) -> Result<Self> {
+        // Validate configuration
+        if let Err(e) = config.validate() {
+            return Err(Error::Config(e));
+        }
+
         info!(
             node_id = config.node_id,
             raft_addr = %config.raft_addr,
             seed_nodes = ?config.seed_nodes,
+            multiraft_enabled = config.multiraft.enabled,
             "Starting distributed cache"
         );
         info!(node_id = config.node_id, "Starting distributed cache");
@@ -197,6 +218,8 @@ impl DistributedCache {
                     let auto_add_voters = config.memberlist.auto_add_voters;
                     let auto_remove_voters = config.memberlist.auto_remove_voters;
 
+                    let multiraft_enabled = config.multiraft.enabled;
+
                     tokio::spawn(async move {
                         Self::run_memberlist_event_loop(
                             ml_for_events,
@@ -206,6 +229,7 @@ impl DistributedCache {
                             auto_remove,
                             auto_add_voters,
                             auto_remove_voters,
+                            multiraft_enabled,
                         )
                         .await;
                     });
@@ -221,9 +245,38 @@ impl DistributedCache {
             (None, None)
         };
 
+        // Create the appropriate router based on configuration
+        let router = if config.multiraft.enabled {
+            // Create Multi-Raft coordinator
+            let metrics = Arc::new(CacheMetrics::new());
+            let coordinator = MultiRaftBuilder::new(config.node_id)
+                .num_shards(config.multiraft.num_shards)
+                .shard_capacity(config.multiraft.shard_capacity)
+                .metrics(metrics)
+                .build();
+
+            // Initialize if auto-init is enabled
+            if config.multiraft.auto_init_shards {
+                coordinator.init().await.map_err(|e| {
+                    Error::Internal(format!("Failed to initialize Multi-Raft coordinator: {}", e))
+                })?;
+            }
+
+            info!(
+                node_id = config.node_id,
+                num_shards = config.multiraft.num_shards,
+                "Multi-Raft mode enabled"
+            );
+
+            CacheRouter::multi(Arc::new(coordinator))
+        } else {
+            CacheRouter::single(storage.clone(), raft.clone())
+        };
+
         info!(node_id = config.node_id, "Distributed cache started");
 
         Ok(Self {
+            router,
             storage,
             raft,
             membership,
@@ -234,13 +287,15 @@ impl DistributedCache {
             memberlist_shutdown_tx,
             pending_forwards,
             next_forward_id: AtomicU64::new(1),
+            shutdown_flag: AtomicBool::new(false),
         })
     }
 
     /// Run the memberlist event processing loop.
     ///
     /// This handles events from memberlist (node joins, leaves, failures) and
-    /// updates the Raft transport accordingly.
+    /// updates the Raft transport accordingly. In Multi-Raft mode, it also
+    /// handles shard leader updates from gossip.
     async fn run_memberlist_event_loop(
         memberlist: Arc<Mutex<MemberlistCluster>>,
         raft: Arc<RaftNode>,
@@ -249,6 +304,7 @@ impl DistributedCache {
         auto_remove_peers: bool,
         auto_add_voters: bool,
         auto_remove_voters: bool,
+        _multiraft_enabled: bool,
     ) {
         info!("Starting memberlist event processing loop");
 
@@ -861,27 +917,60 @@ impl DistributedCache {
             "Shutting down distributed cache"
         );
 
-        // Shutdown memberlist event loop first
+        // 1. Stop accepting new requests
+        self.shutdown_flag.store(true, Ordering::SeqCst);
+
+        // 2. Shutdown Multi-Raft coordinator (if Multi mode)
+        if let Some(coordinator) = self.router.coordinator() {
+            if let Err(e) = coordinator.shutdown().await {
+                warn!(
+                    node_id = self.config.node_id,
+                    error = %e,
+                    "Error shutting down Multi-Raft coordinator"
+                );
+            }
+        }
+
+        // 3. Shutdown memberlist event loop
         if let Some(ref tx) = self.memberlist_shutdown_tx {
             let _ = tx.send(()).await;
         }
 
-        // Leave memberlist gracefully
+        // 4. Leave memberlist gracefully
         if let Some(ref ml) = self.memberlist {
             let mut ml = ml.lock();
             if let Err(e) = ml.leave().await {
-                warn!(   node_id = self.config.node_id,error = %e, "Error leaving memberlist");
+                warn!(node_id = self.config.node_id, error = %e, "Error leaving memberlist");
             }
             if let Err(e) = ml.shutdown().await {
-                warn!(   node_id = self.config.node_id,error = %e, "Error shutting down memberlist");
+                warn!(node_id = self.config.node_id, error = %e, "Error shutting down memberlist");
             }
         }
 
-        // Shutdown Raft tick loop
+        // 5. Shutdown Raft tick loop
         let _ = self.tick_shutdown_tx.send(()).await;
 
-        // Shutdown network server
+        // 6. Shutdown network server
         let _ = self.shutdown_tx.send(()).await;
+    }
+
+    // ==================== Multi-Raft ====================
+
+    /// Check if Multi-Raft mode is enabled.
+    pub fn is_multiraft_enabled(&self) -> bool {
+        self.router.is_multi_raft()
+    }
+
+    /// Get the Multi-Raft coordinator (only available in Multi-Raft mode).
+    pub fn multiraft_coordinator(&self) -> Option<&Arc<MultiRaftCoordinator>> {
+        self.router.coordinator()
+    }
+
+    /// Get the shard ID for a key (only meaningful in Multi-Raft mode).
+    ///
+    /// Returns None if Multi-Raft is not enabled.
+    pub fn shard_for_key(&self, key: &[u8]) -> Option<u32> {
+        self.router.coordinator().map(|c| c.shard_for_key(key))
     }
 }
 

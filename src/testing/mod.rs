@@ -72,6 +72,7 @@ mod cache_integration_tests_edge_failed;
 mod cache_integration_tests_edge_pass;
 mod memberlist_cache_integration_tests;
 mod memberlist_cluster_tests;
+mod multiraft_integration_tests;
 mod raft;
 mod utils;
 

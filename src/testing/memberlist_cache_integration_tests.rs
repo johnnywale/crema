@@ -14,18 +14,10 @@ use crate::cache::DistributedCache;
 use crate::config::{CacheConfig, MemberlistConfig, RaftConfig};
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicU16, Ordering};
 use std::time::Duration;
+use tokio::net::TcpListener;
 use tokio::time::sleep;
 use tracing::info;
-
-/// Global port counter to ensure each test uses unique ports
-static PORT_COUNTER: AtomicU16 = AtomicU16::new(30000);
-
-/// Allocate unique ports for a test
-fn allocate_ports(count: u16) -> u16 {
-    PORT_COUNTER.fetch_add(count * 100, Ordering::SeqCst)
-}
 
 /// Port configuration for a node
 #[derive(Debug, Clone)]
@@ -34,22 +26,24 @@ struct NodePorts {
     memberlist_port: u16,
 }
 
-/// Allocate ports for multiple nodes
-fn allocate_node_ports(node_ids: &[u64]) -> HashMap<u64, NodePorts> {
-    let base_port = allocate_ports(node_ids.len() as u16);
-    node_ids
-        .iter()
-        .enumerate()
-        .map(|(i, &node_id)| {
-            (
-                node_id,
-                NodePorts {
-                    raft_port: base_port + (i as u16) * 2,
-                    memberlist_port: base_port + (i as u16) * 2 + 1,
-                },
-            )
-        })
-        .collect()
+/// Allocate OS-assigned ports for multiple nodes.
+/// Each node needs 2 ports: one for Raft and one for memberlist.
+async fn allocate_node_ports(node_ids: &[u64]) -> HashMap<u64, NodePorts> {
+    let mut result = HashMap::new();
+    for &node_id in node_ids {
+        // Allocate Raft port
+        let raft_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let raft_port = raft_listener.local_addr().unwrap().port();
+        drop(raft_listener);
+
+        // Allocate memberlist port
+        let ml_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let memberlist_port = ml_listener.local_addr().unwrap().port();
+        drop(ml_listener);
+
+        result.insert(node_id, NodePorts { raft_port, memberlist_port });
+    }
+    result
 }
 
 /// Create a cache config with memberlist enabled for auto-discovery.
@@ -157,7 +151,7 @@ mod tests {
             .try_init();
 
         let node_ids = [1u64, 2, 3];
-        let ports = allocate_node_ports(&node_ids);
+        let ports = allocate_node_ports(&node_ids).await;
 
         info!("Allocated ports: {:?}", ports);
 
@@ -258,7 +252,7 @@ mod tests {
             .try_init();
 
         let node_ids = [1u64, 2, 3];
-        let ports = allocate_node_ports(&node_ids);
+        let ports = allocate_node_ports(&node_ids).await;
 
         // Build addresses
         let raft_addr_1: SocketAddr = format!("127.0.0.1:{}", ports[&1].raft_port).parse().unwrap();
@@ -361,7 +355,7 @@ mod tests {
             .try_init();
 
         let node_ids = [1u64, 2, 3];
-        let ports = allocate_node_ports(&node_ids);
+        let ports = allocate_node_ports(&node_ids).await;
 
         // Build addresses
         let raft_addr_1: SocketAddr = format!("127.0.0.1:{}", ports[&1].raft_port).parse().unwrap();
@@ -447,7 +441,7 @@ mod tests {
             .try_init();
 
         let node_ids = [1u64, 2, 3];
-        let ports = allocate_node_ports(&node_ids);
+        let ports = allocate_node_ports(&node_ids).await;
 
         // Build addresses
         let raft_addr_1: SocketAddr = format!("127.0.0.1:{}", ports[&1].raft_port).parse().unwrap();
@@ -550,7 +544,7 @@ mod tests {
             .try_init();
 
         let node_ids = [1u64, 2];
-        let ports = allocate_node_ports(&node_ids);
+        let ports = allocate_node_ports(&node_ids).await;
 
         // Build addresses
         let raft_addr_1: SocketAddr = format!("127.0.0.1:{}", ports[&1].raft_port).parse().unwrap();

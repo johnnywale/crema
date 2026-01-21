@@ -50,6 +50,7 @@ mod tests {
             memberlist: MemberlistConfig::default(), // Disabled by default
             checkpoint: Default::default(),
             forwarding: Default::default(),
+            multiraft: Default::default(),
         }
     }
 
@@ -96,6 +97,7 @@ mod tests {
             memberlist: MemberlistConfig::default(),
             checkpoint: Default::default(),
             forwarding: Default::default(),
+            multiraft: Default::default(),
         }
     }
 

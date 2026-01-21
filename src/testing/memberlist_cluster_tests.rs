@@ -10,31 +10,47 @@ use crate::cluster::memberlist_cluster::{
     RaftNodeMetadata,
 };
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicU16, Ordering};
 use std::time::Duration;
+use tokio::net::TcpListener;
 
-/// Global port counter to ensure each test uses unique ports
-static PORT_COUNTER: AtomicU16 = AtomicU16::new(20000);
-
-/// Allocate unique ports for a test to avoid port conflicts
-fn allocate_ports(count: u16) -> u16 {
-    PORT_COUNTER.fetch_add(count * 100, Ordering::SeqCst)
+/// Port configuration for a node (bind port for memberlist and raft port)
+#[derive(Debug, Clone)]
+struct NodePorts {
+    bind_port: u16,
+    raft_port: u16,
 }
 
-/// Create a memberlist cluster config with unique ports
-fn create_config(node_id: u64, base_port: u16, seeds: Vec<u16>) -> MemberlistClusterConfig {
-    let bind_port = base_port + (node_id as u16);
-    let raft_port = base_port + 1000 + (node_id as u16);
+/// Allocate OS-assigned ports for multiple nodes.
+/// Each node needs 2 ports: one for memberlist bind and one for raft.
+async fn allocate_node_ports(count: usize) -> Vec<NodePorts> {
+    let mut result = Vec::with_capacity(count);
+    for _ in 0..count {
+        // Allocate memberlist bind port
+        let bind_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let bind_port = bind_listener.local_addr().unwrap().port();
+        drop(bind_listener);
 
-    let seed_addrs: Vec<SocketAddr> = seeds
+        // Allocate raft port
+        let raft_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let raft_port = raft_listener.local_addr().unwrap().port();
+        drop(raft_listener);
+
+        result.push(NodePorts { bind_port, raft_port });
+    }
+    result
+}
+
+/// Create a memberlist cluster config with given ports
+fn create_config(node_id: u64, ports: &NodePorts, seed_ports: &[u16]) -> MemberlistClusterConfig {
+    let seed_addrs: Vec<SocketAddr> = seed_ports
         .iter()
         .map(|p| format!("127.0.0.1:{}", p).parse().unwrap())
         .collect();
 
     MemberlistClusterConfig::new(
         node_id,
-        format!("127.0.0.1:{}", bind_port).parse().unwrap(),
-        format!("127.0.0.1:{}", raft_port).parse().unwrap(),
+        format!("127.0.0.1:{}", ports.bind_port).parse().unwrap(),
+        format!("127.0.0.1:{}", ports.raft_port).parse().unwrap(),
     )
     .with_node_name(format!("test-node-{}", node_id))
     .with_seed_nodes(seed_addrs)
@@ -132,8 +148,8 @@ mod tests {
     /// Verifies that a single node can start and bind to its port successfully.
     #[tokio::test]
     async fn test_case_1_single_node_startup() {
-        let base_port = allocate_ports(1);
-        let config = create_config(1, base_port, vec![]);
+        let ports = allocate_node_ports(1).await;
+        let config = create_config(1, &ports[0], &[]);
 
         let mut cluster = MemberlistCluster::new(config);
         assert!(!cluster.is_initialized());
@@ -159,10 +175,10 @@ mod tests {
     /// Node 2 joins Node 1 via seed configuration and they discover each other.
     #[tokio::test]
     async fn test_case_2_two_node_cluster_formation() {
-        let base_port = allocate_ports(2);
+        let ports = allocate_node_ports(2).await;
 
         // Start Node 1 (seed node)
-        let config1 = create_config(1, base_port, vec![]);
+        let config1 = create_config(1, &ports[0], &[]);
         let mut cluster1 = MemberlistCluster::new(config1);
 
         cluster1
@@ -172,8 +188,7 @@ mod tests {
         assert!(cluster1.is_initialized(), "Node 1 should be initialized");
 
         // Start Node 2 with Node 1 as seed
-        let node1_port = base_port + 1;
-        let config2 = create_config(2, base_port, vec![node1_port]);
+        let config2 = create_config(2, &ports[1], &[ports[0].bind_port]);
         let mut cluster2 = MemberlistCluster::new(config2);
 
         cluster2
@@ -226,10 +241,10 @@ mod tests {
     /// Tests a proper cluster with 3 nodes discovering each other.
     #[tokio::test]
     async fn test_case_3_three_node_cluster_formation() {
-        let base_port = allocate_ports(3);
+        let ports = allocate_node_ports(3).await;
 
         // Start Node 1 (seed node)
-        let config1 = create_config(1, base_port, vec![]);
+        let config1 = create_config(1, &ports[0], &[]);
         let mut cluster1 = MemberlistCluster::new(config1);
 
         cluster1
@@ -237,10 +252,8 @@ mod tests {
             .await
             .expect("Node 1 should start successfully");
 
-        let node1_port = base_port + 1;
-
         // Start Node 2 with Node 1 as seed
-        let config2 = create_config(2, base_port, vec![node1_port]);
+        let config2 = create_config(2, &ports[1], &[ports[0].bind_port]);
         let mut cluster2 = MemberlistCluster::new(config2);
 
         cluster2
@@ -249,7 +262,7 @@ mod tests {
             .expect("Node 2 should start successfully");
 
         // Start Node 3 with Node 1 as seed
-        let config3 = create_config(3, base_port, vec![node1_port]);
+        let config3 = create_config(3, &ports[2], &[ports[0].bind_port]);
         let mut cluster3 = MemberlistCluster::new(config3);
 
         cluster3
@@ -296,10 +309,10 @@ mod tests {
     /// Tests that when a node gracefully leaves, others are notified.
     #[tokio::test]
     async fn test_case_4_graceful_node_leave() {
-        let base_port = allocate_ports(2);
+        let ports = allocate_node_ports(2).await;
 
         // Start Node 1
-        let config1 = create_config(1, base_port, vec![]);
+        let config1 = create_config(1, &ports[0], &[]);
         let mut cluster1 = MemberlistCluster::new(config1);
 
         cluster1
@@ -308,8 +321,7 @@ mod tests {
             .expect("Node 1 should start successfully");
 
         // Start Node 2
-        let node1_port = base_port + 1;
-        let config2 = create_config(2, base_port, vec![node1_port]);
+        let config2 = create_config(2, &ports[1], &[ports[0].bind_port]);
         let mut cluster2 = MemberlistCluster::new(config2);
 
         cluster2
@@ -350,10 +362,10 @@ mod tests {
     /// Verifies that the NodeRegistry is correctly updated when nodes join.
     #[tokio::test]
     async fn test_case_5_registry_updated_on_join() {
-        let base_port = allocate_ports(2);
+        let ports = allocate_node_ports(2).await;
 
         // Start Node 1
-        let config1 = create_config(1, base_port, vec![]);
+        let config1 = create_config(1, &ports[0], &[]);
         let mut cluster1 = MemberlistCluster::new(config1);
 
         cluster1
@@ -373,8 +385,7 @@ mod tests {
         );
 
         // Start Node 2
-        let node1_port = base_port + 1;
-        let config2 = create_config(2, base_port, vec![node1_port]);
+        let config2 = create_config(2, &ports[1], &[ports[0].bind_port]);
         let mut cluster2 = MemberlistCluster::new(config2);
 
         cluster2
@@ -408,10 +419,10 @@ mod tests {
     /// Tests joining with multiple seed nodes for redundancy.
     #[tokio::test]
     async fn test_case_6_multiple_seeds() {
-        let base_port = allocate_ports(3);
+        let ports = allocate_node_ports(3).await;
 
         // Start Node 1
-        let config1 = create_config(1, base_port, vec![]);
+        let config1 = create_config(1, &ports[0], &[]);
         let mut cluster1 = MemberlistCluster::new(config1);
 
         cluster1
@@ -420,8 +431,7 @@ mod tests {
             .expect("Node 1 should start successfully");
 
         // Start Node 2
-        let node1_port = base_port + 1;
-        let config2 = create_config(2, base_port, vec![node1_port]);
+        let config2 = create_config(2, &ports[1], &[ports[0].bind_port]);
         let mut cluster2 = MemberlistCluster::new(config2);
 
         cluster2
@@ -433,8 +443,7 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(500)).await;
 
         // Start Node 3 with both Node 1 and Node 2 as seeds
-        let node2_port = base_port + 2;
-        let config3 = create_config(3, base_port, vec![node1_port, node2_port]);
+        let config3 = create_config(3, &ports[2], &[ports[0].bind_port, ports[1].bind_port]);
         let mut cluster3 = MemberlistCluster::new(config3);
 
         cluster3
@@ -470,10 +479,10 @@ mod tests {
     /// Tests abrupt shutdown (simulating crash).
     #[tokio::test]
     async fn test_case_7_shutdown_without_leave() {
-        let base_port = allocate_ports(2);
+        let ports = allocate_node_ports(2).await;
 
         // Start Node 1
-        let config1 = create_config(1, base_port, vec![]);
+        let config1 = create_config(1, &ports[0], &[]);
         let mut cluster1 = MemberlistCluster::new(config1);
 
         cluster1
@@ -482,8 +491,7 @@ mod tests {
             .expect("Node 1 should start successfully");
 
         // Start Node 2
-        let node1_port = base_port + 1;
-        let config2 = create_config(2, base_port, vec![node1_port]);
+        let config2 = create_config(2, &ports[1], &[ports[0].bind_port]);
         let mut cluster2 = MemberlistCluster::new(config2);
 
         cluster2
@@ -524,10 +532,11 @@ mod tests {
     /// Tests that a node can rejoin the cluster after leaving.
     #[tokio::test]
     async fn test_case_8_rejoin_after_leave() {
-        let base_port = allocate_ports(3); // Extra port range for rejoin
+        // Allocate ports for node1, node2, and node2's rejoin
+        let ports = allocate_node_ports(3).await;
 
         // Start Node 1
-        let config1 = create_config(1, base_port, vec![]);
+        let config1 = create_config(1, &ports[0], &[]);
         let mut cluster1 = MemberlistCluster::new(config1);
 
         cluster1
@@ -535,10 +544,8 @@ mod tests {
             .await
             .expect("Node 1 should start successfully");
 
-        let node1_port = base_port + 1;
-
         // Start Node 2
-        let config2 = create_config(2, base_port, vec![node1_port]);
+        let config2 = create_config(2, &ports[1], &[ports[0].bind_port]);
         let mut cluster2 = MemberlistCluster::new(config2);
 
         cluster2
@@ -565,15 +572,13 @@ mod tests {
         drain_events(&mut cluster1);
 
         // Node 2 rejoins with a new port (simulating restart on different port)
-        // We use a different port to avoid "address already in use" errors
-        let rejoin_port = base_port + 10;
         let config2_new = MemberlistClusterConfig::new(
             2,
-            format!("127.0.0.1:{}", rejoin_port).parse().unwrap(),
-            format!("127.0.0.1:{}", rejoin_port + 1000).parse().unwrap(),
+            format!("127.0.0.1:{}", ports[2].bind_port).parse().unwrap(),
+            format!("127.0.0.1:{}", ports[2].raft_port).parse().unwrap(),
         )
         .with_node_name("test-node-2-rejoined".to_string())
-        .with_seed_nodes(vec![format!("127.0.0.1:{}", node1_port).parse().unwrap()]);
+        .with_seed_nodes(vec![format!("127.0.0.1:{}", ports[0].bind_port).parse().unwrap()]);
 
         let mut cluster2_new = MemberlistCluster::new(config2_new);
         cluster2_new
@@ -600,10 +605,10 @@ mod tests {
     /// Verifies that node metadata (tags) is correctly propagated via gossip.
     #[tokio::test]
     async fn test_case_9_metadata_propagation() {
-        let base_port = allocate_ports(2);
+        let ports = allocate_node_ports(2).await;
 
         // Start Node 1
-        let config1 = create_config(1, base_port, vec![]);
+        let config1 = create_config(1, &ports[0], &[]);
         let mut cluster1 = MemberlistCluster::new(config1);
 
         cluster1
@@ -612,8 +617,7 @@ mod tests {
             .expect("Node 1 should start successfully");
 
         // Start Node 2 (metadata is included in RaftNodeMetadata)
-        let node1_port = base_port + 1;
-        let config2 = create_config(2, base_port, vec![node1_port]);
+        let config2 = create_config(2, &ports[1], &[ports[0].bind_port]);
         let mut cluster2 = MemberlistCluster::new(config2);
 
         cluster2
@@ -644,10 +648,9 @@ mod tests {
                 "Metadata should contain version string"
             );
             // Verify raft_addr is set correctly
-            let expected_raft_port = base_port + 1000 + 2;
             assert_eq!(
                 metadata.raft_addr.port(),
-                expected_raft_port,
+                ports[1].raft_port,
                 "Metadata should contain correct raft_addr"
             );
         }
@@ -661,10 +664,10 @@ mod tests {
     /// Tests multiple nodes joining simultaneously.
     #[tokio::test]
     async fn test_case_10_concurrent_node_joins() {
-        let base_port = allocate_ports(4);
+        let ports = allocate_node_ports(4).await;
 
         // Start Node 1 (seed)
-        let config1 = create_config(1, base_port, vec![]);
+        let config1 = create_config(1, &ports[0], &[]);
         let mut cluster1 = MemberlistCluster::new(config1);
 
         cluster1
@@ -672,12 +675,10 @@ mod tests {
             .await
             .expect("Node 1 should start successfully");
 
-        let node1_port = base_port + 1;
-
         // Start Nodes 2, 3, 4 concurrently
-        let config2 = create_config(2, base_port, vec![node1_port]);
-        let config3 = create_config(3, base_port, vec![node1_port]);
-        let config4 = create_config(4, base_port, vec![node1_port]);
+        let config2 = create_config(2, &ports[1], &[ports[0].bind_port]);
+        let config3 = create_config(3, &ports[2], &[ports[0].bind_port]);
+        let config4 = create_config(4, &ports[3], &[ports[0].bind_port]);
 
         let mut cluster2 = MemberlistCluster::new(config2);
         let mut cluster3 = MemberlistCluster::new(config3);
@@ -718,10 +719,10 @@ mod tests {
     /// Verifies that events are received in a reasonable order.
     #[tokio::test]
     async fn test_case_11_event_ordering() {
-        let base_port = allocate_ports(2);
+        let ports = allocate_node_ports(2).await;
 
         // Start Node 1
-        let config1 = create_config(1, base_port, vec![]);
+        let config1 = create_config(1, &ports[0], &[]);
         let mut cluster1 = MemberlistCluster::new(config1);
 
         cluster1
@@ -730,8 +731,7 @@ mod tests {
             .expect("Node 1 should start successfully");
 
         // Start Node 2
-        let node1_port = base_port + 1;
-        let config2 = create_config(2, base_port, vec![node1_port]);
+        let config2 = create_config(2, &ports[1], &[ports[0].bind_port]);
         let mut cluster2 = MemberlistCluster::new(config2);
 
         cluster2
@@ -787,10 +787,10 @@ mod tests {
     /// Tests cluster formation with 5 nodes.
     #[tokio::test]
     async fn test_case_12_large_cluster() {
-        let base_port = allocate_ports(5);
+        let ports = allocate_node_ports(5).await;
 
         // Start Node 1 (seed)
-        let config1 = create_config(1, base_port, vec![]);
+        let config1 = create_config(1, &ports[0], &[]);
         let mut cluster1 = MemberlistCluster::new(config1);
 
         cluster1
@@ -798,12 +798,11 @@ mod tests {
             .await
             .expect("Seed node should start successfully");
 
-        let node1_port = base_port + 1;
         let mut clusters: Vec<MemberlistCluster> = vec![];
 
         // Start nodes 2-5
         for i in 2..=5 {
-            let config = create_config(i, base_port, vec![node1_port]);
+            let config = create_config(i as u64, &ports[i - 1], &[ports[0].bind_port]);
             let mut cluster = MemberlistCluster::new(config);
 
             cluster
@@ -858,10 +857,10 @@ mod tests {
     /// Verifies that get_node_addr works after gossip discovery.
     #[tokio::test]
     async fn test_case_13_address_lookup_after_join() {
-        let base_port = allocate_ports(2);
+        let ports = allocate_node_ports(2).await;
 
         // Start Node 1
-        let config1 = create_config(1, base_port, vec![]);
+        let config1 = create_config(1, &ports[0], &[]);
         let mut cluster1 = MemberlistCluster::new(config1);
 
         cluster1
@@ -877,16 +876,14 @@ mod tests {
         );
 
         // Verify self address is correct
-        let expected_raft_port = base_port + 1000 + 1;
         assert_eq!(
             self_addr.unwrap().port(),
-            expected_raft_port,
+            ports[0].raft_port,
             "Self address should have correct raft port"
         );
 
         // Start Node 2
-        let node1_port = base_port + 1;
-        let config2 = create_config(2, base_port, vec![node1_port]);
+        let config2 = create_config(2, &ports[1], &[ports[0].bind_port]);
         let mut cluster2 = MemberlistCluster::new(config2);
 
         cluster2
@@ -908,10 +905,9 @@ mod tests {
         );
 
         // Verify Node 2's address is correct
-        let expected_node2_raft_port = base_port + 1000 + 2;
         assert_eq!(
             node2_addr.unwrap().port(),
-            expected_node2_raft_port,
+            ports[1].raft_port,
             "Node 2 address should have correct raft port"
         );
 

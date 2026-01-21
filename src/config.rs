@@ -41,6 +41,9 @@ pub struct CacheConfig {
 
     /// Forwarding configuration for follower-to-leader request routing.
     pub forwarding: ForwardingConfig,
+
+    /// Multi-Raft configuration for horizontal scaling.
+    pub multiraft: MultiRaftCacheConfig,
 }
 
 impl Default for CacheConfig {
@@ -57,6 +60,7 @@ impl Default for CacheConfig {
             memberlist: MemberlistConfig::default(),
             checkpoint: CheckpointConfig::default(),
             forwarding: ForwardingConfig::default(),
+            multiraft: MultiRaftCacheConfig::default(),
         }
     }
 }
@@ -160,6 +164,43 @@ impl CacheConfig {
     pub fn with_forwarding_timeout_ms(mut self, timeout_ms: u64) -> Self {
         self.forwarding.forward_timeout_ms = timeout_ms;
         self
+    }
+
+    /// Set Multi-Raft configuration.
+    pub fn with_multiraft_config(mut self, multiraft: MultiRaftCacheConfig) -> Self {
+        self.multiraft = multiraft;
+        self
+    }
+
+    /// Enable or disable Multi-Raft mode.
+    pub fn with_multiraft_enabled(mut self, enabled: bool) -> Self {
+        self.multiraft.enabled = enabled;
+        self
+    }
+
+    /// Set the number of Multi-Raft shards.
+    pub fn with_multiraft_shards(mut self, num_shards: u32) -> Self {
+        self.multiraft.num_shards = num_shards;
+        self
+    }
+
+    /// Validate the configuration and return an error if invalid.
+    ///
+    /// Checks:
+    /// - Multi-Raft requires memberlist to be enabled
+    /// - Multi-Raft shard count is within limits
+    pub fn validate(&self) -> Result<(), String> {
+        // Multi-Raft requires memberlist for gossip-based shard leader routing
+        if self.multiraft.enabled && !self.memberlist.enabled {
+            return Err("Multi-Raft requires memberlist to be enabled for shard leader discovery".to_string());
+        }
+
+        // Validate Multi-Raft config
+        if let Some(err) = self.multiraft.validate() {
+            return Err(err);
+        }
+
+        Ok(())
     }
 }
 
@@ -388,6 +429,102 @@ impl MemberlistConfig {
     }
 }
 
+/// Configuration for Multi-Raft cache mode.
+///
+/// When enabled, the cache uses multiple Raft groups (shards) for horizontal scaling.
+/// Phase 1 uses gossip-based routing (eventual consistency for shard leader info).
+#[derive(Debug, Clone)]
+pub struct MultiRaftCacheConfig {
+    /// Whether Multi-Raft mode is enabled.
+    /// When disabled, the cache uses a single Raft group.
+    pub enabled: bool,
+
+    /// Number of shards to partition the keyspace.
+    /// Must be between 1 and 64 (Phase 1 limit due to metadata size constraints).
+    pub num_shards: u32,
+
+    /// Maximum capacity per shard.
+    pub shard_capacity: u64,
+
+    /// Whether to automatically initialize shards on startup.
+    pub auto_init_shards: bool,
+
+    /// Debounce interval for broadcasting shard leader updates (milliseconds).
+    /// Batches rapid leader changes to reduce gossip overhead.
+    pub leader_broadcast_debounce_ms: u64,
+}
+
+impl Default for MultiRaftCacheConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            num_shards: 16,
+            shard_capacity: 100_000,
+            auto_init_shards: true,
+            leader_broadcast_debounce_ms: 200,
+        }
+    }
+}
+
+impl MultiRaftCacheConfig {
+    /// Create a new Multi-Raft config with the given number of shards.
+    pub fn new(num_shards: u32) -> Self {
+        Self {
+            enabled: true,
+            num_shards,
+            ..Default::default()
+        }
+    }
+
+    /// Enable Multi-Raft mode.
+    pub fn enabled(mut self) -> Self {
+        self.enabled = true;
+        self
+    }
+
+    /// Set the number of shards.
+    pub fn with_num_shards(mut self, num_shards: u32) -> Self {
+        self.num_shards = num_shards;
+        self
+    }
+
+    /// Set the shard capacity.
+    pub fn with_shard_capacity(mut self, capacity: u64) -> Self {
+        self.shard_capacity = capacity;
+        self
+    }
+
+    /// Disable automatic shard initialization.
+    pub fn with_manual_init(mut self) -> Self {
+        self.auto_init_shards = false;
+        self
+    }
+
+    /// Set the leader broadcast debounce interval.
+    pub fn with_leader_broadcast_debounce_ms(mut self, ms: u64) -> Self {
+        self.leader_broadcast_debounce_ms = ms;
+        self
+    }
+
+    /// Get the debounce duration for leader broadcasts.
+    pub fn leader_broadcast_debounce(&self) -> std::time::Duration {
+        std::time::Duration::from_millis(self.leader_broadcast_debounce_ms)
+    }
+
+    /// Validate the configuration.
+    ///
+    /// Returns an error message if the configuration is invalid.
+    pub fn validate(&self) -> Option<String> {
+        if self.num_shards == 0 {
+            return Some("num_shards must be at least 1".to_string());
+        }
+        if self.num_shards > 64 {
+            return Some("Phase 1 supports max 64 shards (metadata size limit)".to_string());
+        }
+        None
+    }
+}
+
 /// Configuration for follower-to-leader request forwarding.
 #[derive(Debug, Clone)]
 pub struct ForwardingConfig {
@@ -470,5 +607,80 @@ mod tests {
         assert_eq!(config.node_id, 42);
         assert_eq!(config.max_capacity, 1_000_000);
         assert_eq!(config.default_ttl, Some(Duration::from_secs(300)));
+    }
+
+    #[test]
+    fn test_multiraft_config_default() {
+        let config = MultiRaftCacheConfig::default();
+        assert!(!config.enabled);
+        assert_eq!(config.num_shards, 16);
+        assert_eq!(config.shard_capacity, 100_000);
+        assert!(config.auto_init_shards);
+        assert_eq!(config.leader_broadcast_debounce_ms, 200);
+    }
+
+    #[test]
+    fn test_multiraft_config_validation() {
+        // Valid config
+        let config = MultiRaftCacheConfig::new(16);
+        assert!(config.validate().is_none());
+
+        // Zero shards is invalid
+        let config = MultiRaftCacheConfig {
+            num_shards: 0,
+            ..Default::default()
+        };
+        assert!(config.validate().is_some());
+
+        // More than 64 shards is invalid (Phase 1 limit)
+        let config = MultiRaftCacheConfig {
+            num_shards: 65,
+            ..Default::default()
+        };
+        assert!(config.validate().is_some());
+
+        // Max 64 shards is valid
+        let config = MultiRaftCacheConfig {
+            num_shards: 64,
+            ..Default::default()
+        };
+        assert!(config.validate().is_none());
+    }
+
+    #[test]
+    fn test_cache_config_multiraft_requires_memberlist() {
+        // Multi-Raft enabled but memberlist disabled should fail validation
+        let config = CacheConfig::default()
+            .with_multiraft_enabled(true);
+        assert!(config.validate().is_err());
+
+        // Multi-Raft enabled with memberlist enabled should pass
+        let config = CacheConfig::default()
+            .with_memberlist_enabled(true)
+            .with_multiraft_enabled(true);
+        assert!(config.validate().is_ok());
+
+        // Multi-Raft disabled should pass regardless of memberlist
+        let config = CacheConfig::default()
+            .with_multiraft_enabled(false);
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_multiraft_config_builder() {
+        let config = MultiRaftCacheConfig::new(32)
+            .with_shard_capacity(50_000)
+            .with_manual_init()
+            .with_leader_broadcast_debounce_ms(500);
+
+        assert!(config.enabled);
+        assert_eq!(config.num_shards, 32);
+        assert_eq!(config.shard_capacity, 50_000);
+        assert!(!config.auto_init_shards);
+        assert_eq!(config.leader_broadcast_debounce_ms, 500);
+        assert_eq!(
+            config.leader_broadcast_debounce(),
+            Duration::from_millis(500)
+        );
     }
 }

@@ -81,6 +81,7 @@ pub(crate) fn cluster_node_config(node_id: NodeId, port_configs: &[(NodeId, u16)
         memberlist: MemberlistConfig::default(),
         checkpoint: Default::default(),
         forwarding: Default::default(),
+        multiraft: Default::default(),
     }
 }
 

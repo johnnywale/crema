@@ -6,6 +6,7 @@
 //! - Handling shard rebalancing
 //! - Coordinating leader elections across shards
 
+use super::memberlist_integration::{ShardLeaderBroadcaster, ShardLeaderTracker};
 use super::router::{RouterConfig, ShardRouter};
 use super::shard::{Shard, ShardConfig, ShardId, ShardInfo, ShardState};
 use crate::error::{Error, Result};
@@ -154,6 +155,12 @@ pub struct MultiRaftCoordinator {
 
     /// Whether the coordinator is running.
     running: AtomicBool,
+
+    /// Epoch-based shard leader tracker for handling out-of-order gossip.
+    leader_tracker: ShardLeaderTracker,
+
+    /// Debounced shard leader broadcaster.
+    leader_broadcaster: ShardLeaderBroadcaster,
 }
 
 impl MultiRaftCoordinator {
@@ -161,6 +168,8 @@ impl MultiRaftCoordinator {
     pub fn new(node_id: NodeId, config: MultiRaftConfig, metrics: Arc<CacheMetrics>) -> Self {
         let router_config = RouterConfig::new(config.num_shards);
         let router = Arc::new(ShardRouter::new(router_config));
+        let leader_tracker = ShardLeaderTracker::new(node_id);
+        let leader_broadcaster = ShardLeaderBroadcaster::new(config.tick_interval);
 
         Self {
             node_id,
@@ -172,6 +181,35 @@ impl MultiRaftCoordinator {
             operations_total: AtomicU64::new(0),
             start_time: Instant::now(),
             running: AtomicBool::new(false),
+            leader_tracker,
+            leader_broadcaster,
+        }
+    }
+
+    /// Create a coordinator with a custom broadcaster debounce interval.
+    pub fn with_broadcaster_debounce(
+        node_id: NodeId,
+        config: MultiRaftConfig,
+        metrics: Arc<CacheMetrics>,
+        debounce: Duration,
+    ) -> Self {
+        let router_config = RouterConfig::new(config.num_shards);
+        let router = Arc::new(ShardRouter::new(router_config));
+        let leader_tracker = ShardLeaderTracker::new(node_id);
+        let leader_broadcaster = ShardLeaderBroadcaster::new(debounce);
+
+        Self {
+            node_id,
+            config,
+            state: RwLock::new(CoordinatorState::Initializing),
+            router,
+            shard_configs: RwLock::new(HashMap::new()),
+            metrics,
+            operations_total: AtomicU64::new(0),
+            start_time: Instant::now(),
+            running: AtomicBool::new(false),
+            leader_tracker,
+            leader_broadcaster,
         }
     }
 
@@ -361,6 +399,72 @@ impl MultiRaftCoordinator {
         }
     }
 
+    /// Update the leader for a shard if the epoch is newer.
+    ///
+    /// This method handles out-of-order gossip updates by checking epochs.
+    /// Returns `true` if the update was applied, `false` if rejected due to stale epoch.
+    pub fn set_shard_leader_if_newer(
+        &self,
+        shard_id: ShardId,
+        leader_id: NodeId,
+        epoch: u64,
+    ) -> bool {
+        if self.leader_tracker.set_leader_if_newer(shard_id, leader_id, epoch) {
+            // Update the router with the new leader
+            self.router.set_shard_leader(shard_id, leader_id);
+
+            if let Some(shard) = self.router.get_shard(shard_id) {
+                shard.set_is_leader(leader_id == self.node_id);
+            }
+
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Set a shard leader for a local leader change.
+    ///
+    /// Automatically increments the epoch and queues for broadcast.
+    /// Returns the new epoch.
+    pub fn set_local_shard_leader(&self, shard_id: ShardId, leader_id: NodeId) -> u64 {
+        let epoch = self.leader_tracker.set_local_leader(shard_id, leader_id);
+
+        // Update router
+        self.router.set_shard_leader(shard_id, leader_id);
+        if let Some(shard) = self.router.get_shard(shard_id) {
+            shard.set_is_leader(leader_id == self.node_id);
+        }
+
+        // Queue for broadcast
+        self.leader_broadcaster.queue_update(shard_id, leader_id, epoch);
+
+        epoch
+    }
+
+    /// Invalidate leadership for all shards where the given node was leader.
+    ///
+    /// Called when a node fails or leaves the cluster.
+    /// Returns the list of invalidated shard IDs.
+    pub fn invalidate_leader_for_node(&self, node_id: NodeId) -> Vec<ShardId> {
+        let invalidated = self.leader_tracker.invalidate_leader_for_node(node_id);
+
+        // Clear leaders in router
+        for shard_id in &invalidated {
+            if let Some(shard) = self.router.get_shard(*shard_id) {
+                shard.set_leader(None);
+                shard.set_is_leader(false);
+            }
+        }
+
+        invalidated
+    }
+
+    /// Get the current epoch for a shard.
+    pub fn get_shard_epoch(&self, shard_id: ShardId) -> Option<u64> {
+        self.leader_tracker.get_epoch(shard_id)
+    }
+
     /// Get all leaders for all shards.
     pub fn shard_leaders(&self) -> HashMap<ShardId, Option<NodeId>> {
         let mut leaders = HashMap::new();
@@ -368,6 +472,16 @@ impl MultiRaftCoordinator {
             leaders.insert(shard_id, self.router.get_shard_leader(shard_id));
         }
         leaders
+    }
+
+    /// Get the shard leader tracker.
+    pub fn leader_tracker(&self) -> &ShardLeaderTracker {
+        &self.leader_tracker
+    }
+
+    /// Get the shard leader broadcaster.
+    pub fn leader_broadcaster(&self) -> &ShardLeaderBroadcaster {
+        &self.leader_broadcaster
     }
 
     /// Shutdown the coordinator.

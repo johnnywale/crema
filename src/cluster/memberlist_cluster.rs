@@ -95,6 +95,23 @@ pub struct RaftNodeMetadata {
     pub tags: HashMap<String, String>,
 }
 
+/// Shard leader information with epoch for ordering out-of-order gossip updates.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ShardLeaderInfo {
+    /// The leader's node ID.
+    pub leader_id: NodeId,
+    /// Monotonically increasing epoch for version ordering.
+    /// Higher epochs supersede lower ones for the same shard.
+    pub epoch: u64,
+}
+
+impl ShardLeaderInfo {
+    /// Create a new shard leader info.
+    pub fn new(leader_id: NodeId, epoch: u64) -> Self {
+        Self { leader_id, epoch }
+    }
+}
+
 impl RaftNodeMetadata {
     pub fn new(raft_id: NodeId, raft_addr: SocketAddr) -> Self {
         Self {
@@ -119,6 +136,79 @@ impl RaftNodeMetadata {
     pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
         bincode::deserialize(bytes).ok()
     }
+
+    /// Set shard leaders with epoch information.
+    ///
+    /// Encodes as: "shard_id:leader_id:epoch,..." under the key "multiraft.shard_leaders".
+    /// This format is compact to fit within memberlist's 512-byte metadata limit.
+    pub fn set_shard_leaders(&mut self, leaders: &HashMap<u32, ShardLeaderInfo>) {
+        if leaders.is_empty() {
+            self.tags.remove("multiraft.shard_leaders");
+            return;
+        }
+
+        let encoded = leaders
+            .iter()
+            .map(|(shard_id, info)| format!("{}:{}:{}", shard_id, info.leader_id, info.epoch))
+            .collect::<Vec<_>>()
+            .join(",");
+        self.tags.insert("multiraft.shard_leaders".to_string(), encoded);
+    }
+
+    /// Get shard leaders from metadata.
+    ///
+    /// Decodes the "multiraft.shard_leaders" tag.
+    /// Returns an empty map if the tag is missing or malformed.
+    /// Tolerates individual malformed entries (skips them).
+    pub fn get_shard_leaders(&self) -> HashMap<u32, ShardLeaderInfo> {
+        self.tags
+            .get("multiraft.shard_leaders")
+            .map(|s| parse_shard_leaders(s))
+            .unwrap_or_default()
+    }
+
+    /// Check if this node has Multi-Raft shard leader information.
+    pub fn has_shard_leaders(&self) -> bool {
+        self.tags.contains_key("multiraft.shard_leaders")
+    }
+}
+
+/// Parse shard leaders from the encoded string format.
+///
+/// Format: "shard_id:leader_id:epoch,..."
+/// Tolerates malformed entries by skipping them.
+fn parse_shard_leaders(encoded: &str) -> HashMap<u32, ShardLeaderInfo> {
+    let mut result = HashMap::new();
+
+    if encoded.is_empty() {
+        return result;
+    }
+
+    for entry in encoded.split(',') {
+        let parts: Vec<&str> = entry.split(':').collect();
+        if parts.len() != 3 {
+            // Skip malformed entries
+            tracing::debug!(entry = entry, "Skipping malformed shard leader entry");
+            continue;
+        }
+
+        let shard_id = match parts[0].parse::<u32>() {
+            Ok(id) => id,
+            Err(_) => continue,
+        };
+        let leader_id = match parts[1].parse::<NodeId>() {
+            Ok(id) => id,
+            Err(_) => continue,
+        };
+        let epoch = match parts[2].parse::<u64>() {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+
+        result.insert(shard_id, ShardLeaderInfo::new(leader_id, epoch));
+    }
+
+    result
 }
 
 /// Events emitted by the memberlist cluster
@@ -866,5 +956,120 @@ mod tests {
             Some("192.168.1.100:7002".parse().unwrap())
         );
         assert_eq!(config.node_name(), "my-custom-node");
+    }
+
+    #[test]
+    fn test_shard_leader_info() {
+        let info = ShardLeaderInfo::new(42, 5);
+        assert_eq!(info.leader_id, 42);
+        assert_eq!(info.epoch, 5);
+    }
+
+    #[test]
+    fn test_shard_leader_metadata_encoding() {
+        let mut meta = RaftNodeMetadata::new(1, "127.0.0.1:9001".parse().unwrap());
+
+        // Set some shard leaders
+        let mut leaders = std::collections::HashMap::new();
+        leaders.insert(0, ShardLeaderInfo::new(1, 10));
+        leaders.insert(1, ShardLeaderInfo::new(2, 20));
+        leaders.insert(2, ShardLeaderInfo::new(1, 15));
+
+        meta.set_shard_leaders(&leaders);
+
+        // Verify encoding
+        assert!(meta.has_shard_leaders());
+
+        // Decode and verify
+        let decoded = meta.get_shard_leaders();
+        assert_eq!(decoded.len(), 3);
+
+        let info0 = decoded.get(&0).unwrap();
+        assert_eq!(info0.leader_id, 1);
+        assert_eq!(info0.epoch, 10);
+
+        let info1 = decoded.get(&1).unwrap();
+        assert_eq!(info1.leader_id, 2);
+        assert_eq!(info1.epoch, 20);
+
+        let info2 = decoded.get(&2).unwrap();
+        assert_eq!(info2.leader_id, 1);
+        assert_eq!(info2.epoch, 15);
+    }
+
+    #[test]
+    fn test_shard_leader_metadata_empty() {
+        let meta = RaftNodeMetadata::new(1, "127.0.0.1:9001".parse().unwrap());
+
+        // No shard leaders set
+        assert!(!meta.has_shard_leaders());
+        let decoded = meta.get_shard_leaders();
+        assert!(decoded.is_empty());
+    }
+
+    #[test]
+    fn test_shard_leader_metadata_clear() {
+        let mut meta = RaftNodeMetadata::new(1, "127.0.0.1:9001".parse().unwrap());
+
+        // Set some leaders
+        let mut leaders = std::collections::HashMap::new();
+        leaders.insert(0, ShardLeaderInfo::new(1, 10));
+        meta.set_shard_leaders(&leaders);
+        assert!(meta.has_shard_leaders());
+
+        // Clear by setting empty map
+        meta.set_shard_leaders(&std::collections::HashMap::new());
+        assert!(!meta.has_shard_leaders());
+    }
+
+    #[test]
+    fn test_shard_leader_parse_malformed_entries() {
+        // Test that malformed entries are gracefully skipped
+        let malformed_inputs = [
+            "",                           // Empty
+            "0:1",                         // Missing epoch
+            "0:1:a",                       // Non-numeric epoch
+            "a:1:10",                      // Non-numeric shard_id
+            "0:b:10",                      // Non-numeric leader_id
+            "0:1:10,invalid,1:2:20",       // One valid, one invalid, one valid
+        ];
+
+        for input in &malformed_inputs {
+            let result = parse_shard_leaders(input);
+            // Should not panic, just skip invalid entries
+            if *input == "0:1:10,invalid,1:2:20" {
+                // Should have parsed 2 valid entries
+                assert_eq!(result.len(), 2);
+                assert!(result.contains_key(&0));
+                assert!(result.contains_key(&1));
+            }
+        }
+    }
+
+    #[test]
+    fn test_shard_leader_serialization_roundtrip() {
+        let mut meta = RaftNodeMetadata::new(1, "127.0.0.1:9001".parse().unwrap());
+
+        // Set shard leaders
+        let mut leaders = std::collections::HashMap::new();
+        leaders.insert(0, ShardLeaderInfo::new(100, 1000));
+        leaders.insert(63, ShardLeaderInfo::new(200, 2000)); // Max shard in Phase 1
+        meta.set_shard_leaders(&leaders);
+
+        // Serialize and deserialize the entire metadata
+        let bytes = meta.to_bytes();
+        let decoded_meta = RaftNodeMetadata::from_bytes(&bytes).unwrap();
+
+        // Verify shard leaders survived the roundtrip
+        let decoded_leaders = decoded_meta.get_shard_leaders();
+        assert_eq!(decoded_leaders.len(), 2);
+
+        let info0 = decoded_leaders.get(&0).unwrap();
+        assert_eq!(info0.leader_id, 100);
+        assert_eq!(info0.epoch, 1000);
+
+        let info63 = decoded_leaders.get(&63).unwrap();
+        assert_eq!(info63.leader_id, 200);
+        assert_eq!(info63.epoch, 2000);
     }
 }
