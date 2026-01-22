@@ -68,6 +68,34 @@ pub enum Error {
     /// TTL expired during forwarding (too many hops).
     #[error("forward TTL expired")]
     ForwardTtlExpired,
+
+    /// Migrations are paused.
+    #[error("migrations paused")]
+    MigrationPaused,
+
+    /// Too many concurrent migrations.
+    #[error("too many concurrent migrations")]
+    TooManyMigrations,
+
+    /// Shard is already being migrated.
+    #[error("shard already migrating: {0}")]
+    ShardAlreadyMigrating(u32),
+
+    /// Migration not found.
+    #[error("migration not found for shard: {0}")]
+    MigrationNotFound(u32),
+
+    /// Invalid migration phase.
+    #[error("invalid migration phase: {0}")]
+    InvalidMigrationPhase(String),
+
+    /// Migration failed.
+    #[error("migration failed: {0}")]
+    MigrationFailed(String),
+
+    /// Migration timed out.
+    #[error("migration timed out")]
+    MigrationTimeout,
 }
 
 /// Raft consensus related errors.
@@ -210,6 +238,191 @@ pub enum MembershipError {
     JoinFailed(String),
 }
 
+impl Error {
+    /// Returns true if this error is transient and the operation can be retried.
+    ///
+    /// Transient errors are temporary conditions that may succeed if retried,
+    /// such as network timeouts, temporary unavailability, or backpressure.
+    ///
+    /// Permanent errors indicate configuration issues, invalid state, or
+    /// conditions that won't change without intervention.
+    pub fn is_retryable(&self) -> bool {
+        match self {
+            // Top-level transient errors
+            Error::Timeout => true,
+            Error::ServerBusy { .. } => true,
+            Error::MigrationPaused => true, // May resume later
+            Error::TooManyMigrations => true, // May have capacity later
+
+            // Delegate to nested error types
+            Error::Raft(e) => e.is_retryable(),
+            Error::Network(e) => e.is_retryable(),
+            Error::Storage(e) => e.is_retryable(),
+            Error::Membership(e) => e.is_retryable(),
+
+            // Permanent errors - won't change without intervention
+            Error::Config(_) => false,
+            Error::Cancelled => false,
+            Error::Internal(_) => false,
+            Error::ShardNotFound(_) => false,
+            Error::ShardAlreadyExists(_) => false,
+            Error::ShardNotActive(_) => false,
+            Error::RemoteError(_) => false,
+            Error::ForwardFailed(_) => true, // Network issue, might succeed
+            Error::ForwardTtlExpired => false, // Configuration/routing issue
+            Error::ShardAlreadyMigrating(_) => false, // Must wait for current migration
+            Error::MigrationNotFound(_) => false,
+            Error::InvalidMigrationPhase(_) => false,
+            Error::MigrationFailed(_) => false, // Terminal failure
+            Error::MigrationTimeout => true, // Might succeed with retry
+        }
+    }
+
+    /// Returns true if this error is permanent and should not be retried.
+    pub fn is_permanent(&self) -> bool {
+        !self.is_retryable()
+    }
+
+    /// Returns a suggested retry delay for transient errors.
+    ///
+    /// Returns `None` for permanent errors that should not be retried.
+    pub fn retry_delay(&self) -> Option<std::time::Duration> {
+        use std::time::Duration;
+
+        if !self.is_retryable() {
+            return None;
+        }
+
+        match self {
+            Error::Timeout => Some(Duration::from_millis(100)),
+            Error::ServerBusy { pending } => {
+                // Exponential backoff based on queue depth
+                let base_ms = 10u64.saturating_mul(*pending as u64).min(1000);
+                Some(Duration::from_millis(base_ms))
+            }
+            Error::MigrationPaused => Some(Duration::from_secs(1)),
+            Error::TooManyMigrations => Some(Duration::from_millis(500)),
+            Error::MigrationTimeout => Some(Duration::from_millis(200)),
+            Error::ForwardFailed(_) => Some(Duration::from_millis(50)),
+            Error::Raft(e) => e.retry_delay(),
+            Error::Network(e) => e.retry_delay(),
+            Error::Storage(e) => e.retry_delay(),
+            Error::Membership(e) => e.retry_delay(),
+            _ => Some(Duration::from_millis(100)),
+        }
+    }
+}
+
+impl RaftError {
+    /// Returns true if this Raft error is transient and can be retried.
+    pub fn is_retryable(&self) -> bool {
+        match self {
+            RaftError::NotLeader { .. } => true,
+            RaftError::ProposalDropped => true,
+            RaftError::NotReady => true,
+            RaftError::ConfigChangeInProgress => true,
+            RaftError::ApplyFailed(_) => false,
+            RaftError::Internal(_) => false,
+        }
+    }
+
+    /// Returns suggested retry delay for transient errors.
+    pub fn retry_delay(&self) -> Option<std::time::Duration> {
+        use std::time::Duration;
+
+        match self {
+            RaftError::NotLeader { .. } => Some(Duration::from_millis(50)),
+            RaftError::ProposalDropped => Some(Duration::from_millis(10)),
+            RaftError::NotReady => Some(Duration::from_millis(100)),
+            RaftError::ConfigChangeInProgress => Some(Duration::from_millis(200)),
+            _ => None,
+        }
+    }
+}
+
+impl NetworkError {
+    /// Returns true if this network error is transient and can be retried.
+    pub fn is_retryable(&self) -> bool {
+        match self {
+            NetworkError::ConnectionFailed { .. } => true,
+            NetworkError::ConnectionClosed => true,
+            NetworkError::SendFailed(_) => true,
+            NetworkError::ReceiveFailed(_) => true,
+            NetworkError::Io(_) => true,
+            NetworkError::Serialization(_) => false,
+            NetworkError::Deserialization(_) => false,
+            NetworkError::InvalidAddress(_) => false,
+        }
+    }
+
+    /// Returns suggested retry delay for transient errors.
+    pub fn retry_delay(&self) -> Option<std::time::Duration> {
+        use std::time::Duration;
+
+        match self {
+            NetworkError::ConnectionFailed { .. } => Some(Duration::from_millis(100)),
+            NetworkError::ConnectionClosed => Some(Duration::from_millis(50)),
+            NetworkError::SendFailed(_) => Some(Duration::from_millis(20)),
+            NetworkError::ReceiveFailed(_) => Some(Duration::from_millis(20)),
+            NetworkError::Io(_) => Some(Duration::from_millis(50)),
+            _ => None,
+        }
+    }
+}
+
+impl StorageError {
+    /// Returns true if this storage error is transient and can be retried.
+    pub fn is_retryable(&self) -> bool {
+        match self {
+            StorageError::SnapshotTemporarilyUnavailable => true,
+            StorageError::Io(_) => true,
+            StorageError::EntryNotFound(_) => false,
+            StorageError::SnapshotNotFound => false,
+            StorageError::NonContiguous { .. } => false,
+            StorageError::LogGap { .. } => false,
+            StorageError::Compacted(_) => false,
+        }
+    }
+
+    /// Returns suggested retry delay for transient errors.
+    pub fn retry_delay(&self) -> Option<std::time::Duration> {
+        use std::time::Duration;
+
+        match self {
+            StorageError::SnapshotTemporarilyUnavailable => Some(Duration::from_millis(500)),
+            StorageError::Io(_) => Some(Duration::from_millis(100)),
+            _ => None,
+        }
+    }
+}
+
+impl MembershipError {
+    /// Returns true if this membership error is transient and can be retried.
+    pub fn is_retryable(&self) -> bool {
+        match self {
+            MembershipError::NodeNotDiscovered(_) => true,
+            MembershipError::JoinFailed(_) => true,
+            MembershipError::NodeStillAlive(_) => true,
+            MembershipError::NodeNotFound(_) => false,
+            MembershipError::NodeAlreadyExists(_) => false,
+            MembershipError::WouldLoseQuorum { .. } => false,
+            MembershipError::TooManyPeers { .. } => false,
+        }
+    }
+
+    /// Returns suggested retry delay for transient errors.
+    pub fn retry_delay(&self) -> Option<std::time::Duration> {
+        use std::time::Duration;
+
+        match self {
+            MembershipError::NodeNotDiscovered(_) => Some(Duration::from_secs(1)),
+            MembershipError::JoinFailed(_) => Some(Duration::from_millis(500)),
+            MembershipError::NodeStillAlive(_) => Some(Duration::from_secs(2)),
+            _ => None,
+        }
+    }
+}
+
 impl From<bincode::Error> for Error {
     fn from(e: bincode::Error) -> Self {
         Error::Network(NetworkError::Serialization(e.to_string()))
@@ -219,5 +432,91 @@ impl From<bincode::Error> for Error {
 impl From<raft::Error> for Error {
     fn from(e: raft::Error) -> Self {
         Error::Raft(RaftError::Internal(e.to_string()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_error_is_retryable() {
+        assert!(Error::Timeout.is_retryable());
+        assert!(Error::ServerBusy { pending: 10 }.is_retryable());
+        assert!(Error::MigrationPaused.is_retryable());
+        assert!(Error::TooManyMigrations.is_retryable());
+        assert!(Error::MigrationTimeout.is_retryable());
+
+        assert!(!Error::Config("bad config".to_string()).is_retryable());
+        assert!(!Error::Cancelled.is_retryable());
+        assert!(!Error::ShardNotFound(1).is_retryable());
+        assert!(!Error::MigrationFailed("failed".to_string()).is_retryable());
+    }
+
+    #[test]
+    fn test_raft_error_is_retryable() {
+        assert!(RaftError::NotLeader { leader: Some(1) }.is_retryable());
+        assert!(RaftError::ProposalDropped.is_retryable());
+        assert!(RaftError::NotReady.is_retryable());
+        assert!(RaftError::ConfigChangeInProgress.is_retryable());
+        assert!(!RaftError::ApplyFailed("failed".to_string()).is_retryable());
+    }
+
+    #[test]
+    fn test_network_error_is_retryable() {
+        assert!(NetworkError::ConnectionFailed {
+            addr: "127.0.0.1:8080".to_string(),
+            reason: "refused".to_string()
+        }
+        .is_retryable());
+        assert!(NetworkError::ConnectionClosed.is_retryable());
+        assert!(!NetworkError::Serialization("bad data".to_string()).is_retryable());
+        assert!(!NetworkError::InvalidAddress("bad".to_string()).is_retryable());
+    }
+
+    #[test]
+    fn test_storage_error_is_retryable() {
+        assert!(StorageError::SnapshotTemporarilyUnavailable.is_retryable());
+        assert!(StorageError::Io("disk error".to_string()).is_retryable());
+        assert!(!StorageError::EntryNotFound(1).is_retryable());
+        assert!(!StorageError::Compacted(5).is_retryable());
+    }
+
+    #[test]
+    fn test_membership_error_is_retryable() {
+        assert!(MembershipError::NodeNotDiscovered(1).is_retryable());
+        assert!(MembershipError::JoinFailed("timeout".to_string()).is_retryable());
+        assert!(!MembershipError::NodeNotFound(1).is_retryable());
+        assert!(!MembershipError::WouldLoseQuorum {
+            current: 3,
+            remaining: 1
+        }
+        .is_retryable());
+    }
+
+    #[test]
+    fn test_retry_delay() {
+        assert!(Error::Timeout.retry_delay().is_some());
+        assert!(Error::ServerBusy { pending: 10 }.retry_delay().is_some());
+        assert!(Error::Cancelled.retry_delay().is_none());
+        assert!(Error::ShardNotFound(1).retry_delay().is_none());
+
+        let delay_10 = Error::ServerBusy { pending: 10 }.retry_delay().unwrap();
+        let delay_100 = Error::ServerBusy { pending: 100 }.retry_delay().unwrap();
+        assert!(delay_100 > delay_10);
+    }
+
+    #[test]
+    fn test_is_permanent_inverse_of_retryable() {
+        let errors = vec![
+            Error::Timeout,
+            Error::Cancelled,
+            Error::ServerBusy { pending: 5 },
+            Error::ShardNotFound(1),
+        ];
+
+        for err in errors {
+            assert_eq!(err.is_permanent(), !err.is_retryable());
+        }
     }
 }

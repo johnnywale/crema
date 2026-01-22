@@ -19,11 +19,9 @@ moka = { version = "0.12", features = ["future"] }
 # Raft consensus
 raft = "0.7"
 slog = "2"
-slog-stdlog = "4"
 protobuf = "2"
 
 # Cluster membership and discovery
-nodecraft = { version = "0.8", features = ["default", "async", "agnostic", "resolver"] }
 
 # Memberlist for gossip-based discovery
 memberlist = { version = "0.7", features = [
@@ -35,7 +33,7 @@ memberlist = { version = "0.7", features = [
 ] }
 
 # Async runtime
-tokio = { version = "1", features = ["sync", "time", "rt", "net", "io-util", "macros"] }
+tokio = { version = "1", features = ["sync", "time", "rt", "net", "io-util", "macros", "fs"] }
 tokio-util = "0.7"
 futures = "0.3"
 
@@ -64,6 +62,10 @@ slog-term = "2.9.2"
 # String types
 smol_str = "0.3"
 socket2 = "0.6.1"
+
+# Migration support
+uuid = { version = "1", features = ["v4", "serde"] }
+async-trait = "0.1"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full", "macros"] }

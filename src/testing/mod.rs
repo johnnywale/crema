@@ -74,6 +74,7 @@ mod memberlist_cache_integration_tests;
 mod memberlist_cluster_tests;
 mod multiraft_integration_tests;
 mod raft;
+mod rebalance_e2e_tests;
 mod utils;
 
 pub use chaos::{

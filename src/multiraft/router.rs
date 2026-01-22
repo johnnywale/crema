@@ -53,18 +53,49 @@ impl RouterConfig {
 }
 
 /// Routes requests to the appropriate shard.
+///
+/// # Locking Strategy (Hot Path Analysis)
+///
+/// This router is designed for high-throughput scenarios with the following
+/// locking characteristics:
+///
+/// ## Read Path (`get`, `put`, `delete`)
+/// 1. `shard_for_key()`: Read lock on `key_cache` (fast cache lookup)
+///    - Cache hit: Returns immediately with read lock only
+///    - Cache miss: Brief write lock to populate cache (amortized over many ops)
+/// 2. `get_shard()`: Read lock on `shards` HashMap
+/// 3. Actual data operation: Lock-free (Moka cache uses lock-free data structures)
+///
+/// ## Write Path (Topology Changes)
+/// - `register_shard()`, `unregister_shard()`: Write lock on `shards`
+/// - These are rare control-plane operations, not hot path
+///
+/// ## Performance Characteristics
+/// - Read locks allow full concurrency for get/put operations
+/// - `parking_lot::RwLock` provides better performance than std's RwLock
+/// - Cache is bounded to 100K entries to prevent memory bloat
+/// - After warmup, cache hit rate is high (read locks dominate)
+///
+/// ## Potential Improvements for Extreme Throughput
+/// - Replace `RwLock<HashMap>` with `DashMap` for shards (avoid all locks)
+/// - Use `ArcSwap` for read-heavy shard lookups with rare updates
+/// - Pre-populate key_cache on startup for known hot keys
 #[derive(Debug)]
 pub struct ShardRouter {
     /// Configuration.
     config: RouterConfig,
 
     /// Map of shard ID to shard instance.
+    /// Uses RwLock for safe concurrent access. Read locks dominate in steady state.
     shards: RwLock<HashMap<ShardId, Arc<Shard>>>,
 
     /// Map of shard ID to leader node.
+    /// Updated during leader elections and topology changes.
     shard_leaders: RwLock<HashMap<ShardId, NodeId>>,
 
     /// Cache of key hash to shard ID (optional optimization).
+    /// Reduces repeated hash-to-shard calculations for hot keys.
+    /// Bounded to 100K entries. Must be cleared on topology changes.
     key_cache: Option<RwLock<HashMap<u64, ShardId>>>,
 }
 

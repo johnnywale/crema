@@ -178,9 +178,12 @@ impl DistributedCache {
                 let seed_addrs: Vec<_> = config
                     .seed_nodes
                     .iter()
-                    .map(|(_, addr)| {
+                    .filter_map(|(_, addr)| {
                         // Convert raft addr to memberlist addr (port + 1000)
-                        std::net::SocketAddr::new(addr.ip(), addr.port() + 1000)
+                        // Use checked_add to prevent overflow with high ephemeral ports
+                        addr.port().checked_add(1000).map(|ml_port| {
+                            std::net::SocketAddr::new(addr.ip(), ml_port)
+                        })
                     })
                     .collect();
                 if !seed_addrs.is_empty() {

@@ -16,7 +16,7 @@
 //! # Example
 //!
 //! ```rust,no_run
-//! use distributed_cache::{DistributedCache, CacheConfig};
+//! use crema::{DistributedCache, CacheConfig};
 //! use std::time::Duration;
 //!
 //! #[tokio::main]
@@ -97,7 +97,7 @@ pub mod metrics;
 pub mod multiraft;
 pub mod network;
 pub mod partitioning;
-pub mod rebalancing;
+// pub mod rebalancing;
 pub mod testing;
 pub mod types;
 
@@ -122,11 +122,11 @@ pub use checkpoint::{
 // Re-export partitioning types
 pub use partitioning::{HashRing, KeyOwnership, OwnershipRole, OwnershipTracker, PendingTransfers};
 
-// Re-export rebalancing types
-pub use rebalancing::{
-    RebalanceConfig, RebalanceCoordinator, RebalanceError, RebalanceState, RebalanceType,
-    TransferBatch, TransferEntry, TransferProgress,
-};
+// // Re-export rebalancing types
+// pub use rebalancing::{
+//     RebalanceConfig, RebalanceCoordinator, RebalanceError, RebalanceState, RebalanceType,
+//     TransferBatch, TransferEntry, TransferProgress,
+// };
 
 // Re-export metrics types
 pub use metrics::{
@@ -146,7 +146,18 @@ pub use multiraft::{
     BatchRouter, CoordinatorState, MultiRaftBuilder, MultiRaftConfig, MultiRaftCoordinator,
     MultiRaftStats, RouterConfig, RoutingDecision, Shard, ShardAssignment, ShardConfig, ShardId,
     ShardInfo, ShardLeaderBroadcaster, ShardLeaderTracker, ShardRange, ShardRouter, ShardState,
+    // Shard placement and registry
+    MovementType, PlacementConfig, ShardMovement, ShardPlacement,
+    ShardLifecycleState, ShardMetadata, ShardRegistry,
+    // Migration (use multiraft:: prefix to avoid conflicts with rebalancing)
+    InMemoryMigrationStore, MigrationCheckpoint, MigrationConfig, MigrationPhase,
+    MigrationProgress, MigrationStateStore, MigrationStats, ShardMigration,
+    ShardMigrationCoordinator, MigrationMetrics, MigrationMetricsSnapshot, MigrationTimer,
 };
+
+// Re-export migration transfer types (from multiraft, not rebalancing)
+pub use multiraft::TransferBatch as MigrationTransferBatch;
+pub use multiraft::TransferEntry as MigrationTransferEntry;
 
 // Re-export memberlist types for Multi-Raft integration
 pub use cluster::memberlist_cluster::ShardLeaderInfo;
