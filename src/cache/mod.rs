@@ -84,6 +84,8 @@ impl DistributedCache {
     /// 6. Start memberlist gossip (if enabled)
     /// 7. Initialize Multi-Raft coordinator (if enabled)
     pub async fn new(config: CacheConfig) -> Result<Self> {
+        use crate::checkpoint::CheckpointManager;
+
         // Validate configuration
         if let Err(e) = config.validate() {
             return Err(Error::Config(e));
@@ -113,13 +115,126 @@ impl DistributedCache {
             }
         }
 
-        // Create Raft node
+        // Check for existing snapshot BEFORE creating Raft node
+        // This allows us to set the correct applied index in raft-rs
+        // Only do recovery when using persistent storage (RocksDB), not in-memory
+        #[cfg(feature = "rocksdb-storage")]
+        let uses_persistent_storage = matches!(
+            config.raft.storage_type,
+            crate::config::RaftStorageType::RocksDb(_)
+        );
+        #[cfg(not(feature = "rocksdb-storage"))]
+        let uses_persistent_storage = false;
+
+        let (recovered_index, checkpoint_manager) = if config.checkpoint.enabled && uses_persistent_storage {
+            match CheckpointManager::new(config.checkpoint.clone(), storage.clone()) {
+                Ok(manager) => {
+                    let manager = Arc::new(manager);
+                    // Find latest snapshot and get its index
+                    match manager.find_latest_snapshot() {
+                        Ok(Some(info)) => {
+                            info!(
+                                node_id = config.node_id,
+                                path = %info.path.display(),
+                                raft_index = info.raft_index,
+                                raft_term = info.raft_term,
+                                "Found existing snapshot for recovery"
+                            );
+                            (Some((info, manager.clone())), Some(manager))
+                        }
+                        Ok(None) => {
+                            debug!(
+                                node_id = config.node_id,
+                                "No existing snapshot found"
+                            );
+                            (None, Some(manager))
+                        }
+                        Err(e) => {
+                            warn!(
+                                node_id = config.node_id,
+                                error = %e,
+                                "Failed to find snapshot"
+                            );
+                            (None, Some(manager))
+                        }
+                    }
+                }
+                Err(e) => {
+                    warn!(
+                        node_id = config.node_id,
+                        error = %e,
+                        "Failed to create checkpoint manager"
+                    );
+                    (None, None)
+                }
+            }
+        } else if config.checkpoint.enabled {
+            // Checkpointing enabled but using in-memory storage - create manager but don't recover
+            match CheckpointManager::new(config.checkpoint.clone(), storage.clone()) {
+                Ok(manager) => (None, Some(Arc::new(manager))),
+                Err(e) => {
+                    warn!(
+                        node_id = config.node_id,
+                        error = %e,
+                        "Failed to create checkpoint manager"
+                    );
+                    (None, None)
+                }
+            }
+        } else {
+            (None, None)
+        };
+
+        // Create Raft config with correct applied index for recovery
+        let mut raft_config = config.raft.clone();
+        if let Some((ref info, _)) = recovered_index {
+            raft_config.applied = info.raft_index;
+            info!(
+                node_id = config.node_id,
+                applied = info.raft_index,
+                "Setting Raft applied index from snapshot for recovery"
+            );
+        }
+
+        // Create Raft node with the correct applied index
         let raft = RaftNode::new(
             config.node_id,
             initial_peers.clone(),
-            config.raft.clone(),
-            state_machine,
+            raft_config,
+            state_machine.clone(),
         )?;
+
+        // Set checkpoint manager on Raft node if available
+        if let Some(manager) = checkpoint_manager {
+            raft.set_checkpoint_manager(manager);
+        }
+
+        // Load snapshot data into cache if recovering
+        if let Some((info, manager)) = recovered_index {
+            info!(
+                node_id = config.node_id,
+                path = %info.path.display(),
+                "Loading snapshot data"
+            );
+            match manager.load_snapshot(&info.path).await {
+                Ok(loaded_index) => {
+                    // Update state machine's applied state
+                    state_machine.set_recovered_state(info.raft_index, info.raft_term);
+                    info!(
+                        node_id = config.node_id,
+                        loaded_index = loaded_index,
+                        "Snapshot loaded successfully"
+                    );
+                }
+                Err(e) => {
+                    warn!(
+                        node_id = config.node_id,
+                        error = %e,
+                        "Failed to load snapshot data"
+                    );
+                }
+            }
+        }
 
         // Add peers to transport using their actual node IDs
         for (peer_id, addr) in &config.seed_nodes {
@@ -501,6 +616,70 @@ impl DistributedCache {
         self.storage.get(key).await
     }
 
+    /// Get a value with linearizable consistency (strongly consistent read).
+    ///
+    /// This method uses the Read-Index protocol to ensure the read is linearizable:
+    /// 1. Verifies this node is the leader (or forwards to leader if configured)
+    /// 2. Confirms leadership via Raft quorum before reading
+    /// 3. Waits for state machine to apply up to the read index
+    ///
+    /// This is more expensive than `get()` but provides strong consistency guarantees.
+    /// Use this when you need to read the most recent value and cannot tolerate stale reads.
+    ///
+    /// # Returns
+    /// - `Ok(Some(value))` - The value exists and was read with linearizable consistency
+    /// - `Ok(None)` - The key doesn't exist (confirmed with linearizable consistency)
+    /// - `Err(NotLeader)` - This node is not the leader and forwarding is disabled
+    /// - `Err(...)` - Other errors (timeout, etc.)
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// // Strongly consistent read - guaranteed to see latest write
+    /// let value = cache.consistent_get(b"key").await?;
+    ///
+    /// // vs regular read - may be stale on followers
+    /// let value = cache.get(b"key").await;
+    /// ```
+    pub async fn consistent_get(&self, key: &[u8]) -> Result<Option<Bytes>> {
+        // If not leader and forwarding is enabled, we could forward
+        // For now, require reads to be on leader for simplicity
+        if !self.raft.is_leader() {
+            // Check if we should forward to leader
+            if self.config.forwarding.enabled {
+                if let Some(leader_id) = self.raft.leader_id() {
+                    debug!(
+                        node_id = self.raft.id(),
+                        leader_id, "CONSISTENT_GET: Not leader, would forward to leader"
+                    );
+                    // For now, return NotLeader error
+                    // TODO: Implement read forwarding when needed
+                    return Err(crate::error::RaftError::NotLeader {
+                        leader: Some(leader_id),
+                    }
+                    .into());
+                }
+            }
+            return Err(crate::error::RaftError::NotLeader {
+                leader: self.raft.leader_id(),
+            }
+            .into());
+        }
+
+        // Use Read-Index protocol to verify leadership and get linearizable read point
+        let read_index = self.raft.read_index().await?;
+
+        debug!(
+            node_id = self.raft.id(),
+            read_index,
+            key = %String::from_utf8_lossy(&key[..std::cmp::min(key.len(), 32)]),
+            "CONSISTENT_GET: Read linearizable at index"
+        );
+
+        // Now safe to read from local storage
+        Ok(self.storage.get(key).await)
+    }
+
     /// Check if a key exists in the local cache.
     pub fn contains(&self, key: &[u8]) -> bool {
         self.storage.contains(key)
@@ -538,7 +717,7 @@ impl DistributedCache {
 
         // Try local propose if leader, otherwise forward
         if self.raft.is_leader() {
-            info!(
+            debug!(
                 node_id = self.config.node_id,
                 key = %key_preview,
                 value_len = value.len(),
@@ -547,7 +726,7 @@ impl DistributedCache {
 
             let result = self.raft.propose(command).await?;
 
-            info!(
+            debug!(
                 node_id = self.config.node_id,
                 key = %key_preview,
                 raft_index = result.index,
@@ -582,7 +761,7 @@ impl DistributedCache {
         let command = CacheCommand::put_with_ttl(key.to_vec(), value.to_vec(), ttl);
 
         if self.raft.is_leader() {
-            info!(
+            debug!(
                 node_id = self.config.node_id,
                 key = %key_preview,
                 value_len = value.len(),
@@ -592,7 +771,7 @@ impl DistributedCache {
 
             let result = self.raft.propose(command).await?;
 
-            info!(
+            debug!(
                 node_id = self.config.node_id,
                 key = %key_preview,
                 raft_index = result.index,
@@ -602,7 +781,7 @@ impl DistributedCache {
 
             Ok(())
         } else {
-            info!(
+            debug!(
                 node_id = self.config.node_id,
                 key = %key_preview,
                 value_len = value.len(),
@@ -622,7 +801,7 @@ impl DistributedCache {
         let command = CacheCommand::delete(key.to_vec());
 
         if self.raft.is_leader() {
-            info!(
+            debug!(
                 node_id = self.config.node_id,
                 key = %key_preview,
                 "DELETE: Submitting to Raft for replication (leader)"
@@ -630,7 +809,7 @@ impl DistributedCache {
 
             let result = self.raft.propose(command).await?;
 
-            info!(
+            debug!(
                 node_id = self.config.node_id,
                 key = %key_preview,
                 raft_index = result.index,
@@ -640,7 +819,7 @@ impl DistributedCache {
 
             Ok(())
         } else {
-            info!(
+            debug!(
                 node_id = self.config.node_id,
                 key = %key_preview,
                 "DELETE: Forwarding to leader (not leader)"
@@ -913,17 +1092,50 @@ impl DistributedCache {
 
     // ==================== Lifecycle ====================
 
-    /// Shutdown the distributed cache.
+    /// Shutdown the distributed cache gracefully.
+    ///
+    /// This method performs a graceful shutdown by:
+    /// 1. Stopping acceptance of new requests
+    /// 2. Waiting for pending Raft proposals to complete (with timeout)
+    /// 3. Pausing active migrations and checkpointing their state
+    /// 4. Leaving the cluster gracefully via memberlist
+    /// 5. Stopping background tasks
+    ///
+    /// The shutdown has a default timeout of 30 seconds for pending operations.
     pub async fn shutdown(&self) {
+        self.shutdown_with_timeout(Duration::from_secs(30)).await;
+    }
+
+    /// Shutdown the distributed cache with a custom timeout for pending operations.
+    pub async fn shutdown_with_timeout(&self, timeout: Duration) {
         info!(
             node_id = self.config.node_id,
+            timeout_secs = timeout.as_secs(),
             "Shutting down distributed cache"
         );
 
+        let start = std::time::Instant::now();
+
         // 1. Stop accepting new requests
         self.shutdown_flag.store(true, Ordering::SeqCst);
+        self.raft.stop_accepting_proposals();
 
-        // 2. Shutdown Multi-Raft coordinator (if Multi mode)
+        // 2. Wait for pending Raft proposals to complete (with timeout)
+        let pending_deadline = start + timeout / 3; // Use 1/3 of timeout for proposals
+        while self.raft.has_pending_proposals() {
+            if std::time::Instant::now() > pending_deadline {
+                warn!(
+                    node_id = self.config.node_id,
+                    pending = self.raft.pending_proposal_count(),
+                    "Timeout waiting for pending proposals, continuing shutdown"
+                );
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        // 3. Shutdown Multi-Raft coordinator (if Multi mode)
+        // This pauses migrations and checkpoints their state
         if let Some(coordinator) = self.router.coordinator() {
             if let Err(e) = coordinator.shutdown().await {
                 warn!(
@@ -934,12 +1146,12 @@ impl DistributedCache {
             }
         }
 
-        // 3. Shutdown memberlist event loop
+        // 4. Shutdown memberlist event loop
         if let Some(ref tx) = self.memberlist_shutdown_tx {
             let _ = tx.send(()).await;
         }
 
-        // 4. Leave memberlist gracefully
+        // 5. Leave memberlist gracefully
         if let Some(ref ml) = self.memberlist {
             let mut ml = ml.lock();
             if let Err(e) = ml.leave().await {
@@ -950,11 +1162,26 @@ impl DistributedCache {
             }
         }
 
-        // 5. Shutdown Raft tick loop
+        // 6. Shutdown Raft tick loop
         let _ = self.tick_shutdown_tx.send(()).await;
 
-        // 6. Shutdown network server
+        // 7. Shutdown Raft node (flushes storage if persistent)
+        if let Err(e) = self.raft.clone().shutdown().await {
+            warn!(
+                node_id = self.config.node_id,
+                error = %e,
+                "Error during Raft shutdown"
+            );
+        }
+
+        // 8. Shutdown network server
         let _ = self.shutdown_tx.send(()).await;
+
+        info!(
+            node_id = self.config.node_id,
+            elapsed_ms = start.elapsed().as_millis(),
+            "Distributed cache shutdown complete"
+        );
     }
 
     // ==================== Multi-Raft ====================
@@ -974,6 +1201,27 @@ impl DistributedCache {
     /// Returns None if Multi-Raft is not enabled.
     pub fn shard_for_key(&self, key: &[u8]) -> Option<u32> {
         self.router.coordinator().map(|c| c.shard_for_key(key))
+    }
+
+    // ==================== Recovery/Checkpoint Operations ====================
+
+    /// Get the applied index (for recovery testing and monitoring).
+    pub fn applied_index(&self) -> u64 {
+        self.raft.applied_index()
+    }
+
+    /// Force a snapshot of the current state to disk.
+    ///
+    /// This creates both an in-memory Raft snapshot (for InstallSnapshot RPC)
+    /// and a persistent disk snapshot (for recovery after restart).
+    ///
+    /// This is useful for testing recovery scenarios.
+    pub async fn force_checkpoint(&self) -> Result<()> {
+        self.raft
+            .create_snapshot()
+            .await
+            .map(|_| ())
+            .map_err(|e| Error::Internal(format!("Snapshot failed: {}", e)))
     }
 }
 

@@ -12,7 +12,7 @@ use parking_lot::RwLock;
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// Unique identifier for a shard.
 pub type ShardId = u32;
@@ -246,13 +246,27 @@ impl Shard {
     /// Apply a command to this shard (called by Raft state machine).
     pub async fn apply(&self, command: &CacheCommand) {
         match command {
-            CacheCommand::Put { key, value, ttl_ms } => {
+            CacheCommand::Put {
+                key,
+                value,
+                expires_at_ms,
+            } => {
                 let key = Bytes::from(key.clone());
                 let value = Bytes::from(value.clone());
-                if let Some(ttl_ms) = ttl_ms {
-                    self.storage
-                        .insert_with_ttl(key, value, Duration::from_millis(*ttl_ms))
-                        .await;
+                if let Some(expires_at_ms) = expires_at_ms {
+                    // Calculate remaining TTL from absolute expiration time
+                    let now_ms = SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_millis() as u64;
+
+                    if *expires_at_ms > now_ms {
+                        let remaining_ttl_ms = *expires_at_ms - now_ms;
+                        self.storage
+                            .insert_with_ttl(key, value, Duration::from_millis(remaining_ttl_ms))
+                            .await;
+                    }
+                    // If already expired, skip insertion
                 } else {
                     self.storage.insert(key, value).await;
                 }
@@ -262,6 +276,9 @@ impl Shard {
             }
             CacheCommand::Clear => {
                 self.storage.invalidate_all();
+            }
+            CacheCommand::Get { .. } => {
+                // Get is read-only, no state change needed
             }
         }
         self.applied_index.fetch_add(1, Ordering::Relaxed);

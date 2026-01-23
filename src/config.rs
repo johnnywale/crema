@@ -228,6 +228,9 @@ pub struct RaftConfig {
 
     /// Applied index to start from (for recovery).
     pub applied: u64,
+
+    /// Storage type for Raft log persistence.
+    pub storage_type: RaftStorageType,
 }
 
 impl Default for RaftConfig {
@@ -240,6 +243,7 @@ impl Default for RaftConfig {
             max_inflight_msgs: 256,
             pre_vote: true,
             applied: 0,
+            storage_type: RaftStorageType::Memory,
         }
     }
 }
@@ -257,6 +261,84 @@ impl RaftConfig {
             applied: self.applied,
             ..Default::default()
         }
+    }
+
+    /// Create a fast Raft configuration suitable for tests.
+    /// Uses shorter tick intervals and election timeouts to speed up test execution.
+    pub fn fast_for_tests() -> Self {
+        Self {
+            tick_interval_ms: 20,   // 20ms per tick (5x faster than default)
+            election_tick: 5,       // 5 ticks = 100ms election timeout
+            heartbeat_tick: 1,      // 1 tick = 20ms heartbeat
+            ..Default::default()
+        }
+    }
+
+    /// Create a fast test config with staggered election ticks to avoid split votes.
+    /// Each node gets a different election_tick based on node_id.
+    pub fn fast_for_tests_staggered(node_id: NodeId) -> Self {
+        Self {
+            tick_interval_ms: 20,
+            election_tick: 5 + (node_id as usize * 2), // Stagger: 7, 9, 11, 13...
+            heartbeat_tick: 1,
+            ..Default::default()
+        }
+    }
+}
+
+/// Storage type for Raft log persistence.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RaftStorageType {
+    /// In-memory storage (fast but not durable across restarts).
+    Memory,
+
+    /// RocksDB-based persistent storage (durable but requires `rocksdb-storage` feature).
+    #[cfg(feature = "rocksdb-storage")]
+    RocksDb(RocksDbConfig),
+}
+
+impl Default for RaftStorageType {
+    fn default() -> Self {
+        Self::Memory
+    }
+}
+
+/// Configuration for RocksDB storage.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg(feature = "rocksdb-storage")]
+pub struct RocksDbConfig {
+    /// Path to the RocksDB database directory.
+    pub path: String,
+
+    /// Whether to sync writes to disk immediately.
+    /// Setting this to true provides stronger durability but lower performance.
+    pub sync_writes: bool,
+}
+
+#[cfg(feature = "rocksdb-storage")]
+impl Default for RocksDbConfig {
+    fn default() -> Self {
+        Self {
+            path: "raft-storage".to_string(),
+            sync_writes: true,
+        }
+    }
+}
+
+#[cfg(feature = "rocksdb-storage")]
+impl RocksDbConfig {
+    /// Create a new config with the specified path.
+    pub fn new(path: impl Into<String>) -> Self {
+        Self {
+            path: path.into(),
+            sync_writes: true,
+        }
+    }
+
+    /// Set whether to sync writes.
+    pub fn with_sync_writes(mut self, sync: bool) -> Self {
+        self.sync_writes = sync;
+        self
     }
 }
 

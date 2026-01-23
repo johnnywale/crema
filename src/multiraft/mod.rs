@@ -177,6 +177,7 @@ mod persistent_migration_store;
 mod raft_migration;
 mod router;
 mod shard;
+mod shard_forwarder;
 mod shard_placement;
 mod shard_recovery;
 mod shard_registry;
@@ -225,7 +226,10 @@ pub use shard_recovery::{
     ShardRecoveryDetail,
 };
 pub use shard_registry::{ShardLifecycleState, ShardMetadata, ShardRegistry};
+pub use shard_forwarder::{
+    ForwardResult, ShardForwarder, ShardForwardingConfig, ShardForwardingStats,
+};
 pub use shard_storage::{
-    PersistedShardMetadata, PersistedShardRegistry, ShardSnapshotInfo, ShardStorageConfig,
-    ShardStorageManager,
+    PersistedShardMetadata, PersistedShardRegistry, ShardLeaderHint, ShardSnapshotInfo,
+    ShardStorageConfig, ShardStorageManager,
 };

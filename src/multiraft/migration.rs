@@ -1125,10 +1125,11 @@ impl ShardMigrationCoordinator {
         self.state_store.save_migration(&migration_for_persist).await?;
 
         // Now safe to remove from active migrations and add to history
-        let migration = {
+        // (we only need the side effect of removal; the updated state is in migration_for_persist)
+        {
             let mut migrations = self.active_migrations.write();
-            migrations.remove(&shard_id)
-        };
+            migrations.remove(&shard_id);
+        }
 
         // Add to history
         {

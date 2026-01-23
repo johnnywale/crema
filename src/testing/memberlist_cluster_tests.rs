@@ -11,6 +11,7 @@ use crate::cluster::memberlist_cluster::{
 };
 use std::net::SocketAddr;
 use std::time::Duration;
+use std::net::UdpSocket;
 use tokio::net::TcpListener;
 
 /// Port configuration for a node (bind port for memberlist and raft port)
@@ -21,16 +22,20 @@ struct NodePorts {
 }
 
 /// Allocate OS-assigned ports for multiple nodes.
-/// Each node needs 2 ports: one for memberlist bind and one for raft.
+/// Each node needs 2 ports: one for memberlist bind (UDP) and one for raft (TCP).
+///
+/// Note: memberlist uses UDP for its packet listener, so we must allocate UDP ports
+/// for bind_port. On Windows, TCP and UDP ports are in separate namespaces, and
+/// some port ranges may be excluded for UDP but not TCP.
 async fn allocate_node_ports(count: usize) -> Vec<NodePorts> {
     let mut result = Vec::with_capacity(count);
     for _ in 0..count {
-        // Allocate memberlist bind port
-        let bind_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let bind_port = bind_listener.local_addr().unwrap().port();
-        drop(bind_listener);
+        // Allocate memberlist bind port using UDP (memberlist uses UDP for packet listener)
+        let bind_socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let bind_port = bind_socket.local_addr().unwrap().port();
+        drop(bind_socket);
 
-        // Allocate raft port
+        // Allocate raft port using TCP
         let raft_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let raft_port = raft_listener.local_addr().unwrap().port();
         drop(raft_listener);

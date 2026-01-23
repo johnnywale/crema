@@ -45,6 +45,7 @@ mod tests {
                 max_inflight_msgs: 256,
                 pre_vote: true,
                 applied: 0,
+                storage_type: crate::config::RaftStorageType::Memory,
             },
             membership: Default::default(),
             memberlist: MemberlistConfig::default(), // Disabled by default
@@ -92,6 +93,7 @@ mod tests {
                 max_inflight_msgs: 256,
                 pre_vote: true,
                 applied: 0,
+                storage_type: crate::config::RaftStorageType::Memory,
             },
             membership: Default::default(),
             memberlist: MemberlistConfig::default(),

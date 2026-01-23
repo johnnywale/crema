@@ -2,7 +2,7 @@
 
 use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// Node identifier in the cluster.
 pub type NodeId = u64;
@@ -14,8 +14,9 @@ pub enum CacheCommand {
     Put {
         key: Vec<u8>,
         value: Vec<u8>,
-        /// Optional TTL for this specific entry.
-        ttl_ms: Option<u64>,
+        /// Optional absolute expiration time in milliseconds since Unix epoch.
+        /// Using absolute time ensures TTL is preserved correctly across crash recovery.
+        expires_at_ms: Option<u64>,
     },
 
     /// Delete a key from the cache.
@@ -23,6 +24,11 @@ pub enum CacheCommand {
 
     /// Clear all entries from the cache.
     Clear,
+
+    /// Get a key from the cache (used for cross-shard forwarding only).
+    /// Note: GET operations don't go through Raft; this variant is only
+    /// used when forwarding GET requests across shards.
+    Get { key: Vec<u8> },
 }
 
 impl CacheCommand {
@@ -31,20 +37,28 @@ impl CacheCommand {
         Self::Put {
             key: key.into(),
             value: value.into(),
-            ttl_ms: None,
+            expires_at_ms: None,
         }
     }
 
     /// Create a Put command with TTL.
+    ///
+    /// The TTL is converted to an absolute expiration time to ensure
+    /// correct behavior across crash recovery and Raft log replay.
     pub fn put_with_ttl(
         key: impl Into<Vec<u8>>,
         value: impl Into<Vec<u8>>,
         ttl: Duration,
     ) -> Self {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        let expires_at = now + ttl.as_millis() as u64;
         Self::Put {
             key: key.into(),
             value: value.into(),
-            ttl_ms: Some(ttl.as_millis() as u64),
+            expires_at_ms: Some(expires_at),
         }
     }
 
@@ -56,6 +70,11 @@ impl CacheCommand {
     /// Create a Clear command.
     pub fn clear() -> Self {
         Self::Clear
+    }
+
+    /// Create a Get command (for cross-shard forwarding).
+    pub fn get(key: impl Into<Vec<u8>>) -> Self {
+        Self::Get { key: key.into() }
     }
 
     /// Serialize command to bytes.
@@ -153,13 +172,35 @@ mod tests {
 
     #[test]
     fn test_cache_command_with_ttl() {
+        let before = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
         let cmd = CacheCommand::put_with_ttl(
             b"key".to_vec(),
             b"value".to_vec(),
             Duration::from_secs(60),
         );
-        if let CacheCommand::Put { ttl_ms, .. } = cmd {
-            assert_eq!(ttl_ms, Some(60_000));
+        let after = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        if let CacheCommand::Put { expires_at_ms, .. } = cmd {
+            // expires_at_ms should be between now+60s before and now+60s after
+            let expected_min = before + 60_000;
+            let expected_max = after + 60_000 + 1; // +1 for rounding
+            assert!(
+                expires_at_ms.is_some(),
+                "Expected expires_at_ms to be set"
+            );
+            let expires = expires_at_ms.unwrap();
+            assert!(
+                expires >= expected_min && expires <= expected_max,
+                "expires_at_ms {} not in expected range [{}, {}]",
+                expires,
+                expected_min,
+                expected_max
+            );
         } else {
             panic!("Expected Put command");
         }

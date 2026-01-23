@@ -70,7 +70,7 @@ mod tests {
 
                 // Small delay between node starts to avoid port conflicts
                 if i > 0 {
-                    sleep(Duration::from_millis(100)).await;
+                    sleep(Duration::from_millis(20)).await;
                 }
 
                 let cache = DistributedCache::new(config)
@@ -79,8 +79,8 @@ mod tests {
                 nodes.push(cache);
             }
 
-            // Wait for cluster to stabilize
-            Self::wait_for_leader(&nodes, Duration::from_secs(10))
+            // Wait for cluster to stabilize (faster timeout for tests)
+            Self::wait_for_leader(&nodes, Duration::from_secs(3))
                 .await
                 .expect("Cluster failed to elect a leader");
 
@@ -100,6 +100,7 @@ mod tests {
         }
 
         /// Create configuration for a node.
+        /// Uses fast test settings for quicker test execution.
         fn create_node_config(node_id: u64, port_configs: &[(u64, u16)], existing_count: usize) -> CacheConfig {
             let my_port = port_configs
                 .iter()
@@ -125,7 +126,8 @@ mod tests {
                     .collect()
             };
 
-            let base_election_tick = 10;
+            // Fast test settings: 20ms tick, staggered election ticks
+            let base_election_tick = 5;
 
             CacheConfig {
                 node_id,
@@ -135,13 +137,14 @@ mod tests {
                 default_ttl: Some(Duration::from_secs(3600)),
                 default_tti: None,
                 raft: RaftConfig {
-                    tick_interval_ms: 100,
-                    election_tick: base_election_tick + (node_id as usize * 5),
-                    heartbeat_tick: 2,
+                    tick_interval_ms: 20,  // 5x faster than default
+                    election_tick: base_election_tick + (node_id as usize * 2), // Staggered: 7, 9, 11...
+                    heartbeat_tick: 1,     // Fast heartbeats
                     max_size_per_msg: 1024 * 1024,
                     max_inflight_msgs: 256,
                     pre_vote: true,
                     applied: 0,
+                    storage_type: crate::config::RaftStorageType::Memory,
                 },
                 membership: Default::default(),
                 memberlist: MemberlistConfig::default(),
@@ -166,8 +169,8 @@ mod tests {
 
             self.nodes.push(cache);
 
-            // Wait for new node to join the cluster
-            sleep(Duration::from_secs(1)).await;
+            // Wait for new node to join the cluster (reduced for fast tests)
+            sleep(Duration::from_millis(200)).await;
 
             info!(node_id, "Node added successfully");
             Ok(node_id)
@@ -185,7 +188,7 @@ mod tests {
                 if let Some(leader) = nodes.iter().find(|n| n.is_leader()) {
                     return Ok(leader.node_id());
                 }
-                sleep(Duration::from_millis(100)).await;
+                sleep(Duration::from_millis(20)).await; // Fast polling for tests
             }
             Err("Timeout waiting for leader election".to_string())
         }
@@ -200,10 +203,11 @@ mod tests {
             self.nodes.len()
         }
 
-        /// Shutdown all nodes.
+        /// Shutdown all nodes with fast timeout for tests.
         async fn shutdown(self) {
             for node in self.nodes {
-                node.shutdown().await;
+                // Use fast shutdown timeout for tests (500ms instead of 30s)
+                node.shutdown_with_timeout(Duration::from_millis(500)).await;
             }
         }
     }
@@ -258,8 +262,8 @@ mod tests {
                 .expect("Write should succeed");
         }
 
-        // Verify data was written
-        sleep(Duration::from_millis(500)).await;
+        // Verify data was written (reduced sleep for fast tests)
+        sleep(Duration::from_millis(50)).await;
         let sample_value = cluster.nodes[leader_idx].get(b"key-000000").await;
         assert!(sample_value.is_some(), "Data should be readable");
 
@@ -349,8 +353,8 @@ mod tests {
                 .expect("Write should succeed");
         }
 
-        // Wait for replication
-        sleep(Duration::from_millis(500)).await;
+        // Wait for replication (reduced for fast tests)
+        sleep(Duration::from_millis(50)).await;
 
         // Spawn chaos monkey client
         let stop_signal = Arc::new(AtomicBool::new(false));

@@ -66,15 +66,18 @@
 //! - `ChaosConfig::heavy()` - High failure rates for stress testing
 
 mod chaos;
+pub mod recovery;
 
 mod cache_integration_tests_basic;
 mod cache_integration_tests_edge_failed;
 mod cache_integration_tests_edge_pass;
 mod memberlist_cache_integration_tests;
 mod memberlist_cluster_tests;
+mod multiraft_forwarding_tests;
 mod multiraft_integration_tests;
 mod raft;
 mod rebalance_e2e_tests;
+mod recovery_e2e_tests;
 mod utils;
 
 pub use chaos::{

@@ -53,6 +53,17 @@ pub enum Error {
     #[error("shard not active: {0}")]
     ShardNotActive(u32),
 
+    /// Shard exists but is hosted on a different node (needs forwarding).
+    #[error("shard not local: shard {shard_id} is hosted on node {target_node:?}")]
+    ShardNotLocal {
+        shard_id: u32,
+        target_node: Option<u64>,
+    },
+
+    /// Shard leader is not yet known (gossip hasn't propagated leader info).
+    #[error("shard leader unknown: shard {0}, waiting for gossip")]
+    ShardLeaderUnknown(u32),
+
     /// Server is busy, too many pending requests (backpressure).
     #[error("server busy: too many pending requests ({pending})")]
     ServerBusy { pending: usize },
@@ -204,6 +215,10 @@ pub enum StorageError {
     /// I/O error.
     #[error("storage io error: {0}")]
     Io(String),
+
+    /// RocksDB error.
+    #[error("rocksdb error: {0}")]
+    RocksDb(String),
 }
 
 /// Cluster membership errors.
@@ -260,6 +275,10 @@ impl Error {
             Error::Storage(e) => e.is_retryable(),
             Error::Membership(e) => e.is_retryable(),
 
+            // Shard routing errors - retryable with forwarding or gossip wait
+            Error::ShardNotLocal { .. } => true, // Forward to correct node
+            Error::ShardLeaderUnknown(_) => true, // Wait for gossip
+
             // Permanent errors - won't change without intervention
             Error::Config(_) => false,
             Error::Cancelled => false,
@@ -304,6 +323,8 @@ impl Error {
             Error::TooManyMigrations => Some(Duration::from_millis(500)),
             Error::MigrationTimeout => Some(Duration::from_millis(200)),
             Error::ForwardFailed(_) => Some(Duration::from_millis(50)),
+            Error::ShardNotLocal { .. } => Some(Duration::from_millis(10)), // Fast retry with forwarding
+            Error::ShardLeaderUnknown(_) => Some(Duration::from_millis(100)), // Wait for gossip
             Error::Raft(e) => e.retry_delay(),
             Error::Network(e) => e.retry_delay(),
             Error::Storage(e) => e.retry_delay(),
@@ -376,6 +397,7 @@ impl StorageError {
         match self {
             StorageError::SnapshotTemporarilyUnavailable => true,
             StorageError::Io(_) => true,
+            StorageError::RocksDb(_) => true, // RocksDB errors may be transient
             StorageError::EntryNotFound(_) => false,
             StorageError::SnapshotNotFound => false,
             StorageError::NonContiguous { .. } => false,
@@ -391,6 +413,7 @@ impl StorageError {
         match self {
             StorageError::SnapshotTemporarilyUnavailable => Some(Duration::from_millis(500)),
             StorageError::Io(_) => Some(Duration::from_millis(100)),
+            StorageError::RocksDb(_) => Some(Duration::from_millis(100)),
             _ => None,
         }
     }
@@ -446,6 +469,11 @@ mod tests {
         assert!(Error::MigrationPaused.is_retryable());
         assert!(Error::TooManyMigrations.is_retryable());
         assert!(Error::MigrationTimeout.is_retryable());
+
+        // New shard routing errors are retryable
+        assert!(Error::ShardNotLocal { shard_id: 1, target_node: Some(2) }.is_retryable());
+        assert!(Error::ShardNotLocal { shard_id: 1, target_node: None }.is_retryable());
+        assert!(Error::ShardLeaderUnknown(1).is_retryable());
 
         assert!(!Error::Config("bad config".to_string()).is_retryable());
         assert!(!Error::Cancelled.is_retryable());

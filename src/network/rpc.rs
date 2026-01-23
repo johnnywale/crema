@@ -32,6 +32,16 @@ pub enum Message {
     /// Response to a forwarded command from leader to follower.
     ForwardResponse(ForwardResponse),
 
+    // ==================== Multi-Raft Shard Forwarding ====================
+
+    /// Forwarded command from a node to the shard leader (cross-node, cross-shard).
+    /// Used in Multi-Raft mode when a request arrives at a node that doesn't
+    /// host the target shard's leader.
+    ShardForwardedCommand(ShardForwardedCommand),
+
+    /// Response to a shard forwarded command.
+    ShardForwardResponse(ShardForwardResponse),
+
     // ==================== Migration Messages ====================
 
     /// Request to fetch a batch of entries from a shard during migration.
@@ -253,6 +263,156 @@ impl ForwardResponse {
             request_id,
             success: false,
             error: Some(error.into()),
+        }
+    }
+}
+
+// ==================== Multi-Raft Shard Forwarding ====================
+
+/// Forwarded command from a node to the shard leader in Multi-Raft mode.
+///
+/// When a request arrives at node A for a key that belongs to shard S,
+/// but shard S's leader is on node B, node A forwards the request to node B.
+/// This enables transparent routing in Multi-Raft deployments.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ShardForwardedCommand {
+    /// Unique request ID for correlation.
+    pub request_id: u64,
+
+    /// Node ID of the node that received the original request.
+    pub origin_node_id: NodeId,
+
+    /// The target shard ID for this command.
+    pub shard_id: ShardId,
+
+    /// The cache command to execute.
+    pub command: CacheCommand,
+
+    /// Time-to-live: remaining forwards allowed.
+    /// Prevents infinite forwarding loops in case of stale leader info.
+    /// Starts at 3, decrements on each forward, rejected when 0.
+    pub ttl: u8,
+}
+
+impl ShardForwardedCommand {
+    /// Create a new shard forwarded command.
+    pub fn new(
+        request_id: u64,
+        origin_node_id: NodeId,
+        shard_id: ShardId,
+        command: CacheCommand,
+    ) -> Self {
+        Self {
+            request_id,
+            origin_node_id,
+            shard_id,
+            command,
+            ttl: 3,
+        }
+    }
+
+    /// Create with specific TTL.
+    pub fn with_ttl(
+        request_id: u64,
+        origin_node_id: NodeId,
+        shard_id: ShardId,
+        command: CacheCommand,
+        ttl: u8,
+    ) -> Self {
+        Self {
+            request_id,
+            origin_node_id,
+            shard_id,
+            command,
+            ttl,
+        }
+    }
+
+    /// Decrement TTL and return the new value.
+    /// Returns None if TTL is already 0.
+    pub fn decrement_ttl(&mut self) -> Option<u8> {
+        if self.ttl == 0 {
+            None
+        } else {
+            self.ttl -= 1;
+            Some(self.ttl)
+        }
+    }
+}
+
+/// Response to a shard forwarded command.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ShardForwardResponse {
+    /// The request ID this is responding to.
+    pub request_id: u64,
+
+    /// Whether the command was successfully committed.
+    pub success: bool,
+
+    /// Error message if failed.
+    pub error: Option<String>,
+
+    /// Optional value for GET operations.
+    pub value: Option<Vec<u8>>,
+
+    /// Shard leader hint if we're not the leader.
+    /// Contains (shard_id, leader_node_id) for retrying.
+    pub leader_hint: Option<(ShardId, NodeId)>,
+}
+
+impl ShardForwardResponse {
+    /// Create a success response for write operations.
+    pub fn success(request_id: u64) -> Self {
+        Self {
+            request_id,
+            success: true,
+            error: None,
+            value: None,
+            leader_hint: None,
+        }
+    }
+
+    /// Create a success response for GET operations with a value.
+    pub fn success_with_value(request_id: u64, value: Option<Vec<u8>>) -> Self {
+        Self {
+            request_id,
+            success: true,
+            error: None,
+            value,
+            leader_hint: None,
+        }
+    }
+
+    /// Create an error response.
+    pub fn error(request_id: u64, error: impl Into<String>) -> Self {
+        Self {
+            request_id,
+            success: false,
+            error: Some(error.into()),
+            value: None,
+            leader_hint: None,
+        }
+    }
+
+    /// Create a "not shard leader" response with leader hint.
+    pub fn not_shard_leader(request_id: u64, shard_id: ShardId, leader: Option<NodeId>) -> Self {
+        Self {
+            request_id,
+            success: false,
+            error: Some(format!("Not leader for shard {}", shard_id)),
+            value: None,
+            leader_hint: leader.map(|l| (shard_id, l)),
+        }
+    }
+
+    /// Create a "shard not found" response.
+    pub fn shard_not_found(request_id: u64, shard_id: ShardId) -> Self {
+        Self {
+            request_id,
+            success: false,
+            error: Some(format!("Shard {} not found on this node", shard_id)),
+            value: None,
+            leader_hint: None,
         }
     }
 }

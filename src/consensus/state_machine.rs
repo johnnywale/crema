@@ -5,7 +5,7 @@ use crate::types::CacheCommand;
 use bytes::Bytes;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tracing::{debug, error, info};
 
 /// The cache state machine that applies committed Raft entries.
@@ -43,9 +43,15 @@ impl CacheStateMachine {
     /// has been committed by Raft. If something goes wrong, we log the
     /// error but continue.
     pub async fn apply(&self, index: u64, term: u64, data: &[u8]) {
+        let current_applied = self.applied_index.load(Ordering::SeqCst);
+
         // Skip if already applied (idempotency)
-        if index <= self.applied_index.load(Ordering::SeqCst) {
-            debug!(index, "Skipping already applied entry");
+        if index <= current_applied {
+            debug!(
+                index,
+                current_applied,
+                "STATE_MACHINE: Skipping already applied entry (index <= applied_index)"
+            );
             return;
         }
 
@@ -68,37 +74,62 @@ impl CacheStateMachine {
 
         // Apply the command
         match command {
-            CacheCommand::Put { key, value, ttl_ms } => {
+            CacheCommand::Put {
+                key,
+                value,
+                expires_at_ms,
+            } => {
                 let key_preview = String::from_utf8_lossy(&key[..std::cmp::min(key.len(), 32)]);
-                info!(
+                debug!(
                     raft_index = index,
                     raft_term = term,
                     key = %key_preview,
                     value_len = value.len(),
-                    ttl_ms = ?ttl_ms,
+                    expires_at_ms = ?expires_at_ms,
                     "STATE_MACHINE: Applying PUT to local storage"
                 );
 
                 let key = Bytes::from(key);
                 let value = Bytes::from(value);
 
-                if let Some(ttl_ms) = ttl_ms {
-                    self.storage
-                        .insert_with_ttl(key, value, Duration::from_millis(ttl_ms))
-                        .await;
+                if let Some(expires_at_ms) = expires_at_ms {
+                    // Calculate remaining TTL from absolute expiration time
+                    let now_ms = SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_millis() as u64;
+
+                    if expires_at_ms > now_ms {
+                        // Entry has not yet expired, calculate remaining TTL
+                        let remaining_ttl_ms = expires_at_ms - now_ms;
+                        self.storage
+                            .insert_with_ttl(key, value, Duration::from_millis(remaining_ttl_ms))
+                            .await;
+                        debug!(
+                            raft_index = index,
+                            remaining_ttl_ms = remaining_ttl_ms,
+                            "STATE_MACHINE: PUT applied with TTL"
+                        );
+                    } else {
+                        // Entry has already expired, skip insertion
+                        debug!(
+                            raft_index = index,
+                            "STATE_MACHINE: Skipping expired PUT entry (expired {}ms ago)",
+                            now_ms - expires_at_ms
+                        );
+                    }
                 } else {
                     self.storage.insert(key, value).await;
+                    debug!(
+                        raft_index = index,
+                        "STATE_MACHINE: PUT applied (no TTL)"
+                    );
                 }
-
-                info!(
-                    raft_index = index,
-                    "STATE_MACHINE: PUT applied successfully"
-                );
             }
 
             CacheCommand::Delete { key } => {
                 let key_preview = String::from_utf8_lossy(&key[..std::cmp::min(key.len(), 32)]);
-                info!(
+                debug!(
                     raft_index = index,
                     raft_term = term,
                     key = %key_preview,
@@ -107,14 +138,14 @@ impl CacheStateMachine {
 
                 self.storage.invalidate(&key).await;
 
-                info!(
+                debug!(
                     raft_index = index,
                     "STATE_MACHINE: DELETE applied successfully"
                 );
             }
 
             CacheCommand::Clear => {
-                info!(
+                debug!(
                     raft_index = index,
                     raft_term = term,
                     "STATE_MACHINE: Applying CLEAR to local storage"
@@ -122,9 +153,20 @@ impl CacheStateMachine {
 
                 self.storage.invalidate_all();
 
-                info!(
+                debug!(
                     raft_index = index,
                     "STATE_MACHINE: CLEAR applied successfully"
+                );
+            }
+
+            CacheCommand::Get { key: _ } => {
+                // Get is a read-only operation used for cross-shard forwarding.
+                // It should never be proposed through Raft; if it appears here,
+                // just treat it as a no-op.
+                debug!(
+                    raft_index = index,
+                    raft_term = term,
+                    "STATE_MACHINE: Ignoring GET command (read-only, should not be proposed)"
                 );
             }
         }
@@ -143,6 +185,25 @@ impl CacheStateMachine {
     fn update_applied(&self, index: u64, term: u64) {
         self.applied_index.store(index, Ordering::SeqCst);
         self.applied_term.store(term, Ordering::SeqCst);
+    }
+
+    /// Set the applied state for recovery from snapshot.
+    ///
+    /// This should be called after loading state from a snapshot to ensure
+    /// the state machine's applied_index matches the snapshot's Raft index.
+    /// This prevents re-applying entries that were already included in the snapshot.
+    pub fn set_recovered_state(&self, index: u64, term: u64) {
+        let old_index = self.applied_index.load(Ordering::SeqCst);
+        let old_term = self.applied_term.load(Ordering::SeqCst);
+        self.applied_index.store(index, Ordering::SeqCst);
+        self.applied_term.store(term, Ordering::SeqCst);
+        debug!(
+            old_index,
+            old_term,
+            new_index = index,
+            new_term = term,
+            "STATE_MACHINE: Set recovered state from snapshot"
+        );
     }
 
     /// Get the last applied index.

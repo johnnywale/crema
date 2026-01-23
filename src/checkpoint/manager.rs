@@ -6,7 +6,7 @@ use crate::checkpoint::reader::SnapshotReader;
 use crate::checkpoint::writer::{SnapshotMetadata, SnapshotWriter};
 use bytes::Bytes;
 use parking_lot::RwLock;
-use std::fs;
+use std::fs::{self, File};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
@@ -46,6 +46,11 @@ pub struct CheckpointConfig {
     /// Estimated average entry size for disk space calculations
     /// Default: 1KB
     pub avg_entry_size: u64,
+
+    /// Minimum interval between snapshot attempts after a failure
+    /// Prevents retry storms on persistent errors (e.g., disk full)
+    /// Default: 60 seconds
+    pub error_backoff: Duration,
 }
 
 impl Default for CheckpointConfig {
@@ -60,6 +65,7 @@ impl Default for CheckpointConfig {
             backpressure_multiplier: 2,
             min_free_space: 100 * 1024 * 1024, // 100MB
             avg_entry_size: 1024,              // 1KB
+            error_backoff: Duration::from_secs(60),
         }
     }
 }
@@ -140,6 +146,9 @@ pub struct CheckpointManager {
     /// Last snapshot time
     last_snapshot_time: RwLock<Instant>,
 
+    /// Last error time (for backoff on failures)
+    last_error_time: RwLock<Option<Instant>>,
+
     /// Whether a snapshot is in progress
     snapshot_in_progress: AtomicBool,
 }
@@ -162,6 +171,7 @@ impl CheckpointManager {
             last_snapshot_index: AtomicU64::new(0),
             entries_since_snapshot: AtomicU64::new(0),
             last_snapshot_time: RwLock::new(Instant::now()),
+            last_error_time: RwLock::new(None),
             snapshot_in_progress: AtomicBool::new(false),
         })
     }
@@ -331,6 +341,13 @@ impl CheckpointManager {
             return false;
         }
 
+        // Check error backoff - don't retry too quickly after failures
+        if let Some(error_time) = *self.last_error_time.read() {
+            if error_time.elapsed() < self.config.error_backoff {
+                return false;
+            }
+        }
+
         // Check log threshold
         if self.entries_since_snapshot() >= self.config.log_threshold {
             return true;
@@ -346,6 +363,9 @@ impl CheckpointManager {
     }
 
     /// Create a snapshot of the current cache state.
+    ///
+    /// This method runs the heavy IO work on a blocking thread pool to avoid
+    /// starving Tokio worker threads during large snapshot operations.
     pub async fn create_snapshot(
         &self,
         raft_index: u64,
@@ -370,21 +390,78 @@ impl CheckpointManager {
         // Check disk space before starting
         if let Err(e) = self.check_disk_space() {
             self.snapshot_in_progress.store(false, Ordering::SeqCst);
+            *self.last_error_time.write() = Some(Instant::now());
             return Err(e);
         }
 
-        let result = self
-            .create_snapshot_internal(raft_index, raft_term)
-            .await;
+        // Collect entries from cache with expiration times (this is relatively fast)
+        // We collect before spawn_blocking to avoid Send issues with Moka iterator
+        let entries: Vec<(Bytes, Bytes, Option<u64>)> = self.storage.collect_entries_with_expiration();
+        let config = self.config.clone();
+
+        // Run heavy IO work on blocking thread pool
+        let result = tokio::task::spawn_blocking(move || {
+            Self::create_snapshot_sync(&config, entries, raft_index, raft_term)
+        })
+        .await
+        .map_err(|e| FormatError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
 
         // Clear in-progress flag
         self.snapshot_in_progress.store(false, Ordering::SeqCst);
 
+        match &result {
+            Ok(metadata) => {
+                // Clear error time on success
+                *self.last_error_time.write() = None;
+
+                // Update state
+                self.last_snapshot_index
+                    .store(metadata.raft_index, Ordering::SeqCst);
+                self.entries_since_snapshot.store(0, Ordering::Relaxed);
+                *self.last_snapshot_time.write() = Instant::now();
+
+                // Update current snapshot info
+                let final_path = self.config.dir.join(format!(
+                    "snapshot-{:016x}-{:016x}.{}",
+                    raft_index,
+                    raft_term,
+                    if self.config.compress { "lz4" } else { "dat" }
+                ));
+                *self.current_snapshot.write() = Some(SnapshotInfo {
+                    path: final_path,
+                    raft_index,
+                    raft_term,
+                    timestamp: metadata.timestamp,
+                    entry_count: metadata.entry_count,
+                    file_size: metadata.file_size,
+                });
+
+                // Cleanup old snapshots
+                if let Err(e) = self.cleanup_old_snapshots() {
+                    warn!(error = %e, "Failed to cleanup old snapshots");
+                }
+
+                info!(
+                    raft_index,
+                    entry_count = metadata.entry_count,
+                    file_size = metadata.file_size,
+                    compression_ratio = format!("{:.2}", metadata.compression_ratio()),
+                    "Snapshot created"
+                );
+            }
+            Err(_) => {
+                // Record error time for backoff
+                *self.last_error_time.write() = Some(Instant::now());
+            }
+        }
+
         result
     }
 
-    async fn create_snapshot_internal(
-        &self,
+    /// Synchronous snapshot creation (runs on blocking thread pool).
+    fn create_snapshot_sync(
+        config: &CheckpointConfig,
+        entries: Vec<(Bytes, Bytes, Option<u64>)>,
         raft_index: u64,
         raft_term: u64,
     ) -> Result<SnapshotMetadata, FormatError> {
@@ -392,70 +469,42 @@ impl CheckpointManager {
             "snapshot-{:016x}-{:016x}.{}",
             raft_index,
             raft_term,
-            if self.config.compress { "lz4" } else { "dat" }
+            if config.compress { "lz4" } else { "dat" }
         );
         let temp_filename = format!("{}.tmp", filename);
-        let temp_path = self.config.dir.join(&temp_filename);
-        let final_path = self.config.dir.join(&filename);
-
-        info!(
-            raft_index,
-            raft_term,
-            path = %final_path.display(),
-            "Creating snapshot"
-        );
+        let temp_path = config.dir.join(&temp_filename);
+        let final_path = config.dir.join(&filename);
 
         // Create writer (writes to temp file)
-        let writer =
-            SnapshotWriter::new(&temp_path, raft_index, raft_term, self.config.compress)?;
+        let mut writer = SnapshotWriter::new(&temp_path, raft_index, raft_term, config.compress)?;
 
-        // Iterate cache and write entries
-        // Note: This is a simplified implementation. In production, you'd want
-        // to use Moka's iteration capabilities more carefully.
-        let entry_count = self.storage.entry_count();
-        debug!(entry_count, "Writing cache entries to snapshot");
+        // Write all cache entries with expiration times
+        // Note: CacheStorage stores expiration in milliseconds, checkpoint format uses nanoseconds
+        for (key, value, expires_at_ms) in &entries {
+            // Convert milliseconds to nanoseconds for checkpoint format
+            let expires_at_ns = expires_at_ms.map(|ms| ms * 1_000_000);
+            writer.write_raw_entry(key, value, expires_at_ns)?;
+        }
 
-        // For now, we can't easily iterate Moka's cache, so we'll need to
-        // track entries separately or use a different approach.
-        // This is a limitation we'll address in the integration step.
-
-        // Finalize snapshot (includes sync_all)
+        // Finalize snapshot (includes sync_all on the file)
         let metadata = writer.finalize()?;
 
         // Atomic rename: temp file -> final file
-        // This ensures we never have a corrupt snapshot file
         fs::rename(&temp_path, &final_path).map_err(|e| {
             // Clean up temp file on rename failure
             let _ = fs::remove_file(&temp_path);
             FormatError::Io(e)
         })?;
 
-        // Update state
-        self.last_snapshot_index
-            .store(raft_index, Ordering::SeqCst);
-        self.entries_since_snapshot.store(0, Ordering::Relaxed);
-        *self.last_snapshot_time.write() = Instant::now();
-
-        // Update current snapshot info
-        *self.current_snapshot.write() = Some(SnapshotInfo {
-            path: final_path.clone(),
-            raft_index,
-            raft_term,
-            timestamp: metadata.timestamp,
-            entry_count: metadata.entry_count,
-            file_size: metadata.file_size,
-        });
-
-        // Cleanup old snapshots
-        self.cleanup_old_snapshots()?;
-
-        info!(
-            raft_index,
-            entry_count = metadata.entry_count,
-            file_size = metadata.file_size,
-            compression_ratio = format!("{:.2}", metadata.compression_ratio()),
-            "Snapshot created"
-        );
+        // Sync parent directory for durability
+        // This ensures the directory entry is persisted after rename
+        if let Some(parent) = final_path.parent() {
+            if let Ok(dir) = File::open(parent) {
+                if let Err(e) = dir.sync_all() {
+                    warn!(error = %e, "Failed to sync parent directory");
+                }
+            }
+        }
 
         Ok(metadata)
     }
@@ -533,9 +582,18 @@ impl CheckpointManager {
 
         // Load entries
         let mut loaded = 0u64;
+        let mut skipped_expired = 0u64;
         while let Some(entry) = reader.read_entry()? {
+            let key_preview = String::from_utf8_lossy(&entry.key[..std::cmp::min(entry.key.len(), 32)]).to_string();
+
             // Skip expired entries
             if entry.is_expired() {
+                debug!(
+                    key = %key_preview,
+                    expires_at = entry.expires_at,
+                    "CHECKPOINT: Skipping expired entry during snapshot load"
+                );
+                skipped_expired += 1;
                 continue;
             }
 
@@ -545,10 +603,19 @@ impl CheckpointManager {
             let value = Bytes::from(entry.value);
 
             if let Some(ttl) = remaining_ttl {
+                debug!(
+                    key = %key_preview,
+                    remaining_ttl_ms = ttl.as_millis() as u64,
+                    "CHECKPOINT: Loading entry with TTL"
+                );
                 self.storage
                     .insert_with_ttl(key, value, ttl)
                     .await;
             } else {
+                debug!(
+                    key = %key_preview,
+                    "CHECKPOINT: Loading entry without TTL"
+                );
                 self.storage.insert(key, value).await;
             }
 
@@ -569,7 +636,8 @@ impl CheckpointManager {
             raft_term,
             entry_count,
             loaded,
-            "Snapshot loaded"
+            skipped_expired,
+            "CHECKPOINT: Snapshot loaded"
         );
 
         Ok(raft_index)

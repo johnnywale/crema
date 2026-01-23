@@ -54,10 +54,15 @@
 
 mod format;
 mod manager;
+pub mod raft_snapshot_data;
 mod reader;
 mod writer;
 
 pub use format::{FormatError, SnapshotEntry, SnapshotHeader, HEADER_SIZE, MAGIC, VERSION};
 pub use manager::{CheckpointConfig, CheckpointManager, RaftStateProvider, SnapshotInfo};
+pub use raft_snapshot_data::{
+    deserialize_snapshot_data, is_valid_snapshot_data, serialize_snapshot_data, SnapshotDataError,
+    SnapshotEntry as RaftSnapshotEntry,
+};
 pub use reader::{SnapshotIterator, SnapshotReader};
 pub use writer::{SnapshotMetadata, SnapshotWriter};

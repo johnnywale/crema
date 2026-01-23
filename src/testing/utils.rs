@@ -1,7 +1,7 @@
 use crate::config::MemberlistConfig;
 use crate::{CacheConfig, DistributedCache, NodeId, RaftConfig};
 use std::collections::HashSet;
-use std::net::SocketAddr;
+use std::net::{SocketAddr, UdpSocket};
 use std::time::{Duration, Instant};
 use tokio::net::TcpListener;
 use tokio::time::sleep;
@@ -18,10 +18,34 @@ pub(crate) async fn allocate_os_ports(node_ids: &[NodeId]) -> Vec<(NodeId, u16)>
     }
     results
 }
+
+/// Allocate OS-assigned ports for both raft (TCP) and memberlist (UDP).
+/// Returns a vector of (NodeId, raft_port, memberlist_port) tuples.
+///
+/// On Windows, TCP and UDP ports are in separate namespaces, and certain
+/// port ranges may be excluded. This function allocates both ports from
+/// the OS to ensure they are available.
+pub(crate) async fn allocate_os_ports_with_memberlist(node_ids: &[NodeId]) -> Vec<(NodeId, u16, u16)> {
+    let mut results = Vec::with_capacity(node_ids.len());
+    for &node_id in node_ids {
+        // Allocate raft port (TCP)
+        let raft_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let raft_port = raft_listener.local_addr().unwrap().port();
+        drop(raft_listener);
+
+        // Allocate memberlist port (UDP) - memberlist uses UDP for gossip
+        let memberlist_socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let memberlist_port = memberlist_socket.local_addr().unwrap().port();
+        drop(memberlist_socket);
+
+        results.push((node_id, raft_port, memberlist_port));
+    }
+    results
+}
 pub async fn wait_for_result<F, Fut, T, P>(
-    mut action: F,     // 获取结果的异步闭包
-    predicate: P,      // 验证结果的闭包
-    timeout: Duration, // 总超时时间
+    mut action: F,
+    predicate: P,
+    timeout: Duration,
 ) -> Option<T>
 where
     F: FnMut() -> Fut,
@@ -76,6 +100,7 @@ pub(crate) fn cluster_node_config(node_id: NodeId, port_configs: &[(NodeId, u16)
             max_inflight_msgs: 256,
             pre_vote: true,
             applied: 0,
+            storage_type: crate::config::RaftStorageType::Memory,
         },
         membership: Default::default(),
         memberlist: MemberlistConfig::default(),

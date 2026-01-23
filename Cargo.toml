@@ -11,6 +11,8 @@ categories = ["caching", "network-programming"]
 [features]
 default = ["tokio"]
 tokio = []
+rocksdb-storage = ["rocksdb"]
+rocksdb-test = ["rocksdb-storage"]
 
 [dependencies]
 # Local cache with automatic TTL/eviction
@@ -66,12 +68,23 @@ socket2 = "0.6.1"
 # Migration support
 uuid = { version = "1", features = ["v4", "serde"] }
 async-trait = "0.1"
+tempfile = "3"
+
+# Persistent storage (optional)
+# Note: Building on Windows requires LLVM/libclang for bindgen
+# Install from: https://github.com/llvm/llvm-project/releases
+# Then: set LIBCLANG_PATH=C:\Program Files\LLVM\bin
+rocksdb = { version = "0.22", optional = true }
+
+# Lazy statics for failpoints
+once_cell = "1.19"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full", "macros"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tempfile = "3"
 test-log = "0.2"
+
 [[example]]
 name = "basic"
 path = "examples/basic.rs"
@@ -79,3 +92,19 @@ path = "examples/basic.rs"
 [[example]]
 name = "cluster"
 path = "examples/cluster.rs"
+
+[[example]]
+name = "memberlist-cluster"
+path = "examples/memberlist-cluster.rs"
+
+[[example]]
+name = "multiraft-cluster"
+path = "examples/multiraft-cluster.rs"
+
+[[example]]
+name = "checkpointing"
+path = "examples/checkpointing.rs"
+
+[[example]]
+name = "metrics"
+path = "examples/metrics.rs"

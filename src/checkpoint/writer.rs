@@ -112,26 +112,79 @@ impl SnapshotWriter {
     ///
     /// Entries are written immediately (streaming) rather than buffered.
     pub fn write_entry(&mut self, entry: &SnapshotEntry) -> Result<(), FormatError> {
-        let bytes = entry.to_bytes();
-        self.data_size += bytes.len() as u64;
+        self.write_raw_entry(&entry.key, &entry.value, entry.expires_at)
+    }
+
+    /// Write a key-value pair directly from slices without intermediate allocation.
+    ///
+    /// This is more efficient than `write_entry` for high-throughput scenarios
+    /// as it avoids allocating a Vec for each entry.
+    ///
+    /// # Arguments
+    /// * `key` - The key bytes
+    /// * `value` - The value bytes
+    /// * `expires_at` - Optional expiration timestamp in nanoseconds since Unix epoch
+    pub fn write_raw_entry(
+        &mut self,
+        key: &[u8],
+        value: &[u8],
+        expires_at: Option<u64>,
+    ) -> Result<(), FormatError> {
+        // Calculate entry size for tracking
+        let entry_size = 4 + key.len() + // key length + key
+            4 + value.len() + // value length + value
+            1 + // has_expiration flag
+            if expires_at.is_some() { 8 } else { 0 } + // expires_at
+            4; // entry CRC
+
+        self.data_size += entry_size as u64;
         self.entry_count += 1;
 
-        match &mut self.inner {
-            WriterInner::Compressed { encoder } => {
-                encoder.write_all(&bytes)?;
-            }
-            WriterInner::Uncompressed { writer } => {
-                writer.write_all(&bytes)?;
-            }
+        // Get writer reference
+        let writer: &mut dyn Write = match &mut self.inner {
+            WriterInner::Compressed { encoder } => encoder,
+            WriterInner::Uncompressed { writer } => writer,
+        };
+
+        // Build CRC incrementally as we write
+        let mut digest = CRC32.digest();
+
+        // Write key length + key
+        let key_len_bytes = (key.len() as u32).to_le_bytes();
+        writer.write_all(&key_len_bytes)?;
+        digest.update(&key_len_bytes);
+        writer.write_all(key)?;
+        digest.update(key);
+
+        // Write value length + value
+        let value_len_bytes = (value.len() as u32).to_le_bytes();
+        writer.write_all(&value_len_bytes)?;
+        digest.update(&value_len_bytes);
+        writer.write_all(value)?;
+        digest.update(value);
+
+        // Write expiration
+        if let Some(expires) = expires_at {
+            writer.write_all(&[1])?;
+            digest.update(&[1]);
+            let expires_bytes = expires.to_le_bytes();
+            writer.write_all(&expires_bytes)?;
+            digest.update(&expires_bytes);
+        } else {
+            writer.write_all(&[0])?;
+            digest.update(&[0]);
         }
+
+        // Write entry CRC
+        let entry_crc = digest.finalize();
+        writer.write_all(&entry_crc.to_le_bytes())?;
 
         Ok(())
     }
 
     /// Write a key-value pair without expiration.
     pub fn write(&mut self, key: &[u8], value: &[u8]) -> Result<(), FormatError> {
-        let entry = SnapshotEntry::new(key.to_vec(), value.to_vec());
-        self.write_entry(&entry)
+        self.write_raw_entry(key, value, None)
     }
 
     /// Finalize the snapshot and return metadata.

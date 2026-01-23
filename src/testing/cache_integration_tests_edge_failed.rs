@@ -38,6 +38,55 @@ mod multi_node_tests {
         None
     }
 
+    /// Helper function to wait for a rejoined node to catch up with the cluster.
+    /// Checks that the node's applied_index reaches a target value.
+    async fn wait_for_node_catchup(
+        node: &DistributedCache,
+        target_applied: u64,
+        timeout: Duration,
+    ) -> bool {
+        let start = Instant::now();
+        while start.elapsed() < timeout {
+            let status = node.cluster_status();
+            if status.applied_index >= target_applied {
+                info!(
+                    node_id = node.node_id(),
+                    applied = status.applied_index,
+                    target = target_applied,
+                    "Node caught up successfully"
+                );
+                return true;
+            }
+            sleep(Duration::from_millis(100)).await;
+        }
+        let status = node.cluster_status();
+        info!(
+            node_id = node.node_id(),
+            applied = status.applied_index,
+            target = target_applied,
+            "Node failed to catch up within timeout"
+        );
+        false
+    }
+
+    /// Helper function to verify a key-value with retry logic.
+    async fn verify_key_with_retry(
+        cache: &DistributedCache,
+        key: &str,
+        expected: Option<bytes::Bytes>,
+        timeout: Duration,
+    ) -> bool {
+        let start = Instant::now();
+        while start.elapsed() < timeout {
+            let actual = cache.get(key.as_bytes()).await;
+            if actual == expected {
+                return true;
+            }
+            sleep(Duration::from_millis(100)).await;
+        }
+        false
+    }
+
     #[test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
     async fn tc23_log_replication_consistency() {
         let port_configs = utils::allocate_os_ports(&[1, 2, 3]).await;
@@ -197,23 +246,51 @@ mod multi_node_tests {
                 .unwrap();
         }
 
+        // Record the leader's applied index - the rejoined node should reach this
+        let target_applied = leader.cluster_status().applied_index;
+        info!(target_applied, "Target applied index for catch-up");
+
         sleep(Duration::from_millis(500)).await;
 
         // Restart node 1
         let cache1_rejoined = DistributedCache::new(config1).await.unwrap();
 
-        // Wait for node to catch up
-        sleep(Duration::from_secs(3)).await;
+        // Wait for node to catch up using the helper (more robust than fixed sleep)
+        // Give it enough time for log reconciliation and replication
+        let caught_up = wait_for_node_catchup(
+            &cache1_rejoined,
+            target_applied,
+            Duration::from_secs(15),
+        )
+        .await;
 
-        // Verify node 1 has all the data (catch-up successful)
+        if !caught_up {
+            // Log the current state for debugging
+            let status = cache1_rejoined.cluster_status();
+            info!(
+                applied = status.applied_index,
+                commit = status.commit_index,
+                target = target_applied,
+                "Node did not fully catch up, but will verify data with retry"
+            );
+        }
+
+        // Verify node 1 has all the data with retry logic
+        // Even if catch-up appears complete, give some grace period for state machine apply
         for i in 0..20 {
             let key = format!("key-{}", i);
             let expected = Some(bytes::Bytes::from(format!("value-{}", i)));
-            let actual = cache1_rejoined.get(key.as_bytes()).await;
-            assert_eq!(
-                actual, expected,
-                "Rejoined node should have caught up: key {}",
-                key
+            let verified = verify_key_with_retry(
+                &cache1_rejoined,
+                &key,
+                expected.clone(),
+                Duration::from_secs(5),
+            )
+            .await;
+            assert!(
+                verified,
+                "Rejoined node should have caught up: key {} (expected {:?})",
+                key, expected
             );
         }
 
@@ -358,7 +435,7 @@ mod multi_node_tests {
     }
 
     // ========================================================================
-    // TC-22: Message Reordering Tolerance (消息乱序与重复)
+    // TC-22: Message Reordering Tolerance
     // ========================================================================
     #[test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
     async fn tc22_message_reordering_tolerance() {

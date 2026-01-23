@@ -149,6 +149,40 @@ pub struct CacheMetrics {
     /// Backpressure events.
     pub checkpoint_backpressure: Counter,
 
+    // Forwarding metrics (for Multi-Raft shard forwarding)
+    /// Total forward requests (shard forwarding).
+    pub forward_total: Counter,
+    /// Successful forward requests.
+    pub forward_success: Counter,
+    /// Failed forward requests.
+    pub forward_failures: Counter,
+    /// Forward request timeouts.
+    pub forward_timeouts: Counter,
+    /// Forward latency (time to complete a forwarded request).
+    pub forward_latency: Histogram,
+    /// Currently pending forward requests.
+    pub forward_pending: Gauge,
+
+    // Migration metrics
+    /// Migration duration (time from start to completion).
+    pub migration_duration: Histogram,
+    /// Currently active migrations.
+    pub migration_active: Gauge,
+    /// Total migrations started.
+    pub migration_total: Counter,
+    /// Successful migrations.
+    pub migration_success: Counter,
+    /// Failed migrations.
+    pub migration_failures: Counter,
+    /// Write operations blocked during migration.
+    pub write_blocked_during_migration: Counter,
+
+    // Leader election metrics
+    /// Total shard leader changes (elections).
+    pub shard_leader_changes: Counter,
+    /// Time since last leader change.
+    pub shard_leader_tenure: Histogram,
+
     // Error counters by type
     /// Errors by type.
     pub errors: LabeledCounter<1>,
@@ -249,6 +283,44 @@ impl CacheMetrics {
                 "Backpressure events during checkpointing",
             ),
 
+            // Forwarding metrics
+            forward_total: Counter::new("forward_total", "Total shard forward requests"),
+            forward_success: Counter::new("forward_success", "Successful shard forwards"),
+            forward_failures: Counter::new("forward_failures", "Failed shard forwards"),
+            forward_timeouts: Counter::new("forward_timeouts", "Timed out shard forwards"),
+            forward_latency: Histogram::with_buckets(
+                "forward_latency_seconds",
+                "Shard forward latency",
+                RAFT_LATENCY_BUCKETS.to_vec(),
+            ),
+            forward_pending: Gauge::new("forward_pending", "Currently pending shard forwards"),
+
+            // Migration metrics
+            migration_duration: Histogram::with_buckets(
+                "migration_duration_seconds",
+                "Shard migration duration",
+                vec![1.0, 5.0, 10.0, 30.0, 60.0, 120.0, 300.0, 600.0, 1800.0],
+            ),
+            migration_active: Gauge::new("migration_active", "Currently active migrations"),
+            migration_total: Counter::new("migration_total", "Total migrations started"),
+            migration_success: Counter::new("migration_success", "Successful migrations"),
+            migration_failures: Counter::new("migration_failures", "Failed migrations"),
+            write_blocked_during_migration: Counter::new(
+                "write_blocked_during_migration_total",
+                "Write operations blocked during migration",
+            ),
+
+            // Leader election metrics
+            shard_leader_changes: Counter::new(
+                "shard_leader_changes_total",
+                "Total shard leader changes (elections)",
+            ),
+            shard_leader_tenure: Histogram::with_buckets(
+                "shard_leader_tenure_seconds",
+                "Duration a node held shard leadership",
+                vec![1.0, 10.0, 60.0, 300.0, 600.0, 1800.0, 3600.0, 7200.0],
+            ),
+
             // Errors
             errors: LabeledCounter::new("cache_errors_total", "Errors by type", ["type"]),
         }
@@ -340,6 +412,66 @@ impl CacheMetrics {
         self.errors.inc([error_type]);
     }
 
+    /// Record a shard forward request.
+    pub fn record_forward(&self, success: bool, timeout: bool, latency: Duration) {
+        self.forward_total.inc();
+        if success {
+            self.forward_success.inc();
+        } else {
+            self.forward_failures.inc();
+            if timeout {
+                self.forward_timeouts.inc();
+            }
+        }
+        self.forward_latency.observe_duration(latency);
+    }
+
+    /// Update the pending forwards gauge.
+    pub fn set_pending_forwards(&self, count: usize) {
+        self.forward_pending.set(count as i64);
+    }
+
+    /// Record a migration operation.
+    pub fn record_migration(&self, success: bool, duration: Duration) {
+        if success {
+            self.migration_success.inc();
+        } else {
+            self.migration_failures.inc();
+        }
+        self.migration_duration.observe_duration(duration);
+    }
+
+    /// Record migration started.
+    pub fn record_migration_started(&self) {
+        self.migration_total.inc();
+        self.migration_active.inc();
+    }
+
+    /// Record migration completed (success or failure).
+    pub fn record_migration_completed(&self) {
+        self.migration_active.dec();
+    }
+
+    /// Update active migrations gauge.
+    pub fn set_active_migrations(&self, count: usize) {
+        self.migration_active.set(count as i64);
+    }
+
+    /// Record a write blocked during migration.
+    pub fn record_write_blocked_during_migration(&self) {
+        self.write_blocked_during_migration.inc();
+    }
+
+    /// Record a shard leader change (election).
+    pub fn record_shard_leader_change(&self) {
+        self.shard_leader_changes.inc();
+    }
+
+    /// Record leader tenure duration when leadership is lost.
+    pub fn record_leader_tenure(&self, duration: Duration) {
+        self.shard_leader_tenure.observe_duration(duration);
+    }
+
     /// Update leader status.
     pub fn set_leader(&self, is_leader: bool) {
         self.is_leader.store(is_leader, Ordering::Relaxed);
@@ -385,6 +517,11 @@ impl CacheMetrics {
             raft_term: self.raft_term.get(),
             get_latency: self.get_latency.snapshot(),
             put_latency: self.put_latency.snapshot(),
+            forward_total: self.forward_total.get(),
+            forward_success: self.forward_success.get(),
+            forward_failures: self.forward_failures.get(),
+            forward_timeouts: self.forward_timeouts.get(),
+            forward_pending: self.forward_pending.get(),
         }
     }
 
@@ -446,6 +583,13 @@ impl CacheMetrics {
             if self.is_leader() { 1 } else { 0 }
         ));
 
+        // Forwarding metrics
+        add_counter!(output, self.forward_total);
+        add_counter!(output, self.forward_success);
+        add_counter!(output, self.forward_failures);
+        add_counter!(output, self.forward_timeouts);
+        add_gauge!(output, self.forward_pending);
+
         // Histograms (simplified output)
         let get_snap = self.get_latency.snapshot();
         output.push_str(&format!(
@@ -454,6 +598,15 @@ impl CacheMetrics {
              cache_get_latency_seconds_sum {}\n\
              cache_get_latency_seconds_count {}\n",
             get_snap.sum, get_snap.count
+        ));
+
+        let forward_snap = self.forward_latency.snapshot();
+        output.push_str(&format!(
+            "# HELP forward_latency_seconds Shard forward latency\n\
+             # TYPE forward_latency_seconds histogram\n\
+             forward_latency_seconds_sum {}\n\
+             forward_latency_seconds_count {}\n",
+            forward_snap.sum, forward_snap.count
         ));
 
         output
@@ -481,6 +634,12 @@ pub struct MetricsSnapshot {
     pub raft_term: i64,
     pub get_latency: HistogramSnapshot,
     pub put_latency: HistogramSnapshot,
+    // Forwarding metrics
+    pub forward_total: u64,
+    pub forward_success: u64,
+    pub forward_failures: u64,
+    pub forward_timeouts: u64,
+    pub forward_pending: i64,
 }
 
 impl MetricsSnapshot {

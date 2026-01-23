@@ -129,6 +129,21 @@ pub struct PersistedShardRegistry {
     pub shards: HashMap<ShardId, PersistedShardMetadata>,
     /// Last update timestamp.
     pub updated_at: u64,
+    /// Leader hints for all shards (from gossip).
+    /// This allows fast recovery without waiting for gossip to propagate.
+    #[serde(default)]
+    pub leader_hints: HashMap<ShardId, ShardLeaderHint>,
+}
+
+/// Persisted leader hint for a shard.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ShardLeaderHint {
+    /// The node that was last known to be the leader.
+    pub leader_node_id: NodeId,
+    /// The epoch when this leadership was observed (for gossip consistency).
+    pub epoch: u64,
+    /// Timestamp when this hint was recorded (Unix seconds).
+    pub timestamp: u64,
 }
 
 /// Information about a shard snapshot.
@@ -667,6 +682,96 @@ impl ShardStorageManager {
         self.persist_registry()
     }
 
+    // ==================== Leader Hints ====================
+
+    /// Save a leader hint for a shard.
+    ///
+    /// Leader hints allow fast recovery after restart by knowing which node
+    /// was last known to be the leader for a shard, without waiting for gossip.
+    pub fn save_leader_hint(&self, shard_id: ShardId, leader_node_id: NodeId, epoch: u64) -> Result<()> {
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
+        let hint = ShardLeaderHint {
+            leader_node_id,
+            epoch,
+            timestamp,
+        };
+
+        {
+            let mut registry = self.registry.write();
+            registry.leader_hints.insert(shard_id, hint);
+            registry.updated_at = timestamp;
+        }
+
+        self.persist_registry()
+    }
+
+    /// Save multiple leader hints at once (batch operation).
+    pub fn save_leader_hints_batch(&self, hints: Vec<(ShardId, NodeId, u64)>) -> Result<()> {
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
+        {
+            let mut registry = self.registry.write();
+            for (shard_id, leader_node_id, epoch) in hints {
+                registry.leader_hints.insert(
+                    shard_id,
+                    ShardLeaderHint {
+                        leader_node_id,
+                        epoch,
+                        timestamp,
+                    },
+                );
+            }
+            registry.updated_at = timestamp;
+        }
+
+        self.persist_registry()
+    }
+
+    /// Get a leader hint for a shard.
+    pub fn get_leader_hint(&self, shard_id: ShardId) -> Option<ShardLeaderHint> {
+        self.registry.read().leader_hints.get(&shard_id).cloned()
+    }
+
+    /// Get all leader hints.
+    pub fn get_all_leader_hints(&self) -> HashMap<ShardId, ShardLeaderHint> {
+        self.registry.read().leader_hints.clone()
+    }
+
+    /// Remove a leader hint.
+    pub fn remove_leader_hint(&self, shard_id: ShardId) -> Result<()> {
+        {
+            let mut registry = self.registry.write();
+            registry.leader_hints.remove(&shard_id);
+            registry.updated_at = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+        }
+
+        self.persist_registry()
+    }
+
+    /// Clear all leader hints (used when cluster topology changes significantly).
+    pub fn clear_leader_hints(&self) -> Result<()> {
+        {
+            let mut registry = self.registry.write();
+            registry.leader_hints.clear();
+            registry.updated_at = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+        }
+
+        self.persist_registry()
+    }
+
     /// Persist the registry to disk.
     fn persist_registry(&self) -> Result<()> {
         let registry_path = self.registry_path();
@@ -745,7 +850,7 @@ mod tests {
     async fn test_shard_storage_manager_creation() {
         let temp_dir = TempDir::new().unwrap();
         let config = ShardStorageConfig::new(temp_dir.path());
-        let manager = ShardStorageManager::new(config, 1).unwrap();
+        let _manager = ShardStorageManager::new(config, 1).unwrap();
 
         // Verify directories were created
         assert!(temp_dir.path().join("snapshots").exists());

@@ -8,7 +8,7 @@
 //! This module provides cleanup handlers to ensure these resources are properly
 //! cleaned up when a migration fails or is cancelled.
 
-use crate::error::{Error, Result};
+use crate::error::{Result};
 use crate::types::NodeId;
 use parking_lot::Mutex;
 use std::collections::HashSet;

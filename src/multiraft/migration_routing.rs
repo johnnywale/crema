@@ -3,7 +3,7 @@
 //! This module implements routing strategies during shard migration to ensure
 //! consistency and availability while data is being transferred between nodes.
 
-use crate::error::{Error, Result};
+use crate::error::{Result};
 use crate::types::NodeId;
 use std::sync::atomic::{AtomicU8, Ordering};
 
@@ -611,6 +611,7 @@ impl DualWriteTracker {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::error::Error;
     use crate::multiraft::shard_placement::MovementType;
 
     fn test_migration() -> ShardMigration {

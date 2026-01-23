@@ -8,7 +8,7 @@ use crate::types::NodeId;
 use raft::prelude::Message as RaftMessage;
 use raft::prelude::MessageType;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicU16, AtomicUsize, Ordering as AtomicOrdering};
+use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::io::AsyncReadExt;
@@ -16,12 +16,11 @@ use tokio::net::TcpListener;
 use tokio::sync::Mutex as TokioMutex;
 use tokio::time::sleep;
 
-/// Port counter to ensure unique ports across tests (starting at 30000)
-static PORT_COUNTER: AtomicU16 = AtomicU16::new(31000);
-
-/// Allocate a unique port for testing
-fn allocate_port() -> u16 {
-    PORT_COUNTER.fetch_add(1, AtomicOrdering::SeqCst)
+/// Allocate an OS-assigned port for testing by binding to port 0.
+/// This avoids conflicts with Windows' dynamic port exclusion ranges.
+async fn allocate_port() -> u16 {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    listener.local_addr().unwrap().port()
 }
 
 /// Helper function to create a test Raft message
@@ -48,7 +47,7 @@ struct MockRaftServer {
 
 impl MockRaftServer {
     async fn new() -> Self {
-        let port = allocate_port();
+        let port = allocate_port().await;
         let addr: SocketAddr = format!("127.0.0.1:{}", port).parse().unwrap();
 
         Self {
@@ -251,7 +250,7 @@ async fn test_retry_on_connection_failure() {
     let transport = RaftTransport::with_config(1, config);
 
     // Add peer with invalid address (will fail to connect)
-    let invalid_port = allocate_port();
+    let invalid_port = allocate_port().await;
     transport
         .add_peer(2, format!("127.0.0.1:{}", invalid_port).parse().unwrap())
         .await;
@@ -325,8 +324,8 @@ async fn test_peer_management() {
     let transport = RaftTransport::new(1);
 
     // Add peers
-    let port1 = allocate_port();
-    let port2 = allocate_port();
+    let port1 = allocate_port().await;
+    let port2 = allocate_port().await;
     let addr1: SocketAddr = format!("127.0.0.1:{}", port1).parse().unwrap();
     let addr2: SocketAddr = format!("127.0.0.1:{}", port2).parse().unwrap();
 
@@ -705,6 +704,7 @@ async fn test_priority_preemption_logic() {
     let server = MockRaftServer::new().await;
     let server_addr = server.addr();
     let received_messages = server.received_messages.clone();
+    let message_count = server.message_count.clone();
 
     // 1. Setup Transport, deliberately not starting Server's run loop
     let transport = RaftTransport::new(1);
@@ -725,14 +725,14 @@ async fn test_priority_preemption_logic() {
     // 4. Start server, Worker begins establishing connection and consuming queue
     tokio::spawn(async move { server.run().await });
 
-    // 5. Use wait_for_metrics instead of sleep
-    // We wait until at least 1 message is sent
+    // 5. Wait until the server has actually received at least 1 message
+    // (not just for transport to report sending - that's a race condition)
     let success = wait_for_condition(Duration::from_secs(3), || {
-        transport.metrics().messages_sent >= 1
+        message_count.load(AtomicOrdering::SeqCst) >= 1
     })
     .await;
 
-    assert!(success, "No messages were sent within the timeout");
+    assert!(success, "Server did not receive any messages within the timeout");
 
     // 6. Verify receive order
     let received = received_messages.lock().await;

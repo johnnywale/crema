@@ -157,8 +157,7 @@ src/
 ├── network/        # TCP server, RPC messages, wire protocol
 ├── checkpoint/     # Snapshot writer/reader with LZ4 compression
 ├── partitioning/   # Consistent hash ring for key distribution
-├── rebalancing/    # Data transfer coordination for cluster changes
-├── multiraft/      # Horizontal scaling via multiple Raft groups
+├── multiraft/      # Horizontal scaling via multiple Raft groups + migration
 │   ├── coordinator.rs    # MultiRaftCoordinator - manages all shards
 │   ├── shard.rs          # Shard - single partition with its own storage
 │   ├── router.rs         # ShardRouter - routes keys to shards

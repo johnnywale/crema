@@ -97,7 +97,6 @@ pub mod metrics;
 pub mod multiraft;
 pub mod network;
 pub mod partitioning;
-// pub mod rebalancing;
 pub mod testing;
 pub mod types;
 
@@ -105,8 +104,11 @@ pub mod types;
 pub use cache::DistributedCache;
 pub use config::{
     CacheConfig, MemberlistConfig, MembershipConfig, MembershipMode, MultiRaftCacheConfig,
-    RaftConfig,
+    RaftConfig, RaftStorageType,
 };
+
+#[cfg(feature = "rocksdb-storage")]
+pub use config::RocksDbConfig;
 pub use error::{Error, Result};
 pub use types::{CacheCommand, CacheStats, ClusterStatus, NodeId, PeerInfo};
 
@@ -121,12 +123,6 @@ pub use checkpoint::{
 
 // Re-export partitioning types
 pub use partitioning::{HashRing, KeyOwnership, OwnershipRole, OwnershipTracker, PendingTransfers};
-
-// // Re-export rebalancing types
-// pub use rebalancing::{
-//     RebalanceConfig, RebalanceCoordinator, RebalanceError, RebalanceState, RebalanceType,
-//     TransferBatch, TransferEntry, TransferProgress,
-// };
 
 // Re-export metrics types
 pub use metrics::{
@@ -149,7 +145,7 @@ pub use multiraft::{
     // Shard placement and registry
     MovementType, PlacementConfig, ShardMovement, ShardPlacement,
     ShardLifecycleState, ShardMetadata, ShardRegistry,
-    // Migration (use multiraft:: prefix to avoid conflicts with rebalancing)
+    // Migration types for shard rebalancing
     InMemoryMigrationStore, MigrationCheckpoint, MigrationConfig, MigrationPhase,
     MigrationProgress, MigrationStateStore, MigrationStats, ShardMigration,
     ShardMigrationCoordinator, MigrationMetrics, MigrationMetricsSnapshot, MigrationTimer,
@@ -161,3 +157,9 @@ pub use multiraft::TransferEntry as MigrationTransferEntry;
 
 // Re-export memberlist types for Multi-Raft integration
 pub use cluster::memberlist_cluster::ShardLeaderInfo;
+
+// Re-export consensus storage types
+pub use consensus::{MemStorage, RaftStorage};
+
+#[cfg(feature = "rocksdb-storage")]
+pub use consensus::{RocksDbStorage, RocksDbStorageConfig};

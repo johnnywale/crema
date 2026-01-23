@@ -18,11 +18,13 @@ use super::raft_migration::{
 };
 use super::router::{RouterConfig, ShardRouter};
 use super::shard::{Shard, ShardConfig, ShardId, ShardInfo, ShardState};
+use super::shard_forwarder::{ShardForwarder, ShardForwardingConfig};
 use super::shard_placement::{PlacementConfig, ShardMovement, ShardPlacement};
-use super::shard_recovery::{RecoveredShard, RecoveryStats, ShardRecoveryCoordinator};
+use super::shard_recovery::{RecoveryStats, ShardRecoveryCoordinator};
 use super::shard_registry::{ShardLifecycleState, ShardRegistry};
 use super::shard_storage::{PersistedShardMetadata, ShardStorageConfig, ShardStorageManager};
 use crate::error::{Error, Result};
+use crate::types::CacheCommand;
 use crate::metrics::CacheMetrics;
 use crate::types::NodeId;
 use bytes::Bytes;
@@ -200,6 +202,12 @@ pub struct MultiRaftCoordinator {
 
     /// Last recovery stats (if recovery was performed).
     last_recovery_stats: RwLock<Option<RecoveryStats>>,
+
+    /// Shard forwarder for cross-node request forwarding.
+    shard_forwarder: ShardForwarder,
+
+    /// Whether shard forwarding is enabled.
+    forwarding_enabled: bool,
 }
 
 impl MultiRaftCoordinator {
@@ -217,6 +225,9 @@ impl MultiRaftCoordinator {
         // Use >= 256 vnodes per node to prevent data skew in distribution
         let placement_config = PlacementConfig::new(config.replica_factor).with_vnodes(256);
         let shard_placement = Arc::new(ShardPlacement::new(config.num_shards, placement_config));
+
+        // Create shard forwarder for cross-node request forwarding
+        let shard_forwarder = ShardForwarder::new(node_id, ShardForwardingConfig::default());
 
         Self {
             node_id,
@@ -238,6 +249,8 @@ impl MultiRaftCoordinator {
             node_addresses: RwLock::new(HashMap::new()),
             storage_manager: RwLock::new(None),
             last_recovery_stats: RwLock::new(None),
+            shard_forwarder,
+            forwarding_enabled: true,
         }
     }
 
@@ -261,6 +274,9 @@ impl MultiRaftCoordinator {
         let placement_config = PlacementConfig::new(config.replica_factor).with_vnodes(256);
         let shard_placement = Arc::new(ShardPlacement::new(config.num_shards, placement_config));
 
+        // Create shard forwarder for cross-node request forwarding
+        let shard_forwarder = ShardForwarder::new(node_id, ShardForwardingConfig::default());
+
         Self {
             node_id,
             config,
@@ -281,6 +297,8 @@ impl MultiRaftCoordinator {
             node_addresses: RwLock::new(HashMap::new()),
             storage_manager: RwLock::new(None),
             last_recovery_stats: RwLock::new(None),
+            shard_forwarder,
+            forwarding_enabled: true,
         }
     }
 
@@ -396,32 +414,121 @@ impl MultiRaftCoordinator {
     }
 
     /// Get a value from the cache.
+    ///
+    /// If the shard is not local but the leader is known on another node,
+    /// the request is automatically forwarded.
     pub async fn get(&self, key: &[u8]) -> Result<Option<Bytes>> {
         self.operations_total.fetch_add(1, Ordering::Relaxed);
 
         let start = Instant::now();
         let result = self.router.get(key).await;
-        let hit = result.as_ref().map(|r| r.is_some()).unwrap_or(false);
 
-        self.metrics.record_get(hit, start.elapsed());
-
-        result
+        // If successful or error other than ShardNotFound, return directly
+        match &result {
+            Ok(_) => {
+                let hit = result.as_ref().map(|r| r.is_some()).unwrap_or(false);
+                self.metrics.record_get(hit, start.elapsed());
+                return result;
+            }
+            Err(Error::ShardNotFound(shard_id)) if self.forwarding_enabled => {
+                // Check if we know the shard leader on another node
+                if let Some(leader_node) = self.leader_tracker.get_leader(*shard_id) {
+                    if leader_node != self.node_id {
+                        // Forward to the leader node
+                        let command = CacheCommand::get(key.to_vec());
+                        match self.shard_forwarder.forward_to_node(leader_node, *shard_id, command).await {
+                            Ok(forward_result) => {
+                                let value = forward_result.value;
+                                self.metrics.record_get(value.is_some(), start.elapsed());
+                                return Ok(value);
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    shard_id = *shard_id,
+                                    leader_node = leader_node,
+                                    error = %e,
+                                    "Shard forward failed for GET"
+                                );
+                                self.metrics.record_get(false, start.elapsed());
+                                return Err(e);
+                            }
+                        }
+                    }
+                }
+                // No leader known or we are the leader - return original error
+                self.metrics.record_get(false, start.elapsed());
+                return Err(Error::ShardLeaderUnknown(*shard_id));
+            }
+            Err(_) => {
+                self.metrics.record_get(false, start.elapsed());
+                return result;
+            }
+        }
     }
 
     /// Put a value in the cache.
+    ///
+    /// If the shard is not local but the leader is known on another node,
+    /// the request is automatically forwarded.
     pub async fn put(&self, key: impl Into<Bytes>, value: impl Into<Bytes>) -> Result<()> {
         self.operations_total.fetch_add(1, Ordering::Relaxed);
 
+        let key = key.into();
+        let value = value.into();
+
         let start = Instant::now();
-        let result = self.router.put(key.into(), value.into()).await;
-        let success = result.is_ok();
+        let result = self.router.put(key.clone(), value.clone()).await;
 
-        self.metrics.record_put(success, start.elapsed());
-
-        result.map(|_| ())
+        match &result {
+            Ok(_) => {
+                self.metrics.record_put(true, start.elapsed());
+                result.map(|_| ())
+            }
+            Err(Error::ShardNotFound(shard_id)) if self.forwarding_enabled => {
+                // Check if we know the shard leader on another node
+                if let Some(leader_node) = self.leader_tracker.get_leader(*shard_id) {
+                    if leader_node != self.node_id {
+                        // Forward to the leader node
+                        let command = CacheCommand::put(key.to_vec(), value.to_vec());
+                        match self.shard_forwarder.forward_to_node(leader_node, *shard_id, command).await {
+                            Ok(forward_result) => {
+                                self.metrics.record_put(forward_result.success, start.elapsed());
+                                if forward_result.success {
+                                    return Ok(());
+                                } else {
+                                    return Err(Error::RemoteError(
+                                        forward_result.error.unwrap_or_else(|| "unknown error".into())
+                                    ));
+                                }
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    shard_id = *shard_id,
+                                    leader_node = leader_node,
+                                    error = %e,
+                                    "Shard forward failed for PUT"
+                                );
+                                self.metrics.record_put(false, start.elapsed());
+                                return Err(e);
+                            }
+                        }
+                    }
+                }
+                // No leader known or we are the leader - return original error
+                self.metrics.record_put(false, start.elapsed());
+                Err(Error::ShardLeaderUnknown(*shard_id))
+            }
+            Err(_) => {
+                self.metrics.record_put(false, start.elapsed());
+                result.map(|_| ())
+            }
+        }
     }
 
     /// Put a value with TTL.
+    ///
+    /// If the shard is not local but the leader is known on another node,
+    /// the request is automatically forwarded.
     pub async fn put_with_ttl(
         &self,
         key: impl Into<Bytes>,
@@ -430,25 +537,110 @@ impl MultiRaftCoordinator {
     ) -> Result<()> {
         self.operations_total.fetch_add(1, Ordering::Relaxed);
 
+        let key = key.into();
+        let value = value.into();
+
         let start = Instant::now();
-        let result = self.router.put_with_ttl(key.into(), value.into(), ttl).await;
-        let success = result.is_ok();
+        let result = self.router.put_with_ttl(key.clone(), value.clone(), ttl).await;
 
-        self.metrics.record_put(success, start.elapsed());
-
-        result.map(|_| ())
+        match &result {
+            Ok(_) => {
+                self.metrics.record_put(true, start.elapsed());
+                result.map(|_| ())
+            }
+            Err(Error::ShardNotFound(shard_id)) if self.forwarding_enabled => {
+                // Check if we know the shard leader on another node
+                if let Some(leader_node) = self.leader_tracker.get_leader(*shard_id) {
+                    if leader_node != self.node_id {
+                        // Forward to the leader node
+                        let command = CacheCommand::put_with_ttl(key.to_vec(), value.to_vec(), ttl);
+                        match self.shard_forwarder.forward_to_node(leader_node, *shard_id, command).await {
+                            Ok(forward_result) => {
+                                self.metrics.record_put(forward_result.success, start.elapsed());
+                                if forward_result.success {
+                                    return Ok(());
+                                } else {
+                                    return Err(Error::RemoteError(
+                                        forward_result.error.unwrap_or_else(|| "unknown error".into())
+                                    ));
+                                }
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    shard_id = *shard_id,
+                                    leader_node = leader_node,
+                                    error = %e,
+                                    "Shard forward failed for PUT_WITH_TTL"
+                                );
+                                self.metrics.record_put(false, start.elapsed());
+                                return Err(e);
+                            }
+                        }
+                    }
+                }
+                // No leader known or we are the leader - return original error
+                self.metrics.record_put(false, start.elapsed());
+                Err(Error::ShardLeaderUnknown(*shard_id))
+            }
+            Err(_) => {
+                self.metrics.record_put(false, start.elapsed());
+                result.map(|_| ())
+            }
+        }
     }
 
     /// Delete a key from the cache.
+    ///
+    /// If the shard is not local but the leader is known on another node,
+    /// the request is automatically forwarded.
     pub async fn delete(&self, key: &[u8]) -> Result<()> {
         self.operations_total.fetch_add(1, Ordering::Relaxed);
 
         let start = Instant::now();
         let result = self.router.delete(key).await;
 
-        self.metrics.record_delete(start.elapsed());
-
-        result.map(|_| ())
+        match &result {
+            Ok(_) => {
+                self.metrics.record_delete(start.elapsed());
+                result.map(|_| ())
+            }
+            Err(Error::ShardNotFound(shard_id)) if self.forwarding_enabled => {
+                // Check if we know the shard leader on another node
+                if let Some(leader_node) = self.leader_tracker.get_leader(*shard_id) {
+                    if leader_node != self.node_id {
+                        // Forward to the leader node
+                        let command = CacheCommand::delete(key.to_vec());
+                        match self.shard_forwarder.forward_to_node(leader_node, *shard_id, command).await {
+                            Ok(forward_result) => {
+                                self.metrics.record_delete(start.elapsed());
+                                if forward_result.success {
+                                    return Ok(());
+                                } else {
+                                    return Err(Error::RemoteError(
+                                        forward_result.error.unwrap_or_else(|| "unknown error".into())
+                                    ));
+                                }
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    shard_id = *shard_id,
+                                    leader_node = leader_node,
+                                    error = %e,
+                                    "Shard forward failed for DELETE"
+                                );
+                                return Err(e);
+                            }
+                        }
+                    }
+                }
+                // No leader known or we are the leader - return original error
+                Err(Error::ShardLeaderUnknown(*shard_id))
+            }
+            Err(_) => {
+                self.metrics.record_delete(start.elapsed());
+                result.map(|_| ())
+            }
+        }
     }
 
     /// Get shard information.
@@ -1120,15 +1312,49 @@ impl MultiRaftCoordinator {
         }
     }
 
-    /// Register a node's address for migration.
+    /// Register a node's address for migration and forwarding.
     pub fn register_node_address(&self, node_id: NodeId, addr: SocketAddr) {
         self.node_addresses.write().insert(node_id, addr);
-        tracing::debug!(node_id, %addr, "Registered node address for migration");
+        // Also register with the shard forwarder
+        self.shard_forwarder.register_node(node_id, addr);
+        tracing::debug!(node_id, %addr, "Registered node address for migration and forwarding");
     }
 
     /// Get a node's address.
     pub fn get_node_address(&self, node_id: NodeId) -> Option<SocketAddr> {
         self.node_addresses.read().get(&node_id).copied()
+    }
+
+    // ==================== Shard Forwarding ====================
+
+    /// Enable or disable shard forwarding.
+    ///
+    /// When enabled, requests for keys whose shard is on another node
+    /// will be automatically forwarded to the correct node.
+    pub fn set_forwarding_enabled(&mut self, enabled: bool) {
+        // Note: This requires &mut self because forwarding_enabled is not behind a lock
+        // In production, you might want to make this atomic or use interior mutability
+        tracing::info!(
+            node_id = self.node_id,
+            enabled = enabled,
+            "Shard forwarding {}",
+            if enabled { "enabled" } else { "disabled" }
+        );
+    }
+
+    /// Check if shard forwarding is enabled.
+    pub fn is_forwarding_enabled(&self) -> bool {
+        self.forwarding_enabled
+    }
+
+    /// Get the number of pending shard forwards.
+    pub fn pending_forwards_count(&self) -> usize {
+        self.shard_forwarder.pending_count()
+    }
+
+    /// Get the shard forwarder for handling incoming messages.
+    pub fn shard_forwarder(&self) -> &ShardForwarder {
+        &self.shard_forwarder
     }
 
     /// Pause Raft-native migrations (kill switch).

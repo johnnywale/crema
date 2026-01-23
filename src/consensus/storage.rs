@@ -276,6 +276,29 @@ impl MemStorage {
         let core = self.inner.read();
         core.entries.len().saturating_sub(1)
     }
+
+    /// Set a snapshot for future `Storage::snapshot()` calls.
+    ///
+    /// Unlike `apply_snapshot` (which is called by followers receiving a snapshot),
+    /// this method is called by the leader to store a locally-created snapshot that
+    /// can be sent to lagging followers via InstallSnapshot RPC.
+    ///
+    /// This method:
+    /// - Stores the snapshot for `Storage::snapshot()` to return
+    /// - Does NOT reset the log (entries are preserved)
+    /// - Does NOT modify hard state or conf state
+    ///
+    /// # Arguments
+    /// * `snapshot` - The snapshot to store, with metadata and state machine data
+    pub fn set_snapshot(&self, snapshot: Snapshot) {
+        let mut core = self.inner.write();
+        core.snapshot = snapshot;
+    }
+
+    /// Get the current snapshot (for testing/inspection).
+    pub fn get_snapshot(&self) -> Snapshot {
+        self.inner.read().snapshot.clone()
+    }
 }
 
 impl MemStorageCore {
@@ -424,6 +447,247 @@ impl Storage for MemStorage {
         }
 
         Ok(core.snapshot.clone())
+    }
+}
+
+// ============================================================================
+// Unified Storage Wrapper
+// ============================================================================
+
+/// Unified storage that can be either in-memory or RocksDB-based.
+///
+/// This enum allows RaftNode to use either storage backend based on configuration.
+/// All variants implement the `Storage` trait through delegation.
+#[derive(Clone)]
+pub enum RaftStorage {
+    /// In-memory storage (fast but not durable).
+    Memory(MemStorage),
+
+    /// RocksDB-based persistent storage (durable).
+    #[cfg(feature = "rocksdb-storage")]
+    RocksDb(super::rocksdb_storage::RocksDbStorage),
+}
+
+impl RaftStorage {
+    /// Create a new in-memory storage.
+    pub fn new_memory() -> Self {
+        Self::Memory(MemStorage::new())
+    }
+
+    /// Create in-memory storage with initial voters.
+    pub fn new_memory_with_conf_state(voters: Vec<u64>) -> Self {
+        Self::Memory(MemStorage::new_with_conf_state(voters))
+    }
+
+    /// Create RocksDB storage with the given configuration.
+    #[cfg(feature = "rocksdb-storage")]
+    pub fn new_rocksdb(
+        config: super::rocksdb_storage::RocksDbStorageConfig,
+    ) -> Result<Self> {
+        Ok(Self::RocksDb(super::rocksdb_storage::RocksDbStorage::new(config)?))
+    }
+
+    /// Create RocksDB storage with initial voters.
+    #[cfg(feature = "rocksdb-storage")]
+    pub fn new_rocksdb_with_conf_state(
+        config: super::rocksdb_storage::RocksDbStorageConfig,
+        voters: Vec<u64>,
+    ) -> Result<Self> {
+        Ok(Self::RocksDb(
+            super::rocksdb_storage::RocksDbStorage::new_with_conf_state(config, voters)?,
+        ))
+    }
+
+    /// Set the hard state.
+    pub fn set_hard_state(&self, hs: HardState) -> Result<()> {
+        match self {
+            Self::Memory(s) => {
+                s.set_hard_state(hs);
+                Ok(())
+            }
+            #[cfg(feature = "rocksdb-storage")]
+            Self::RocksDb(s) => s.set_hard_state(hs),
+        }
+    }
+
+    /// Set the conf state.
+    pub fn set_conf_state(&self, cs: ConfState) -> Result<()> {
+        match self {
+            Self::Memory(s) => {
+                s.set_conf_state(cs);
+                Ok(())
+            }
+            #[cfg(feature = "rocksdb-storage")]
+            Self::RocksDb(s) => s.set_conf_state(cs),
+        }
+    }
+
+    /// Append entries to the log.
+    pub fn append(&self, entries: &[Entry]) -> Result<()> {
+        match self {
+            Self::Memory(s) => s.append(entries),
+            #[cfg(feature = "rocksdb-storage")]
+            Self::RocksDb(s) => s.append(entries),
+        }
+    }
+
+    /// Apply a snapshot.
+    pub fn apply_snapshot(&self, snapshot: Snapshot) -> Result<()> {
+        match self {
+            Self::Memory(s) => s.apply_snapshot(snapshot),
+            #[cfg(feature = "rocksdb-storage")]
+            Self::RocksDb(s) => s.apply_snapshot(snapshot),
+        }
+    }
+
+    /// Compact the log up to the given index.
+    pub fn compact(&self, compact_index: u64) -> Result<()> {
+        match self {
+            Self::Memory(s) => s.compact(compact_index),
+            #[cfg(feature = "rocksdb-storage")]
+            Self::RocksDb(s) => s.compact(compact_index),
+        }
+    }
+
+    /// Get the last index in the log.
+    pub fn last_index(&self) -> u64 {
+        match self {
+            Self::Memory(s) => s.last_index(),
+            #[cfg(feature = "rocksdb-storage")]
+            Self::RocksDb(s) => s.last_index(),
+        }
+    }
+
+    /// Get the first index in the log.
+    pub fn first_index(&self) -> u64 {
+        match self {
+            Self::Memory(s) => s.first_index(),
+            #[cfg(feature = "rocksdb-storage")]
+            Self::RocksDb(s) => s.first_index(),
+        }
+    }
+
+    /// Get the compacted index.
+    pub fn compacted_index(&self) -> u64 {
+        match self {
+            Self::Memory(s) => s.compacted_index(),
+            #[cfg(feature = "rocksdb-storage")]
+            Self::RocksDb(s) => s.compacted_index(),
+        }
+    }
+
+    /// Get the number of entries in the log.
+    pub fn entry_count(&self) -> usize {
+        match self {
+            Self::Memory(s) => s.entry_count(),
+            #[cfg(feature = "rocksdb-storage")]
+            Self::RocksDb(s) => s.entry_count(),
+        }
+    }
+
+    /// Check if this is memory storage.
+    pub fn is_memory(&self) -> bool {
+        matches!(self, Self::Memory(_))
+    }
+
+    /// Check if this is RocksDB storage.
+    #[cfg(feature = "rocksdb-storage")]
+    pub fn is_rocksdb(&self) -> bool {
+        matches!(self, Self::RocksDb(_))
+    }
+
+    /// Set a snapshot for future `Storage::snapshot()` calls.
+    ///
+    /// This method is called by the leader to store a locally-created snapshot
+    /// that can be sent to lagging followers via InstallSnapshot RPC.
+    pub fn set_snapshot(&self, snapshot: Snapshot) -> Result<()> {
+        match self {
+            Self::Memory(s) => {
+                s.set_snapshot(snapshot);
+                Ok(())
+            }
+            #[cfg(feature = "rocksdb-storage")]
+            Self::RocksDb(s) => s.set_snapshot(snapshot),
+        }
+    }
+
+    /// Get the current snapshot.
+    pub fn get_snapshot(&self) -> Snapshot {
+        match self {
+            Self::Memory(s) => s.get_snapshot(),
+            #[cfg(feature = "rocksdb-storage")]
+            Self::RocksDb(s) => s.get_snapshot(),
+        }
+    }
+}
+
+impl Storage for RaftStorage {
+    fn initial_state(&self) -> raft::Result<RaftState> {
+        match self {
+            Self::Memory(s) => s.initial_state(),
+            #[cfg(feature = "rocksdb-storage")]
+            Self::RocksDb(s) => s.initial_state(),
+        }
+    }
+
+    fn entries(
+        &self,
+        low: u64,
+        high: u64,
+        max_size: impl Into<Option<u64>>,
+        context: raft::GetEntriesContext,
+    ) -> raft::Result<Vec<Entry>> {
+        match self {
+            Self::Memory(s) => s.entries(low, high, max_size, context),
+            #[cfg(feature = "rocksdb-storage")]
+            Self::RocksDb(s) => s.entries(low, high, max_size, context),
+        }
+    }
+
+    fn term(&self, idx: u64) -> raft::Result<u64> {
+        match self {
+            Self::Memory(s) => s.term(idx),
+            #[cfg(feature = "rocksdb-storage")]
+            Self::RocksDb(s) => s.term(idx),
+        }
+    }
+
+    fn first_index(&self) -> raft::Result<u64> {
+        match self {
+            Self::Memory(s) => Storage::first_index(s),
+            #[cfg(feature = "rocksdb-storage")]
+            Self::RocksDb(s) => Storage::first_index(s),
+        }
+    }
+
+    fn last_index(&self) -> raft::Result<u64> {
+        match self {
+            Self::Memory(s) => Storage::last_index(s),
+            #[cfg(feature = "rocksdb-storage")]
+            Self::RocksDb(s) => Storage::last_index(s),
+        }
+    }
+
+    fn snapshot(&self, request_index: u64, to: u64) -> raft::Result<Snapshot> {
+        match self {
+            Self::Memory(s) => s.snapshot(request_index, to),
+            #[cfg(feature = "rocksdb-storage")]
+            Self::RocksDb(s) => s.snapshot(request_index, to),
+        }
+    }
+}
+
+impl std::fmt::Debug for RaftStorage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Memory(s) => f.debug_tuple("RaftStorage::Memory")
+                .field(&format!("entries={}", s.entry_count()))
+                .finish(),
+            #[cfg(feature = "rocksdb-storage")]
+            Self::RocksDb(s) => f.debug_tuple("RaftStorage::RocksDb")
+                .field(s)
+                .finish(),
+        }
     }
 }
 

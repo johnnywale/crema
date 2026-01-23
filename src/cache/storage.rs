@@ -4,7 +4,10 @@ use crate::config::CacheConfig;
 use crate::types::CacheStats;
 use bytes::Bytes;
 use moka::future::Cache;
+use parking_lot::RwLock;
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 /// Local cache storage backed by Moka.
@@ -17,6 +20,11 @@ pub struct CacheStorage {
 
     /// Miss counter for statistics.
     misses: AtomicU64,
+
+    /// Expiration times for entries with per-entry TTL.
+    /// Maps key to absolute expiration time in milliseconds since Unix epoch.
+    /// Entries without TTL are not present in this map.
+    expirations: RwLock<HashMap<Bytes, u64>>,
 }
 
 impl CacheStorage {
@@ -47,6 +55,7 @@ impl CacheStorage {
             cache,
             hits: AtomicU64::new(0),
             misses: AtomicU64::new(0),
+            expirations: RwLock::new(HashMap::new()),
         }
     }
 
@@ -77,23 +86,54 @@ impl CacheStorage {
     }
 
     /// Insert a key-value pair with a custom TTL.
-    pub async fn insert_with_ttl(&self, key: Bytes, value: Bytes, _ttl: Duration) {
-        // Moka doesn't support per-entry TTL directly in the basic API,
-        // but we can use the expire_after policy or a workaround.
-        // For now, we'll use the cache's policy and note this limitation.
-        // In a production implementation, you'd use expire_after.
+    ///
+    /// The TTL is tracked separately from Moka (which doesn't expose per-entry TTL).
+    /// This allows snapshots to include expiration times for proper recovery.
+    pub async fn insert_with_ttl(&self, key: Bytes, value: Bytes, ttl: Duration) {
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        // Calculate absolute expiration time
+        let now_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        let expires_at_ms = now_ms + ttl.as_millis() as u64;
+
+        // Store expiration time
+        self.expirations.write().insert(key.clone(), expires_at_ms);
+
+        // Insert into Moka cache
         self.cache.insert(key, value).await;
-        // TODO: Implement per-entry TTL using Moka's expiry policy
+    }
+
+    /// Insert a key-value pair with an absolute expiration time.
+    ///
+    /// Used when restoring from snapshots where we have the absolute expiration time.
+    pub async fn insert_with_expiration(&self, key: Bytes, value: Bytes, expires_at_ms: u64) {
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let now_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+
+        // Only insert if not expired
+        if expires_at_ms > now_ms {
+            self.expirations.write().insert(key.clone(), expires_at_ms);
+            self.cache.insert(key, value).await;
+        }
     }
 
     /// Invalidate (remove) a key from the cache.
     pub async fn invalidate(&self, key: &[u8]) {
         let key = Bytes::copy_from_slice(key);
+        self.expirations.write().remove(&key);
         self.cache.invalidate(&key).await;
     }
 
     /// Invalidate all entries in the cache.
     pub fn invalidate_all(&self) {
+        self.expirations.write().clear();
         self.cache.invalidate_all();
     }
 
@@ -120,6 +160,59 @@ impl CacheStorage {
     /// Run pending maintenance tasks (cleanup expired entries, etc.).
     pub async fn run_pending_tasks(&self) {
         self.cache.run_pending_tasks().await;
+    }
+
+    /// Iterate over all entries in the cache.
+    ///
+    /// Returns an iterator over (key, value) pairs. The iterator visits entries
+    /// in arbitrary order and does not update popularity estimators or reset
+    /// idle timers.
+    ///
+    /// Note: Due to concurrent access, newly inserted entries may or may not
+    /// appear in the iteration, but removed entries will not be returned.
+    pub fn iter(&self) -> impl Iterator<Item = (Arc<Bytes>, Bytes)> + '_ {
+        self.cache.iter()
+    }
+
+    /// Collect all entries for snapshot creation (without expiration times).
+    ///
+    /// Returns a vector of (key, value) pairs representing the current cache state.
+    /// This is used for creating Raft snapshots to transfer state to followers.
+    ///
+    /// Note: This is a point-in-time snapshot. Concurrent modifications may not
+    /// be fully captured.
+    pub fn collect_entries(&self) -> Vec<(Bytes, Bytes)> {
+        self.cache
+            .iter()
+            .map(|(k, v)| ((*k).clone(), v))
+            .collect()
+    }
+
+    /// Collect all entries with their expiration times for snapshot creation.
+    ///
+    /// Returns a vector of (key, value, expires_at_ms) tuples.
+    /// expires_at_ms is None for entries without TTL.
+    ///
+    /// Note: This is a point-in-time snapshot. Concurrent modifications may not
+    /// be fully captured.
+    pub fn collect_entries_with_expiration(&self) -> Vec<(Bytes, Bytes, Option<u64>)> {
+        let expirations = self.expirations.read();
+        self.cache
+            .iter()
+            .map(|(k, v)| {
+                let key = (*k).clone();
+                let expires_at = expirations.get(&key).copied();
+                (key, v, expires_at)
+            })
+            .collect()
+    }
+
+    /// Get the expiration time for a key.
+    ///
+    /// Returns None if the key has no expiration or doesn't exist.
+    pub fn get_expiration(&self, key: &[u8]) -> Option<u64> {
+        let key = Bytes::copy_from_slice(key);
+        self.expirations.read().get(&key).copied()
     }
 }
 

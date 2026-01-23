@@ -97,6 +97,9 @@ pub struct TransportConfig {
     pub background_reconnect_interval: Option<Duration>,
     /// 新增：连接失败标记持续时间，在此期间强制尝试重连
     pub force_reconnect_window: Duration,
+    /// Worker shutdown timeout - how long to wait for each worker to flush during shutdown.
+    /// Use a shorter value for tests (e.g., 50ms) vs production (1s).
+    pub worker_shutdown_timeout: Duration,
 }
 
 impl Default for TransportConfig {
@@ -126,6 +129,27 @@ impl Default for TransportConfig {
             // 新增：每500ms尝试重连，直到成功
             background_reconnect_interval: Some(Duration::from_millis(500)),
             force_reconnect_window: Duration::from_secs(30),
+            worker_shutdown_timeout: Duration::from_secs(1),
+        }
+    }
+}
+
+impl TransportConfig {
+    /// Create a fast configuration suitable for tests.
+    /// Uses shorter timeouts to speed up test execution.
+    pub fn fast_for_tests() -> Self {
+        Self {
+            worker_shutdown_timeout: Duration::from_millis(50),
+            connect_timeout: Duration::from_millis(500),
+            write_timeout: Duration::from_millis(500),
+            initial_retry_delay: Duration::from_millis(10),
+            max_retry_delay: Duration::from_millis(100),
+            initial_connect_retry_delay: Duration::from_millis(10),
+            max_connect_retry_delay: Duration::from_millis(100),
+            idle_timeout: Some(Duration::from_secs(10)),
+            background_reconnect_interval: Some(Duration::from_millis(100)),
+            force_reconnect_window: Duration::from_secs(5),
+            ..Default::default()
         }
     }
 }
@@ -705,13 +729,14 @@ impl RaftTransport {
                     };
 
                     let mut drain_futures = vec![];
+                    let shutdown_timeout = config.worker_shutdown_timeout;
                     for worker in worker_list {
                         let (tx, rx) = oneshot::channel();
                         let _ = worker.control_tx.send(WorkerCommand::Stop(tx));
 
                         drain_futures.push(async move {
-                            // 给每个 Worker 1秒的优雅刷盘时间
-                            if let Err(_) = tokio::time::timeout(Duration::from_secs(1), rx).await {
+                            // Give each worker time to flush (configurable, default 1s, 50ms for tests)
+                            if let Err(_) = tokio::time::timeout(shutdown_timeout, rx).await {
                                 debug!(peer_id = worker.peer_id, "Worker stop timeout, aborting");
                             }
                             // 关键点 2：显式调用 abort 确保 handle 结束
@@ -1007,7 +1032,7 @@ impl RaftTransport {
 
                 // 5. 优雅停机：刷完队列
                 Some(WorkerCommand::Stop(ack)) = control_rx.recv() => {
-                    info!(peer_id, "Flushing remaining messages before stop");
+                    debug!(peer_id, "Flushing remaining messages before stop");
 
                     // 先发送批处理缓冲区中的消息
                     if !batch_buffer.is_empty() {
