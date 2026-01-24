@@ -2,6 +2,8 @@
 
 This guide explains how to use the metrics system for observability and monitoring.
 
+For the complete API reference, see the [main README](../../README.md).
+
 ## Overview
 
 Crema provides comprehensive metrics for:

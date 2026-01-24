@@ -1,4 +1,3 @@
-use crate::config::MemberlistConfig;
 use crate::{CacheConfig, DistributedCache, NodeId, RaftConfig};
 use std::collections::HashSet;
 use std::net::{SocketAddr, UdpSocket};
@@ -85,29 +84,22 @@ pub(crate) fn cluster_node_config(node_id: NodeId, port_configs: &[(NodeId, u16)
 
     let base_election_tick = 10;
 
-    CacheConfig {
-        node_id,
-        raft_addr,
-        seed_nodes,
-        max_capacity: 10_000,
-        default_ttl: Some(Duration::from_secs(3600)),
-        default_tti: None,
-        raft: RaftConfig {
-            tick_interval_ms: 100,
-            election_tick: base_election_tick + (node_id as usize * 10),
-            heartbeat_tick: 2,
-            max_size_per_msg: 1024 * 1024,
-            max_inflight_msgs: 256,
-            pre_vote: true,
-            applied: 0,
-            storage_type: crate::config::RaftStorageType::Memory,
-        },
-        membership: Default::default(),
-        memberlist: MemberlistConfig::default(),
-        checkpoint: Default::default(),
-        forwarding: Default::default(),
-        multiraft: Default::default(),
-    }
+    let raft_config = RaftConfig {
+        tick_interval_ms: 100,
+        election_tick: base_election_tick + (node_id as usize * 10),
+        heartbeat_tick: 2,
+        max_size_per_msg: 1024 * 1024,
+        max_inflight_msgs: 256,
+        pre_vote: true,
+        applied: 0,
+        storage_type: crate::config::RaftStorageType::Memory,
+    };
+
+    CacheConfig::new(node_id, raft_addr)
+        .with_seed_nodes(seed_nodes)
+        .with_max_capacity(10_000)
+        .with_default_ttl(Duration::from_secs(3600))
+        .with_raft_config(raft_config)
 }
 
 /// Wait for a condition with timeout

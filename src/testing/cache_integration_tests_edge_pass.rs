@@ -352,16 +352,12 @@ pub(crate) mod multi_node_tests {
     async fn tc17_network_partition_majority_minority() {
         let port_configs = allocate_os_ports(&[1, 2, 3, 4, 5]).await;
 
-        // Start all 5 nodes
-        let configs: Vec<CacheConfig> = (1u64..=5)
-            .map(|i| utils::cluster_node_config(i, &port_configs))
-            .collect();
-
-        let cache1 = DistributedCache::new(configs[0].clone()).await.unwrap();
-        let cache2 = DistributedCache::new(configs[1].clone()).await.unwrap();
-        let cache3 = DistributedCache::new(configs[2].clone()).await.unwrap();
-        let cache4 = DistributedCache::new(configs[3].clone()).await.unwrap();
-        let cache5 = DistributedCache::new(configs[4].clone()).await.unwrap();
+        // Start all 5 nodes (create configs directly - CacheConfig is not Clone)
+        let cache1 = DistributedCache::new(utils::cluster_node_config(1, &port_configs)).await.unwrap();
+        let cache2 = DistributedCache::new(utils::cluster_node_config(2, &port_configs)).await.unwrap();
+        let cache3 = DistributedCache::new(utils::cluster_node_config(3, &port_configs)).await.unwrap();
+        let cache4 = DistributedCache::new(utils::cluster_node_config(4, &port_configs)).await.unwrap();
+        let cache5 = DistributedCache::new(utils::cluster_node_config(5, &port_configs)).await.unwrap();
 
         let all_caches = [&cache1, &cache2, &cache3, &cache4, &cache5];
 
@@ -491,17 +487,13 @@ pub(crate) mod multi_node_tests {
     async fn tc20_no_dual_leader() {
         let port_configs = allocate_os_ports(&[1, 2, 3, 4, 5]).await;
 
-        // Start all 5 nodes
-        let configs: Vec<CacheConfig> = (1u64..=5)
-            .map(|i| utils::cluster_node_config(i, &port_configs))
-            .collect();
-
+        // Start all 5 nodes (create configs directly - CacheConfig is not Clone)
         let caches = vec![
-            DistributedCache::new(configs[0].clone()).await.unwrap(),
-            DistributedCache::new(configs[1].clone()).await.unwrap(),
-            DistributedCache::new(configs[2].clone()).await.unwrap(),
-            DistributedCache::new(configs[3].clone()).await.unwrap(),
-            DistributedCache::new(configs[4].clone()).await.unwrap(),
+            DistributedCache::new(utils::cluster_node_config(1, &port_configs)).await.unwrap(),
+            DistributedCache::new(utils::cluster_node_config(2, &port_configs)).await.unwrap(),
+            DistributedCache::new(utils::cluster_node_config(3, &port_configs)).await.unwrap(),
+            DistributedCache::new(utils::cluster_node_config(4, &port_configs)).await.unwrap(),
+            DistributedCache::new(utils::cluster_node_config(5, &port_configs)).await.unwrap(),
         ];
 
         let cache_refs: Vec<&DistributedCache> = caches.iter().collect();
@@ -611,16 +603,13 @@ pub(crate) mod multi_node_tests {
     async fn tc_extra_quorum_verification() {
         let port_configs = allocate_os_ports(&[1, 2, 3, 4, 5]).await;
 
-        let configs: Vec<CacheConfig> = (1u64..=5)
-            .map(|i| utils::cluster_node_config(i, &port_configs))
-            .collect();
-
+        // Create configs directly - CacheConfig is not Clone
         let caches = vec![
-            DistributedCache::new(configs[0].clone()).await.unwrap(),
-            DistributedCache::new(configs[1].clone()).await.unwrap(),
-            DistributedCache::new(configs[2].clone()).await.unwrap(),
-            DistributedCache::new(configs[3].clone()).await.unwrap(),
-            DistributedCache::new(configs[4].clone()).await.unwrap(),
+            DistributedCache::new(utils::cluster_node_config(1, &port_configs)).await.unwrap(),
+            DistributedCache::new(utils::cluster_node_config(2, &port_configs)).await.unwrap(),
+            DistributedCache::new(utils::cluster_node_config(3, &port_configs)).await.unwrap(),
+            DistributedCache::new(utils::cluster_node_config(4, &port_configs)).await.unwrap(),
+            DistributedCache::new(utils::cluster_node_config(5, &port_configs)).await.unwrap(),
         ];
 
         let cache_refs: Vec<&DistributedCache> = caches.iter().collect();

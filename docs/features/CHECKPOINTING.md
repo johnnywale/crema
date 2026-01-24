@@ -2,6 +2,8 @@
 
 This guide explains how to use the checkpointing system for snapshots and fast recovery.
 
+For the complete API reference, see the [main README](../../README.md).
+
 ## Overview
 
 Checkpointing creates periodic snapshots of the cache state for:

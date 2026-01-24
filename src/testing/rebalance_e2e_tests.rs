@@ -21,7 +21,8 @@
 #[cfg(test)]
 mod tests {
     use crate::cache::DistributedCache;
-    use crate::config::{CacheConfig, MemberlistConfig};
+    use crate::cluster::MemberlistDiscovery;
+    use crate::config::{CacheConfig, MemberlistConfig, PeerManagementConfig};
     use crate::multiraft::{
         NoOpShardRaftController, RaftChangeType, RaftMembershipChange, RaftMigrationConfig,
         RaftMigrationCoordinator, RaftMigrationPhase,
@@ -140,29 +141,41 @@ mod tests {
             // Fast test settings: 20ms tick, staggered election ticks
             let base_election_tick = 5;
 
-            CacheConfig {
-                node_id,
-                raft_addr,
-                seed_nodes,
-                max_capacity: 100_000,
-                default_ttl: Some(Duration::from_secs(3600)),
-                default_tti: None,
-                raft: RaftConfig {
-                    tick_interval_ms: 20,  // 5x faster than default
-                    election_tick: base_election_tick + (node_id as usize * 2), // Staggered: 7, 9, 11...
-                    heartbeat_tick: 1,     // Fast heartbeats
-                    max_size_per_msg: 1024 * 1024,
-                    max_inflight_msgs: 256,
-                    pre_vote: true,
-                    applied: 0,
-                    storage_type: crate::config::RaftStorageType::Memory,
+            let raft_config = RaftConfig {
+                tick_interval_ms: 20,  // 5x faster than default
+                election_tick: base_election_tick + (node_id as usize * 2), // Staggered: 7, 9, 11...
+                heartbeat_tick: 1,     // Fast heartbeats
+                max_size_per_msg: 1024 * 1024,
+                max_inflight_msgs: 256,
+                pre_vote: true,
+                applied: 0,
+                storage_type: crate::config::RaftStorageType::Memory,
+            };
+
+            // Create memberlist config
+            let memberlist_config = MemberlistConfig {
+                enabled: true,
+                bind_addr: None,
+                advertise_addr: None,
+                seed_addrs: vec![],
+                node_name: Some(format!("rebalance-node-{}", node_id)),
+                peer_management: PeerManagementConfig {
+                    auto_add_peers: true,
+                    auto_remove_peers: false,
+                    auto_add_voters: false,
+                    auto_remove_voters: false,
                 },
-                membership: Default::default(),
-                memberlist: MemberlistConfig::default(),
-                checkpoint: Default::default(),
-                forwarding: Default::default(),
-                multiraft: Default::default(),
-            }
+            };
+
+            // Create MemberlistDiscovery
+            let discovery = MemberlistDiscovery::new(node_id, raft_addr, &memberlist_config, &seed_nodes);
+
+            CacheConfig::new(node_id, raft_addr)
+                .with_seed_nodes(seed_nodes)
+                .with_max_capacity(100_000)
+                .with_default_ttl(Duration::from_secs(3600))
+                .with_raft_config(raft_config)
+                .with_cluster_discovery(discovery)
         }
 
         /// Add a new node to the cluster.

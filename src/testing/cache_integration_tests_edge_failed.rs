@@ -203,13 +203,11 @@ mod multi_node_tests {
     #[test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
     async fn tc27_node_rejoin() {
         let port_configs = utils::allocate_os_ports(&[1, 2, 3]).await;
-        let config1 = utils::cluster_node_config(1, &port_configs);
-        let config2 = utils::cluster_node_config(2, &port_configs);
-        let config3 = utils::cluster_node_config(3, &port_configs);
 
-        let cache1 = DistributedCache::new(config1.clone()).await.unwrap();
-        let cache2 = DistributedCache::new(config2).await.unwrap();
-        let cache3 = DistributedCache::new(config3).await.unwrap();
+        // Create configs directly - CacheConfig is not Clone, so we'll recreate for restart
+        let cache1 = DistributedCache::new(utils::cluster_node_config(1, &port_configs)).await.unwrap();
+        let cache2 = DistributedCache::new(utils::cluster_node_config(2, &port_configs)).await.unwrap();
+        let cache3 = DistributedCache::new(utils::cluster_node_config(3, &port_configs)).await.unwrap();
 
         // Wait for leader election
         let caches = [&cache1, &cache2, &cache3];
@@ -252,8 +250,8 @@ mod multi_node_tests {
 
         sleep(Duration::from_millis(500)).await;
 
-        // Restart node 1
-        let cache1_rejoined = DistributedCache::new(config1).await.unwrap();
+        // Restart node 1 (recreate config since CacheConfig is not Clone)
+        let cache1_rejoined = DistributedCache::new(utils::cluster_node_config(1, &port_configs)).await.unwrap();
 
         // Wait for node to catch up using the helper (more robust than fixed sleep)
         // Give it enough time for log reconciliation and replication
@@ -306,12 +304,10 @@ mod multi_node_tests {
     #[test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
     async fn tc18_stale_leader_replacement() {
         let port_configs = utils::allocate_os_ports(&[1, 2, 3]).await;
-        let config1 = utils::cluster_node_config(1, &port_configs);
-        let config2 = utils::cluster_node_config(2, &port_configs);
-        let config3 = utils::cluster_node_config(3, &port_configs);
-        let cache1 = DistributedCache::new(config1.clone()).await.unwrap();
-        let cache2 = DistributedCache::new(config2).await.unwrap();
-        let cache3 = DistributedCache::new(config3).await.unwrap();
+        // CacheConfig is not Clone, so create configs directly
+        let cache1 = DistributedCache::new(utils::cluster_node_config(1, &port_configs)).await.unwrap();
+        let cache2 = DistributedCache::new(utils::cluster_node_config(2, &port_configs)).await.unwrap();
+        let cache3 = DistributedCache::new(utils::cluster_node_config(3, &port_configs)).await.unwrap();
         let caches = [&cache1, &cache2, &cache3];
 
         // 缩短等待时间，因为 tick 小了，选举会非常快
@@ -356,8 +352,9 @@ mod multi_node_tests {
             .unwrap();
 
         // 5. 【关键点】重启旧 Leader 时调大其选举超时
-        // 这样它回归后会更“耐心”地等待心跳，而不是立即发起 Pre-Vote
-        let mut config1_reconnected = config1.clone();
+        // 这样它回归后会更"耐心"地等待心跳，而不是立即发起 Pre-Vote
+        // CacheConfig is not Clone, so create a new config with modified election_tick
+        let mut config1_reconnected = utils::cluster_node_config(1, &port_configs);
         config1_reconnected.raft.election_tick = 50; // 调大回归节点的 tick
 
         sleep(Duration::from_millis(500)).await;

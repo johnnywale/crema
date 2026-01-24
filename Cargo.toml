@@ -1,18 +1,20 @@
 [package]
 name = "crema"
-version = "0.0.1"
+version = "0.1.0"
 edition = "2021"
 rust-version = "1.75.0"
 license = "MIT OR Apache-2.0"
-description = "Strongly consistent distributed cache with Raft consensus and Moka local cache"
+description = "A high-performance, sharded Key-Value store utilizing a Multi-Raft consensus architecture"
 keywords = ["cache", "distributed", "moka", "raft", "consensus"]
 categories = ["caching", "network-programming"]
 
 [features]
-default = ["tokio"]
+default = ["tokio", "memberlist"]
 tokio = []
+memberlist = ["dep:memberlist", "dep:smol_str"]
 rocksdb-storage = ["rocksdb"]
 rocksdb-test = ["rocksdb-storage"]
+full = ["memberlist", "rocksdb-storage"]
 
 [dependencies]
 # Local cache with automatic TTL/eviction
@@ -25,8 +27,8 @@ protobuf = "2"
 
 # Cluster membership and discovery
 
-# Memberlist for gossip-based discovery
-memberlist = { version = "0.7", features = [
+# Memberlist for gossip-based discovery (optional)
+memberlist = { version = "0.7", optional = true, features = [
     "tcp",
     "crc32",
     "snappy",
@@ -61,8 +63,8 @@ twox-hash = "2"
 rand = "0.9"
 slog-term = "2.9.2"
 
-# String types
-smol_str = "0.3"
+# String types (optional, used by memberlist)
+smol_str = { version = "0.3", optional = true }
 socket2 = "0.6.1"
 
 # Migration support

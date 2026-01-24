@@ -2,6 +2,8 @@
 
 This guide explains the request forwarding feature that enables transparent write operations from any node.
 
+For the complete API reference, see the [main README](../../README.md).
+
 ## Overview
 
 In a Raft-based distributed cache, only the leader can accept write operations. Request forwarding allows followers to automatically forward write requests to the current leader, making the cluster appear as a single endpoint to clients.

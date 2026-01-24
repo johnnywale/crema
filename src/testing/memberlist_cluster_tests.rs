@@ -30,22 +30,33 @@ async fn allocate_node_ports(count: usize) -> Vec<NodePorts> {
     let mut result = Vec::with_capacity(count);
     for _ in 0..count {
         // For memberlist bind port, we need BOTH UDP and TCP to be available on the same port.
-        // Strategy: allocate UDP first, then verify TCP is also available on the same port.
-        // If TCP fails, try again with a different port.
-        let bind_port = loop {
-            let udp_socket = UdpSocket::bind("127.0.0.1:0").unwrap();
-            let port = udp_socket.local_addr().unwrap().port();
-            drop(udp_socket);
-
-            // Verify TCP is also available on this port
-            match TcpListener::bind(format!("127.0.0.1:{}", port)).await {
-                Ok(listener) => {
-                    drop(listener);
-                    break port;
+        // Strategy: allocate TCP first (more restrictive on Windows), then verify UDP.
+        let bind_port = {
+            let mut attempts = 0;
+            loop {
+                attempts += 1;
+                if attempts > 100 {
+                    panic!("Failed to allocate port with both UDP and TCP available after 100 attempts");
                 }
-                Err(_) => {
-                    // TCP not available, try another port
-                    continue;
+
+                // Allocate TCP first (tends to be more restrictive)
+                let tcp_listener = match TcpListener::bind("127.0.0.1:0").await {
+                    Ok(l) => l,
+                    Err(_) => continue,
+                };
+                let port = tcp_listener.local_addr().unwrap().port();
+                drop(tcp_listener);
+
+                // Verify UDP is also available on this port
+                match UdpSocket::bind(format!("127.0.0.1:{}", port)) {
+                    Ok(socket) => {
+                        drop(socket);
+                        break port;
+                    }
+                    Err(_) => {
+                        // UDP not available, try another port
+                        continue;
+                    }
                 }
             }
         };

@@ -2,6 +2,8 @@
 
 This document describes the system architecture of Crema, a strongly consistent distributed cache.
 
+For the complete API reference, see the [main README](../../README.md).
+
 ## High-Level Architecture
 
 ```

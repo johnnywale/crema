@@ -17,7 +17,7 @@
 //! - Gossip-based node discovery
 //! - No need to know all node IPs upfront
 
-use crema::{CacheConfig, DistributedCache, MemberlistConfig, RaftConfig};
+use crema::{CacheConfig, DistributedCache, MemberlistConfig, MemberlistDiscovery, PeerManagementConfig, RaftConfig};
 use std::env;
 use std::net::SocketAddr;
 use std::time::Duration;
@@ -84,13 +84,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         enabled: true,
         bind_addr: Some(my_memberlist_addr),
         advertise_addr: None,
-        seed_addrs: memberlist_seeds,
+        seed_addrs: memberlist_seeds.clone(),
         node_name: Some(format!("cache-node-{}", node_id)),
-        auto_add_peers: true,     // Auto-add discovered peers to Raft transport
-        auto_remove_peers: false, // Don't auto-remove (safer)
-        auto_add_voters: true,    // ** KEY: Auto-add discovered nodes as Raft voters **
-        auto_remove_voters: false, // Don't auto-remove voters
+        peer_management: PeerManagementConfig {
+            auto_add_peers: true,     // Auto-add discovered peers to Raft transport
+            auto_remove_peers: false, // Don't auto-remove (safer)
+            auto_add_voters: true,    // ** KEY: Auto-add discovered nodes as Raft voters **
+            auto_remove_voters: false, // Don't auto-remove voters
+        },
     };
+    // Create MemberlistDiscovery for auto-discovery
+    let discovery = MemberlistDiscovery::new(node_id, my_raft_addr, &memberlist_config, &raft_peers);
 
     // Create the cache configuration
     let config = CacheConfig::new(node_id, my_raft_addr)
@@ -98,7 +102,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with_max_capacity(100_000)
         .with_default_ttl(Duration::from_secs(3600))
         .with_raft_config(raft_config)
-        .with_memberlist_config(memberlist_config);
+        .with_cluster_discovery(discovery);
 
     // Create the cache
     println!("Starting distributed cache...");

@@ -2,13 +2,15 @@
 
 A high-performance embedded distributed cache built on **Raft consensus** for strong consistency and **Moka** for fast local caching.
 
+For complete documentation and examples, see the [main README](../README.md).
+
 ## Features
 
 | Feature | Status | Description |
 |---------|--------|-------------|
 | Strong Consistency | Production Ready | Linearizable writes via Raft consensus |
 | Fast Local Reads | Production Ready | Sub-millisecond reads from Moka cache |
-| Two-Tier Membership | Production Ready | Gossip discovery + manual Raft control |
+| Pluggable Discovery | Production Ready | ClusterDiscovery trait with multiple implementations |
 | Multi-Raft Sharding | Implemented | Horizontal scaling via multiple Raft groups |
 | Request Forwarding | Implemented | Automatic follower-to-leader forwarding |
 | Checkpointing | Implemented | LZ4-compressed snapshots for fast recovery |
@@ -37,9 +39,33 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("Found: {:?}", value);
     }
 
-    cache.shutdown().await?;
+    cache.shutdown().await;
     Ok(())
 }
+```
+
+### With Cluster Discovery
+
+For multi-node clusters, create a `ClusterDiscovery` implementation:
+
+```rust
+use crema::{CacheConfig, DistributedCache, MemberlistConfig, MemberlistDiscovery, PeerManagementConfig};
+
+let memberlist_config = MemberlistConfig {
+    enabled: true,
+    bind_addr: Some("127.0.0.1:8001".parse()?),
+    seed_addrs: vec!["127.0.0.1:8002".parse()?, "127.0.0.1:8003".parse()?],
+    ..Default::default()
+};
+
+let seed_nodes = vec![(2, "127.0.0.1:9002".parse()?), (3, "127.0.0.1:9003".parse()?)];
+let discovery = MemberlistDiscovery::new(1, "127.0.0.1:9001".parse()?, &memberlist_config, &seed_nodes);
+
+let config = CacheConfig::new(1, "127.0.0.1:9001".parse()?)
+    .with_seed_nodes(seed_nodes)
+    .with_cluster_discovery(discovery);
+
+let cache = DistributedCache::new(config).await?;
 ```
 
 ## Documentation

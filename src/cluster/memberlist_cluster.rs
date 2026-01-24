@@ -52,6 +52,9 @@ use std::time::Instant;
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
+use crate::cluster::discovery::{
+    ClusterDiscovery, ClusterDiscoveryError, ClusterEvent, NodeMetadata as GenericNodeMetadata,
+};
 use crate::types::NodeId;
 
 /// Type alias for the transport layer
@@ -787,6 +790,121 @@ impl MemberlistCluster {
     pub fn simulate_leave(&self, raft_id: NodeId) {
         self.registry.unregister(raft_id);
         let _ = self.event_tx.send(MemberlistEvent::NodeLeave { raft_id });
+    }
+
+    /// Convert a MemberlistEvent to a ClusterEvent
+    fn to_cluster_event(event: MemberlistEvent) -> ClusterEvent {
+        match event {
+            MemberlistEvent::NodeJoin { raft_id, raft_addr, metadata } => {
+                ClusterEvent::NodeJoin {
+                    node_id: raft_id,
+                    raft_addr,
+                    metadata: GenericNodeMetadata {
+                        node_id: metadata.raft_id,
+                        raft_addr: metadata.raft_addr,
+                        version: metadata.version,
+                        tags: metadata.tags,
+                    },
+                }
+            }
+            MemberlistEvent::NodeLeave { raft_id } => {
+                ClusterEvent::NodeLeave { node_id: raft_id }
+            }
+            MemberlistEvent::NodeFailed { raft_id } => {
+                ClusterEvent::NodeFailed { node_id: raft_id }
+            }
+            MemberlistEvent::NodeUpdate { raft_id, metadata } => {
+                ClusterEvent::NodeUpdate {
+                    node_id: raft_id,
+                    metadata: GenericNodeMetadata {
+                        node_id: metadata.raft_id,
+                        raft_addr: metadata.raft_addr,
+                        version: metadata.version,
+                        tags: metadata.tags,
+                    },
+                }
+            }
+        }
+    }
+}
+
+/// Implement the ClusterDiscovery trait for MemberlistCluster
+#[async_trait::async_trait]
+impl ClusterDiscovery for MemberlistCluster {
+    async fn start(&mut self) -> Result<(), ClusterDiscoveryError> {
+        MemberlistCluster::start(self)
+            .await
+            .map_err(|e| ClusterDiscoveryError::Other(e.to_string()))
+    }
+
+    async fn leave(&mut self) -> Result<(), ClusterDiscoveryError> {
+        MemberlistCluster::leave(self)
+            .await
+            .map_err(|e| ClusterDiscoveryError::Other(e.to_string()))
+    }
+
+    async fn shutdown(&mut self) -> Result<(), ClusterDiscoveryError> {
+        MemberlistCluster::shutdown(self)
+            .await
+            .map_err(|e| ClusterDiscoveryError::Other(e.to_string()))
+    }
+
+    fn is_initialized(&self) -> bool {
+        MemberlistCluster::is_initialized(self)
+    }
+
+    fn node_id(&self) -> NodeId {
+        self.raft_id()
+    }
+
+    fn registry(&self) -> Arc<crate::cluster::discovery::NodeRegistry> {
+        // Create a new generic NodeRegistry from our memberlist-specific one
+        let generic_registry = Arc::new(crate::cluster::discovery::NodeRegistry::new());
+
+        // Copy nodes from memberlist registry to generic registry
+        for node_id in self.registry.all_nodes() {
+            if let Some(metadata) = self.registry.get_metadata(node_id) {
+                let generic_metadata = GenericNodeMetadata {
+                    node_id: metadata.raft_id,
+                    raft_addr: metadata.raft_addr,
+                    version: metadata.version,
+                    tags: metadata.tags,
+                };
+                generic_registry.register(generic_metadata);
+
+                if !self.registry.is_healthy(node_id) {
+                    generic_registry.mark_failed(node_id);
+                }
+            }
+        }
+
+        generic_registry
+    }
+
+    async fn recv_event(&mut self) -> Option<ClusterEvent> {
+        self.event_rx.recv().await.map(Self::to_cluster_event)
+    }
+
+    fn try_recv_event(&mut self) -> Option<ClusterEvent> {
+        self.event_rx.try_recv().ok().map(Self::to_cluster_event)
+    }
+
+    fn members(&self) -> Vec<NodeId> {
+        MemberlistCluster::members(self)
+    }
+
+    fn healthy_members(&self) -> Vec<NodeId> {
+        MemberlistCluster::healthy_members(self)
+    }
+
+    fn get_node_addr(&self, node_id: NodeId) -> Option<SocketAddr> {
+        MemberlistCluster::get_node_addr(self, node_id)
+    }
+
+    async fn update_local_metadata(&self, _metadata: GenericNodeMetadata) -> Result<(), ClusterDiscoveryError> {
+        // Memberlist doesn't support dynamic metadata updates after start
+        // The metadata is set at initialization time
+        Ok(())
     }
 }
 

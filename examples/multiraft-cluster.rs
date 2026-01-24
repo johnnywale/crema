@@ -16,7 +16,7 @@
 //! - Write throughput scales linearly with shard count
 //! - Memberlist is required for gossip-based shard leader discovery
 
-use crema::{CacheConfig, DistributedCache, MemberlistConfig, MultiRaftCacheConfig, RaftConfig};
+use crema::{CacheConfig, DistributedCache, MemberlistConfig, MemberlistDiscovery, MultiRaftCacheConfig, PeerManagementConfig, RaftConfig};
 use std::collections::HashMap;
 use std::env;
 use std::net::SocketAddr;
@@ -92,10 +92,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         advertise_addr: None,
         seed_addrs: memberlist_seeds,
         node_name: Some(format!("multiraft-node-{}", node_id)),
-        auto_add_peers: true,
-        auto_remove_peers: false,
-        auto_add_voters: false,
-        auto_remove_voters: false,
+        peer_management: PeerManagementConfig {
+            auto_add_peers: true,
+            auto_remove_peers: false,
+            auto_add_voters: false,
+            auto_remove_voters: false,
+        },
     };
 
     // Create Multi-Raft configuration
@@ -112,13 +114,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("  Shard capacity: {}", multiraft_config.shard_capacity);
     println!();
 
+    // Create MemberlistDiscovery for cluster discovery (REQUIRED for Multi-Raft)
+    let discovery = MemberlistDiscovery::new(
+        node_id,
+        my_raft_addr.parse()?,
+        &memberlist_config,
+        &raft_peers,
+    );
+
     // Create the cache configuration
     let config = CacheConfig::new(node_id, my_raft_addr.parse()?)
         .with_seed_nodes(raft_peers)
         .with_max_capacity(100_000)
         .with_default_ttl(Duration::from_secs(3600))
         .with_raft_config(raft_config)
-        .with_memberlist_config(memberlist_config)
+        .with_cluster_discovery(discovery)
         .with_multiraft_config(multiraft_config);
 
     // Validate configuration

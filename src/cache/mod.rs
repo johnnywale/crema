@@ -3,10 +3,7 @@
 pub mod router;
 pub mod storage;
 
-use crate::cluster::memberlist_cluster::{
-    MemberlistCluster, MemberlistClusterConfig, MemberlistEvent,
-};
-use crate::cluster::ClusterMembership;
+use crate::cluster::{ClusterDiscovery, ClusterEvent, ClusterMembership, NoOpClusterDiscovery};
 use crate::config::CacheConfig;
 use crate::consensus::{CacheStateMachine, RaftNode};
 use crate::error::{Error, Result};
@@ -46,8 +43,8 @@ pub struct DistributedCache {
     /// Cluster membership manager.
     membership: Arc<ClusterMembership>,
 
-    /// Memberlist cluster for gossip-based discovery (optional).
-    memberlist: Option<Arc<Mutex<MemberlistCluster>>>,
+    /// Cluster discovery service (trait-based, supports multiple backends).
+    discovery: Arc<Mutex<Box<dyn ClusterDiscovery>>>,
 
     /// Configuration.
     config: CacheConfig,
@@ -58,8 +55,8 @@ pub struct DistributedCache {
     /// Raft tick loop shutdown sender.
     tick_shutdown_tx: mpsc::Sender<()>,
 
-    /// Memberlist event loop shutdown sender.
-    memberlist_shutdown_tx: Option<mpsc::Sender<()>>,
+    /// Discovery event loop shutdown sender.
+    discovery_shutdown_tx: Option<mpsc::Sender<()>>,
 
     /// Pending forwarded requests awaiting leader response.
     /// Maps request_id -> oneshot sender for the response.
@@ -83,7 +80,7 @@ impl DistributedCache {
     /// 5. Begin the Raft tick loop
     /// 6. Start memberlist gossip (if enabled)
     /// 7. Initialize Multi-Raft coordinator (if enabled)
-    pub async fn new(config: CacheConfig) -> Result<Self> {
+    pub async fn new(mut config: CacheConfig) -> Result<Self> {
         use crate::checkpoint::CheckpointManager;
 
         // Validate configuration
@@ -244,9 +241,9 @@ impl DistributedCache {
             }
         }
 
-        // Create membership manager
+        // Create membership manager with default config
         let (membership, _event_rx) =
-            ClusterMembership::new(config.node_id, config.membership.clone());
+            ClusterMembership::new(config.node_id, crate::config::MembershipConfig::default());
 
         // Create pending forwards map (shared with message handler)
         let pending_forwards = Arc::new(DashMap::new());
@@ -275,94 +272,63 @@ impl DistributedCache {
             raft_clone.run_tick_loop(tick_shutdown_rx).await;
         });
 
-        // Start memberlist if enabled
-        let (memberlist, memberlist_shutdown_tx) = if config.memberlist.enabled {
-            let memberlist_bind_addr = config.memberlist.get_bind_addr(config.raft_addr);
-
-            // Build memberlist config
-            let mut ml_config = MemberlistClusterConfig::new(
-                config.node_id,
-                memberlist_bind_addr,
-                config.raft_addr,
-            );
-
-            // Add seed addresses from config
-            if !config.memberlist.seed_addrs.is_empty() {
-                ml_config = ml_config.with_seed_nodes(config.memberlist.seed_addrs.clone());
+        // Get cluster discovery from config or create default NoOp
+        let mut discovery_box: Box<dyn ClusterDiscovery> =
+            if let Some(user_discovery) = config.cluster_discovery.take() {
+                user_discovery
             } else {
-                // Fall back to seed_nodes addresses if no memberlist-specific seeds
-                let seed_addrs: Vec<_> = config
-                    .seed_nodes
-                    .iter()
-                    .filter_map(|(_, addr)| {
-                        // Convert raft addr to memberlist addr (port + 1000)
-                        // Use checked_add to prevent overflow with high ephemeral ports
-                        addr.port().checked_add(1000).map(|ml_port| {
-                            std::net::SocketAddr::new(addr.ip(), ml_port)
-                        })
-                    })
-                    .collect();
-                if !seed_addrs.is_empty() {
-                    ml_config = ml_config.with_seed_nodes(seed_addrs);
-                }
-            }
+                Box::new(NoOpClusterDiscovery::new(config.node_id, config.raft_addr))
+            };
 
-            if let Some(advertise) = config.memberlist.advertise_addr {
-                ml_config = ml_config.with_advertise_addr(advertise);
-            }
-
-            if let Some(ref name) = config.memberlist.node_name {
-                ml_config = ml_config.with_node_name(name.clone());
-            }
-
-            // Create and start memberlist
-            let mut cluster = MemberlistCluster::new(ml_config);
-
-            match cluster.start().await {
+        // Start discovery if it's active
+        let discovery_shutdown_tx = if discovery_box.is_active() {
+            match discovery_box.start().await {
                 Ok(()) => {
                     info!(
                         node_id = config.node_id,
-                        bind_addr = %memberlist_bind_addr,
-                        "Memberlist gossip started"
+                        active = discovery_box.is_active(),
+                        "Cluster discovery started"
                     );
 
-                    let memberlist = Arc::new(Mutex::new(cluster));
+                    let discovery = Arc::new(Mutex::new(discovery_box));
 
                     // Start event processing loop
-                    let (ml_shutdown_tx, ml_shutdown_rx) = mpsc::channel(1);
+                    let (shutdown_tx, shutdown_rx) = mpsc::channel(1);
                     let raft_for_events = raft.clone();
-                    let ml_for_events = memberlist.clone();
-                    let auto_add = config.memberlist.auto_add_peers;
-                    let auto_remove = config.memberlist.auto_remove_peers;
-                    let auto_add_voters = config.memberlist.auto_add_voters;
-                    let auto_remove_voters = config.memberlist.auto_remove_voters;
+                    let discovery_for_events = discovery.clone();
 
-                    let multiraft_enabled = config.multiraft.enabled;
+                    // Peer management defaults to false (conservative)
+                    // Users can implement custom logic in their discovery implementation
+                    let auto_add = false;
+                    let auto_remove = false;
+                    let auto_add_voters = false;
+                    let auto_remove_voters = false;
 
                     tokio::spawn(async move {
-                        Self::run_memberlist_event_loop(
-                            ml_for_events,
+                        Self::run_discovery_event_loop(
+                            discovery_for_events,
                             raft_for_events,
-                            ml_shutdown_rx,
+                            shutdown_rx,
                             auto_add,
                             auto_remove,
                             auto_add_voters,
                             auto_remove_voters,
-                            multiraft_enabled,
                         )
                         .await;
                     });
 
-                    (Some(memberlist), Some(ml_shutdown_tx))
+                    (discovery, Some(shutdown_tx))
                 }
                 Err(e) => {
-                    warn!(error = %e, "Failed to start memberlist, continuing without gossip");
-                    (None, None)
+                    warn!(error = %e, "Failed to start cluster discovery, continuing without it");
+                    (Arc::new(Mutex::new(discovery_box)), None)
                 }
             }
         } else {
-            (None, None)
+            // Discovery not active, just wrap it
+            (Arc::new(Mutex::new(discovery_box)), None)
         };
+        let (discovery, discovery_shutdown_tx) = discovery_shutdown_tx;
 
         // Create the appropriate router based on configuration
         let router = if config.multiraft.enabled {
@@ -399,11 +365,11 @@ impl DistributedCache {
             storage,
             raft,
             membership,
-            memberlist,
+            discovery,
             config,
             shutdown_tx,
             tick_shutdown_tx,
-            memberlist_shutdown_tx,
+            discovery_shutdown_tx,
             pending_forwards,
             next_forward_id: AtomicU64::new(1),
             shutdown_flag: AtomicBool::new(false),
@@ -412,37 +378,35 @@ impl DistributedCache {
 
     /// Run the memberlist event processing loop.
     ///
-    /// This handles events from memberlist (node joins, leaves, failures) and
-    /// updates the Raft transport accordingly. In Multi-Raft mode, it also
-    /// handles shard leader updates from gossip.
-    async fn run_memberlist_event_loop(
-        memberlist: Arc<Mutex<MemberlistCluster>>,
+    /// This handles events from cluster discovery (node joins, leaves, failures) and
+    /// updates the Raft transport accordingly. Works with any ClusterDiscovery implementation.
+    async fn run_discovery_event_loop(
+        discovery: Arc<Mutex<Box<dyn ClusterDiscovery>>>,
         raft: Arc<RaftNode>,
         mut shutdown_rx: mpsc::Receiver<()>,
         auto_add_peers: bool,
         auto_remove_peers: bool,
         auto_add_voters: bool,
         auto_remove_voters: bool,
-        _multiraft_enabled: bool,
     ) {
-        info!("Starting memberlist event processing loop");
+        info!("Starting cluster discovery event processing loop");
 
         loop {
             // Try to receive event with timeout
             let event = {
-                let mut ml = memberlist.lock();
-                ml.try_recv_event()
+                let mut disc = discovery.lock();
+                disc.try_recv_event()
             };
 
             tokio::select! {
                 _ = shutdown_rx.recv() => {
-                    info!("Memberlist event loop shutting down");
+                    info!("Discovery event loop shutting down");
                     break;
                 }
                 _ = tokio::time::sleep(Duration::from_millis(100)) => {
                     // Process any pending event
                     if let Some(event) = event {
-                        Self::handle_memberlist_event(
+                        Self::handle_discovery_event(
                             &event,
                             &raft,
                             auto_add_peers,
@@ -456,9 +420,9 @@ impl DistributedCache {
         }
     }
 
-    /// Handle a single memberlist event.
-    async fn handle_memberlist_event(
-        event: &MemberlistEvent,
+    /// Handle a single cluster discovery event.
+    async fn handle_discovery_event(
+        event: &ClusterEvent,
         raft: &Arc<RaftNode>,
         auto_add_peers: bool,
         auto_remove_peers: bool,
@@ -466,37 +430,37 @@ impl DistributedCache {
         auto_remove_voters: bool,
     ) {
         match event {
-            MemberlistEvent::NodeJoin {
-                raft_id,
+            ClusterEvent::NodeJoin {
+                node_id,
                 raft_addr,
                 metadata: _,
             } => {
                 info!(
-                    raft_id = *raft_id,
+                    node_id = *node_id,
                     raft_addr = %raft_addr,
-                    "Node discovered via memberlist"
+                    "Node discovered via cluster discovery"
                 );
 
                 if auto_add_peers {
                     // Add to Raft transport so we can communicate
-                    raft.transport().add_peer(*raft_id, *raft_addr).await;
-                    debug!(raft_id = *raft_id, "Added peer to Raft transport");
+                    raft.transport().add_peer(*node_id, *raft_addr).await;
+                    debug!(node_id = *node_id, "Added peer to Raft transport");
                 }
 
                 // Propose ConfChange to add as voter if we're the leader
                 if auto_add_voters && raft.is_leader() {
                     info!(
-                        raft_id = *raft_id,
+                        node_id = *node_id,
                         raft_addr = %raft_addr,
                         "Leader proposing ConfChange to add new voter"
                     );
-                    match raft.add_voter(*raft_id, *raft_addr).await {
+                    match raft.add_voter(*node_id, *raft_addr).await {
                         Ok(()) => {
-                            info!(raft_id = *raft_id, "Successfully proposed adding voter");
+                            info!(node_id = *node_id, "Successfully proposed adding voter");
                         }
                         Err(e) => {
                             warn!(
-                                raft_id = *raft_id,
+                                node_id = *node_id,
                                 error = %e,
                                 "Failed to propose adding voter"
                             );
@@ -505,28 +469,28 @@ impl DistributedCache {
                 }
             }
 
-            MemberlistEvent::NodeLeave { raft_id } => {
-                info!(raft_id = *raft_id, "Node left via memberlist");
+            ClusterEvent::NodeLeave { node_id } => {
+                info!(node_id = *node_id, "Node left via cluster discovery");
 
                 if auto_remove_peers {
                     // Remove from Raft transport
-                    raft.transport().remove_peer(*raft_id);
-                    debug!(raft_id = *raft_id, "Removed peer from Raft transport");
+                    raft.transport().remove_peer(*node_id);
+                    debug!(node_id = *node_id, "Removed peer from Raft transport");
                 }
 
                 // Propose ConfChange to remove voter if we're the leader
                 if auto_remove_voters && raft.is_leader() {
                     info!(
-                        raft_id = *raft_id,
+                        node_id = *node_id,
                         "Leader proposing ConfChange to remove voter"
                     );
-                    match raft.remove_voter(*raft_id).await {
+                    match raft.remove_voter(*node_id).await {
                         Ok(()) => {
-                            info!(raft_id = *raft_id, "Successfully proposed removing voter");
+                            info!(node_id = *node_id, "Successfully proposed removing voter");
                         }
                         Err(e) => {
                             warn!(
-                                raft_id = *raft_id,
+                                node_id = *node_id,
                                 error = %e,
                                 "Failed to propose removing voter"
                             );
@@ -535,14 +499,14 @@ impl DistributedCache {
                 }
             }
 
-            MemberlistEvent::NodeFailed { raft_id } => {
-                warn!(raft_id = *raft_id, "Node failed via memberlist");
+            ClusterEvent::NodeFailed { node_id } => {
+                warn!(node_id = *node_id, "Node failed via cluster discovery");
 
                 if auto_remove_peers {
                     // Remove from Raft transport
-                    raft.transport().remove_peer(*raft_id);
+                    raft.transport().remove_peer(*node_id);
                     debug!(
-                        raft_id = *raft_id,
+                        node_id = *node_id,
                         "Removed failed peer from Raft transport"
                     );
                 }
@@ -550,16 +514,16 @@ impl DistributedCache {
                 // Propose ConfChange to remove voter if we're the leader
                 if auto_remove_voters && raft.is_leader() {
                     info!(
-                        raft_id = *raft_id,
+                        node_id = *node_id,
                         "Leader proposing ConfChange to remove failed voter"
                     );
-                    match raft.remove_voter(*raft_id).await {
+                    match raft.remove_voter(*node_id).await {
                         Ok(()) => {
-                            info!(raft_id = *raft_id, "Successfully proposed removing voter");
+                            info!(node_id = *node_id, "Successfully proposed removing voter");
                         }
                         Err(e) => {
                             warn!(
-                                raft_id = *raft_id,
+                                node_id = *node_id,
                                 error = %e,
                                 "Failed to propose removing voter"
                             );
@@ -568,17 +532,17 @@ impl DistributedCache {
                 }
             }
 
-            MemberlistEvent::NodeUpdate { raft_id, metadata } => {
+            ClusterEvent::NodeUpdate { node_id, metadata } => {
                 debug!(
-                    raft_id = *raft_id,
+                    node_id = *node_id,
                     raft_addr = %metadata.raft_addr,
-                    "Node metadata updated via memberlist"
+                    "Node metadata updated via cluster discovery"
                 );
 
                 // Update address in case it changed
                 if auto_add_peers {
                     raft.transport()
-                        .add_peer(*raft_id, metadata.raft_addr)
+                        .add_peer(*node_id, metadata.raft_addr)
                         .await;
                 }
             }
@@ -1067,27 +1031,39 @@ impl DistributedCache {
         self.raft.is_known_voter(node_id)
     }
 
-    // ==================== Memberlist ====================
+    // ==================== Cluster Discovery ====================
 
-    /// Check if memberlist gossip is enabled and running.
+    /// Check if cluster discovery (memberlist or other) is active.
+    ///
+    /// Returns true if using an active discovery mechanism like memberlist,
+    /// false if using NoOp discovery (static configuration only).
+    pub fn discovery_enabled(&self) -> bool {
+        self.discovery.lock().is_active()
+    }
+
+    /// Check if memberlist gossip is enabled and running (alias for discovery_enabled).
     pub fn memberlist_enabled(&self) -> bool {
-        self.memberlist.is_some()
+        self.discovery_enabled()
     }
 
-    /// Get all nodes discovered via memberlist.
+    /// Get all nodes discovered via cluster discovery.
+    pub fn discovery_members(&self) -> Vec<NodeId> {
+        self.discovery.lock().members()
+    }
+
+    /// Get all nodes discovered via memberlist (alias for discovery_members).
     pub fn memberlist_members(&self) -> Vec<NodeId> {
-        self.memberlist
-            .as_ref()
-            .map(|ml| ml.lock().members())
-            .unwrap_or_default()
+        self.discovery_members()
     }
 
-    /// Get healthy nodes discovered via memberlist.
+    /// Get healthy nodes discovered via cluster discovery.
+    pub fn discovery_healthy_members(&self) -> Vec<NodeId> {
+        self.discovery.lock().healthy_members()
+    }
+
+    /// Get healthy nodes discovered via memberlist (alias for discovery_healthy_members).
     pub fn memberlist_healthy_members(&self) -> Vec<NodeId> {
-        self.memberlist
-            .as_ref()
-            .map(|ml| ml.lock().healthy_members())
-            .unwrap_or_default()
+        self.discovery_healthy_members()
     }
 
     // ==================== Lifecycle ====================
@@ -1146,19 +1122,21 @@ impl DistributedCache {
             }
         }
 
-        // 4. Shutdown memberlist event loop
-        if let Some(ref tx) = self.memberlist_shutdown_tx {
+        // 4. Shutdown discovery event loop
+        if let Some(ref tx) = self.discovery_shutdown_tx {
             let _ = tx.send(()).await;
         }
 
-        // 5. Leave memberlist gracefully
-        if let Some(ref ml) = self.memberlist {
-            let mut ml = ml.lock();
-            if let Err(e) = ml.leave().await {
-                warn!(node_id = self.config.node_id, error = %e, "Error leaving memberlist");
-            }
-            if let Err(e) = ml.shutdown().await {
-                warn!(node_id = self.config.node_id, error = %e, "Error shutting down memberlist");
+        // 5. Leave cluster discovery gracefully
+        {
+            let mut disc = self.discovery.lock();
+            if disc.is_active() {
+                if let Err(e) = disc.leave().await {
+                    warn!(node_id = self.config.node_id, error = %e, "Error leaving cluster discovery");
+                }
+                if let Err(e) = disc.shutdown().await {
+                    warn!(node_id = self.config.node_id, error = %e, "Error shutting down cluster discovery");
+                }
             }
         }
 
@@ -1452,17 +1430,19 @@ mod tests {
 
     #[tokio::test]
     async fn test_memberlist_disabled_by_default() {
-        // Memberlist should be disabled by default
+        // Active discovery (memberlist) should be disabled by default
         let config = test_config(1);
         let cache = DistributedCache::new(config).await.unwrap();
 
         assert!(
             !cache.memberlist_enabled(),
-            "Memberlist should be disabled by default"
+            "Active discovery should be disabled by default"
         );
-        assert!(
-            cache.memberlist_members().is_empty(),
-            "No memberlist members when disabled"
+        // NoOp discovery still registers the local node
+        assert_eq!(
+            cache.memberlist_members().len(),
+            1,
+            "Local node should be registered even with NoOp discovery"
         );
     }
 
@@ -1475,8 +1455,8 @@ mod tests {
         assert!(config.bind_addr.is_none());
         assert!(config.advertise_addr.is_none());
         assert!(config.seed_addrs.is_empty());
-        assert!(config.auto_add_peers);
-        assert!(!config.auto_remove_peers);
+        assert!(config.auto_add_peers());
+        assert!(!config.auto_remove_peers());
     }
 
     #[tokio::test]
@@ -1493,12 +1473,13 @@ mod tests {
 
     #[tokio::test]
     async fn test_cluster_status_includes_memberlist() {
-        // Test that cluster status includes memberlist node count
+        // Test that cluster status includes discovery node count
+        // (local node is always registered even with NoOp discovery)
         let config = test_config(1);
         let cache = DistributedCache::new(config).await.unwrap();
 
         let status = cache.cluster_status();
 
-        assert_eq!(status.memberlist_node_count, 0);
+        assert_eq!(status.memberlist_node_count, 1, "Local node should be counted");
     }
 }

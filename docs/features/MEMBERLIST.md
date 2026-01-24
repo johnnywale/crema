@@ -2,6 +2,8 @@
 
 This guide explains how to use memberlist for gossip-based node discovery and cluster membership.
 
+For the complete API reference, see the [main README](../../README.md).
+
 ## Overview
 
 Memberlist provides:
@@ -55,21 +57,45 @@ Memberlist provides:
 
 ### Basic Setup
 
+With the new API, users create their own `MemberlistDiscovery` and pass it to the config via `with_cluster_discovery()`:
+
 ```rust
-use crema::{CacheConfig, MemberlistConfig};
+use crema::{CacheConfig, DistributedCache, MemberlistConfig, MemberlistDiscovery, PeerManagementConfig};
 
-let memberlist_config = MemberlistConfig::new(
-    "127.0.0.1:8001".parse()?,  // Memberlist bind address
-)
-.with_seeds(vec![
-    "127.0.0.1:8001".parse()?,
-    "127.0.0.1:8002".parse()?,
-    "127.0.0.1:8003".parse()?,
-])
-.with_auto_add_peers(true);  // Auto-register in Raft transport
+let node_id = 1;
+let raft_addr = "127.0.0.1:9001".parse()?;
 
-let config = CacheConfig::new(1, "127.0.0.1:9001".parse()?)
-    .with_memberlist(memberlist_config);
+// Configure memberlist
+let memberlist_config = MemberlistConfig {
+    enabled: true,
+    bind_addr: Some("127.0.0.1:8001".parse()?),
+    advertise_addr: None,
+    seed_addrs: vec![
+        "127.0.0.1:8002".parse()?,
+        "127.0.0.1:8003".parse()?,
+    ],
+    node_name: Some(format!("node-{}", node_id)),
+    peer_management: PeerManagementConfig {
+        auto_add_peers: true,     // Auto-register in Raft transport
+        auto_remove_peers: false,
+        auto_add_voters: false,   // IMPORTANT: Don't auto-add to Raft
+        auto_remove_voters: false, // IMPORTANT: Don't auto-remove from Raft
+    },
+};
+
+// Define Raft peer addresses
+let seed_nodes = vec![
+    (2, "127.0.0.1:9002".parse()?),
+    (3, "127.0.0.1:9003".parse()?),
+];
+
+// Create MemberlistDiscovery
+let discovery = MemberlistDiscovery::new(node_id, raft_addr, &memberlist_config, &seed_nodes);
+
+// Build config with discovery
+let config = CacheConfig::new(node_id, raft_addr)
+    .with_seed_nodes(seed_nodes)
+    .with_cluster_discovery(discovery);
 
 let cache = DistributedCache::new(config).await?;
 ```
@@ -78,22 +104,26 @@ let cache = DistributedCache::new(config).await?;
 
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
-| `bind_addr` | `SocketAddr` | Required | Address for gossip protocol |
+| `enabled` | `bool` | false | Enable memberlist gossip |
+| `bind_addr` | `Option<SocketAddr>` | None | Address for gossip protocol |
 | `advertise_addr` | `Option<SocketAddr>` | None | Public address (for NAT) |
-| `seeds` | `Vec<SocketAddr>` | Empty | Seed nodes for discovery |
-| `auto_add_peers` | `bool` | false | Auto-register discovered peers |
-| `auto_add_voters` | `bool` | false | Auto-add to Raft voting |
-| `auto_remove_voters` | `bool` | false | Auto-remove failed from Raft |
+| `seed_addrs` | `Vec<SocketAddr>` | Empty | Seed nodes for discovery |
+| `node_name` | `Option<String>` | None | Human-readable node name |
+| `peer_management.auto_add_peers` | `bool` | false | Auto-register discovered peers |
+| `peer_management.auto_add_voters` | `bool` | false | Auto-add to Raft voting |
+| `peer_management.auto_remove_voters` | `bool` | false | Auto-remove failed from Raft |
 
 ### Safety Defaults
 
 The defaults are conservative for safety:
 
 ```rust
-MemberlistConfig::new(bind_addr)
-    .with_auto_add_peers(true)     // Safe: Only affects transport
-    .with_auto_add_voters(false)   // IMPORTANT: Don't auto-add to Raft
-    .with_auto_remove_voters(false) // IMPORTANT: Don't auto-remove from Raft
+let peer_management = PeerManagementConfig {
+    auto_add_peers: true,      // Safe: Only affects transport
+    auto_remove_peers: false,
+    auto_add_voters: false,    // IMPORTANT: Don't auto-add to Raft
+    auto_remove_voters: false, // IMPORTANT: Don't auto-remove from Raft
+};
 ```
 
 **Never set `auto_add_voters` or `auto_remove_voters` to `true` in production** unless you understand the split-brain risks.

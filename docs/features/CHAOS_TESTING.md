@@ -2,6 +2,8 @@
 
 This guide explains how to use the chaos testing framework for verifying system resilience.
 
+For the complete API reference, see the [main README](../../README.md).
+
 ## Overview
 
 The chaos testing framework provides:

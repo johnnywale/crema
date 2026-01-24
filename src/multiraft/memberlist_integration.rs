@@ -5,7 +5,7 @@
 //! - Debounced shard leader broadcasting
 //! - Shard leader invalidation on node failures
 
-use crate::cluster::memberlist_cluster::ShardLeaderInfo;
+use crate::cluster::discovery::ShardLeaderInfo;
 use crate::types::NodeId;
 use parking_lot::Mutex;
 use std::collections::HashMap;

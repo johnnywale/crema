@@ -14,19 +14,19 @@ CacheConfig
 │   ├── default_ttl: Duration
 │   └── time_to_idle: Option<Duration>
 ├── Cluster Settings
-│   ├── seed_nodes: Vec<SocketAddr>
-│   └── membership_config: MembershipConfig
+│   ├── seed_nodes: Vec<(NodeId, SocketAddr)>
+│   └── cluster_discovery: Option<Box<dyn ClusterDiscovery>>
 ├── Raft Settings
 │   └── raft_config: RaftConfig
 ├── Forwarding Settings
 │   └── forwarding_config: ForwardingConfig
-├── Memberlist Settings
-│   └── memberlist_config: Option<MemberlistConfig>
 ├── Checkpoint Settings
 │   └── checkpoint_config: Option<CheckpointConfig>
 └── Multi-Raft Settings
     └── multiraft_config: Option<MultiRaftCacheConfig>
 ```
+
+For the full API reference, see the [main README](../../README.md).
 
 ## Core Configuration
 
@@ -165,41 +165,65 @@ let config = CacheConfig::new(node_id, addr)
 
 ---
 
-## Memberlist Configuration
+## Cluster Discovery Configuration
 
-### MemberlistConfig
+Crema uses a `ClusterDiscovery` trait to abstract cluster membership. Users create their own discovery implementation and pass it to the config.
 
-Enable gossip-based node discovery.
+### MemberlistDiscovery (Gossip-based)
 
 ```rust
-use crema::MemberlistConfig;
+use crema::{MemberlistConfig, MemberlistDiscovery, PeerManagementConfig};
 
-let memberlist_config = MemberlistConfig::new(
-    "127.0.0.1:8000".parse().unwrap(),  // Memberlist bind address
-)
-.with_advertise_addr("192.168.1.10:8000".parse().unwrap())  // Public address
-.with_seeds(vec![
-    "192.168.1.11:8000".parse().unwrap(),
-    "192.168.1.12:8000".parse().unwrap(),
-])
-.with_auto_add_peers(true)      // Auto-register in Raft transport
-.with_auto_add_voters(false)    // Don't auto-add to Raft (safe default)
-.with_auto_remove_voters(false); // Don't auto-remove from Raft
+let memberlist_config = MemberlistConfig {
+    enabled: true,
+    bind_addr: Some("127.0.0.1:8000".parse().unwrap()),
+    advertise_addr: Some("192.168.1.10:8000".parse().unwrap()),  // Public address
+    seed_addrs: vec![
+        "192.168.1.11:8000".parse().unwrap(),
+        "192.168.1.12:8000".parse().unwrap(),
+    ],
+    node_name: Some(format!("node-{}", node_id)),
+    peer_management: PeerManagementConfig {
+        auto_add_peers: true,      // Auto-register in Raft transport
+        auto_remove_peers: false,
+        auto_add_voters: false,    // Don't auto-add to Raft (safe default)
+        auto_remove_voters: false, // Don't auto-remove from Raft
+    },
+};
+
+// Create discovery and pass to config
+let seed_nodes = vec![(2, "192.168.1.11:9000".parse().unwrap())];
+let discovery = MemberlistDiscovery::new(node_id, raft_addr, &memberlist_config, &seed_nodes);
 
 let config = CacheConfig::new(node_id, raft_addr)
-    .with_memberlist(memberlist_config);
+    .with_seed_nodes(seed_nodes)
+    .with_cluster_discovery(discovery);
 ```
+
+### MemberlistConfig Fields
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `bind_addr` | `SocketAddr` | Required | Address for gossip |
+| `enabled` | `bool` | false | Enable memberlist gossip |
+| `bind_addr` | `Option<SocketAddr>` | None | Address for gossip |
 | `advertise_addr` | `Option<SocketAddr>` | None | Public address (for NAT) |
-| `seeds` | `Vec<SocketAddr>` | Empty | Seed nodes for discovery |
-| `auto_add_peers` | `bool` | false | Auto-register discovered peers |
-| `auto_add_voters` | `bool` | false | Auto-add to Raft voting |
-| `auto_remove_voters` | `bool` | false | Auto-remove failed nodes |
+| `seed_addrs` | `Vec<SocketAddr>` | Empty | Seed nodes for discovery |
+| `node_name` | `Option<String>` | None | Human-readable node name |
+| `peer_management.auto_add_peers` | `bool` | false | Auto-register discovered peers |
+| `peer_management.auto_add_voters` | `bool` | false | Auto-add to Raft voting |
+| `peer_management.auto_remove_voters` | `bool` | false | Auto-remove failed nodes |
 
 **Safety Warning**: `auto_add_voters` and `auto_remove_voters` can cause split-brain during network partitions. Keep them `false` for production.
+
+### Other Discovery Options
+
+```rust
+// StaticClusterDiscovery - Fixed IP list with health checks
+let discovery = StaticClusterDiscovery::new(node_id, raft_addr, seed_nodes);
+
+// NoOpClusterDiscovery - No-op for single-node or manual management
+let discovery = NoOpClusterDiscovery::new(node_id, raft_addr);
+```
 
 ---
 
@@ -266,9 +290,8 @@ See [Multi-Raft Guide](./MULTIRAFT_GUIDE.md) for detailed setup.
 
 ```rust
 use crema::{
-    CacheConfig, RaftConfig, MemberlistConfig,
-    MembershipConfig, MembershipMode, CheckpointConfig,
-    MultiRaftCacheConfig,
+    CacheConfig, RaftConfig, MemberlistConfig, MemberlistDiscovery,
+    PeerManagementConfig, CheckpointConfig, MultiRaftCacheConfig,
 };
 use std::time::Duration;
 
@@ -276,29 +299,45 @@ fn create_production_config(
     node_id: u64,
     raft_addr: &str,
     memberlist_addr: &str,
+    seed_nodes: Vec<(u64, std::net::SocketAddr)>,
 ) -> CacheConfig {
-    // Raft tuning
-    let raft_config = RaftConfig::default()
-        .with_election_timeout(Duration::from_millis(1500))
-        .with_heartbeat_interval(Duration::from_millis(150))
-        .with_pre_vote(true);
+    let raft_addr_parsed: std::net::SocketAddr = raft_addr.parse().unwrap();
 
-    // Membership (manual control)
-    let membership_config = MembershipConfig::default()
-        .with_mode(MembershipMode::SemiAutomatic)
-        .with_max_peer_count(7);
+    // Raft tuning
+    let raft_config = RaftConfig {
+        election_tick: 15,
+        heartbeat_tick: 3,
+        tick_interval_ms: 100,
+        pre_vote: true,
+        ..Default::default()
+    };
 
     // Memberlist (gossip discovery)
-    let memberlist_config = MemberlistConfig::new(
-        memberlist_addr.parse().unwrap(),
-    )
-    .with_seeds(vec![
-        "10.0.0.1:8000".parse().unwrap(),
-        "10.0.0.2:8000".parse().unwrap(),
-        "10.0.0.3:8000".parse().unwrap(),
-    ])
-    .with_auto_add_peers(true)
-    .with_auto_add_voters(false);  // Manual Raft approval
+    let memberlist_config = MemberlistConfig {
+        enabled: true,
+        bind_addr: Some(memberlist_addr.parse().unwrap()),
+        advertise_addr: None,
+        seed_addrs: vec![
+            "10.0.0.1:8000".parse().unwrap(),
+            "10.0.0.2:8000".parse().unwrap(),
+            "10.0.0.3:8000".parse().unwrap(),
+        ],
+        node_name: Some(format!("node-{}", node_id)),
+        peer_management: PeerManagementConfig {
+            auto_add_peers: true,
+            auto_remove_peers: false,
+            auto_add_voters: false,  // Manual Raft approval
+            auto_remove_voters: false,
+        },
+    };
+
+    // Create discovery implementation
+    let discovery = MemberlistDiscovery::new(
+        node_id,
+        raft_addr_parsed,
+        &memberlist_config,
+        &seed_nodes,
+    );
 
     // Checkpointing
     let checkpoint_config = CheckpointConfig::new("/var/lib/crema/snapshots")
@@ -308,22 +347,28 @@ fn create_production_config(
         .with_max_snapshots(3);
 
     // Multi-Raft (for high write throughput)
-    let multiraft_config = MultiRaftCacheConfig::new()
-        .with_num_shards(8)
-        .with_auto_init(true);
+    let multiraft_config = MultiRaftCacheConfig {
+        enabled: true,
+        num_shards: 8,
+        shard_capacity: 100_000,
+        auto_init_shards: true,
+        leader_broadcast_debounce_ms: 200,
+    };
 
     // Combine all configs
-    CacheConfig::new(node_id, raft_addr.parse().unwrap())
+    CacheConfig::new(node_id, raft_addr_parsed)
+        .with_seed_nodes(seed_nodes)
         .with_max_capacity(1_000_000)
         .with_default_ttl(Duration::from_secs(86400))
         .with_raft_config(raft_config)
-        .with_membership_config(membership_config)
-        .with_memberlist(memberlist_config)
+        .with_cluster_discovery(discovery)
         .with_checkpoint_config(checkpoint_config)
         .with_multiraft_config(multiraft_config)
         .with_forwarding_enabled(true)
 }
 ```
+
+For more examples, see the [main README](../../README.md).
 
 ---
 

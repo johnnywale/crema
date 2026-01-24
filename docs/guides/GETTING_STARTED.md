@@ -2,6 +2,8 @@
 
 This guide walks you through setting up and running Crema, from a single-node cache to a full distributed cluster.
 
+For the complete API reference, see the [main README](../../README.md).
+
 ## Prerequisites
 
 - Rust 1.70 or later
@@ -116,29 +118,49 @@ RUST_LOG=info cargo run --example cluster -- 3
 
 ## Multi-Node Cluster with Memberlist (Recommended)
 
-For automatic node discovery using gossip:
+For automatic node discovery using gossip, create a `MemberlistDiscovery` and pass it to the config:
 
 ```rust
-use crema::{DistributedCache, CacheConfig, MemberlistConfig};
+use crema::{DistributedCache, CacheConfig, MemberlistConfig, MemberlistDiscovery, PeerManagementConfig};
+use std::net::SocketAddr;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let node_id = 1;
-    let raft_port = 9000 + node_id as u16;
-    let memberlist_port = 8000 + node_id as u16;
+    let raft_addr: SocketAddr = "127.0.0.1:9001".parse()?;
+    let memberlist_addr: SocketAddr = "127.0.0.1:8001".parse()?;
 
-    let memberlist_config = MemberlistConfig::new(
-        format!("127.0.0.1:{}", memberlist_port).parse()?,
-    )
-    .with_seeds(vec![
-        "127.0.0.1:8001".parse()?,
-        "127.0.0.1:8002".parse()?,
-        "127.0.0.1:8003".parse()?,
-    ])
-    .with_auto_add_peers(true);  // Auto-register peers in transport
+    // Configure memberlist
+    let memberlist_config = MemberlistConfig {
+        enabled: true,
+        bind_addr: Some(memberlist_addr),
+        advertise_addr: None,
+        seed_addrs: vec![
+            "127.0.0.1:8002".parse()?,
+            "127.0.0.1:8003".parse()?,
+        ],
+        node_name: Some(format!("node-{}", node_id)),
+        peer_management: PeerManagementConfig {
+            auto_add_peers: true,     // Auto-register peers in transport
+            auto_remove_peers: false,
+            auto_add_voters: false,   // Manual Raft voter approval for safety
+            auto_remove_voters: false,
+        },
+    };
 
-    let config = CacheConfig::new(node_id, format!("127.0.0.1:{}", raft_port).parse()?)
-        .with_memberlist(memberlist_config);
+    // Define Raft peer addresses
+    let raft_peers = vec![
+        (2, "127.0.0.1:9002".parse()?),
+        (3, "127.0.0.1:9003".parse()?),
+    ];
+
+    // Create MemberlistDiscovery
+    let discovery = MemberlistDiscovery::new(node_id, raft_addr, &memberlist_config, &raft_peers);
+
+    // Build config with discovery
+    let config = CacheConfig::new(node_id, raft_addr)
+        .with_seed_nodes(raft_peers)
+        .with_cluster_discovery(discovery);
 
     let cache = DistributedCache::new(config).await?;
 
@@ -245,14 +267,27 @@ let config = CacheConfig::new(node_id, raft_addr)
     .with_time_to_idle(Duration::from_secs(300))  // TTI (optional)
 
     // Seed nodes for cluster discovery
-    .with_seed_nodes(vec![addr1, addr2])
+    .with_seed_nodes(vec![(2, addr2), (3, addr3)])
 
     // Request forwarding
     .with_forwarding_enabled(true)
     .with_forwarding_timeout(Duration::from_secs(5))
 
-    // Memberlist (gossip)
-    .with_memberlist(memberlist_config);
+    // Cluster discovery - pass your own ClusterDiscovery implementation
+    .with_cluster_discovery(discovery);
+```
+
+### Cluster Discovery Options
+
+```rust
+// Option 1: MemberlistDiscovery - Gossip-based discovery
+let discovery = MemberlistDiscovery::new(node_id, raft_addr, &memberlist_config, &seed_nodes);
+
+// Option 2: StaticClusterDiscovery - Fixed IP list
+let discovery = StaticClusterDiscovery::new(node_id, raft_addr, seed_nodes);
+
+// Option 3: NoOpClusterDiscovery - Single-node or manual management
+let discovery = NoOpClusterDiscovery::new(node_id, raft_addr);
 ```
 
 ### Raft Configuration

@@ -2,6 +2,8 @@
 
 This guide explains how to use Multi-Raft mode for horizontal scaling beyond the limits of a single Raft group.
 
+For the complete API reference, see the [main README](../../README.md).
+
 ## Why Multi-Raft?
 
 A single Raft group has inherent throughput limits:
@@ -48,24 +50,57 @@ With N shards distributed across M nodes:
 
 ### Basic Setup
 
+Multi-Raft requires a `ClusterDiscovery` implementation for shard leader discovery:
+
 ```rust
-use crema::{CacheConfig, MultiRaftCacheConfig, MemberlistConfig};
+use crema::{
+    CacheConfig, DistributedCache, MemberlistConfig, MemberlistDiscovery,
+    MultiRaftCacheConfig, PeerManagementConfig,
+};
 
-let multiraft_config = MultiRaftCacheConfig::new()
-    .with_num_shards(16)    // 16 independent Raft groups
-    .with_auto_init(true);  // Auto-initialize shards on startup
+let node_id = 1;
+let raft_addr = "127.0.0.1:9001".parse()?;
 
-let memberlist_config = MemberlistConfig::new(
-    "127.0.0.1:8001".parse()?,
-)
-.with_seeds(vec![
-    "127.0.0.1:8001".parse()?,
-    "127.0.0.1:8002".parse()?,
-    "127.0.0.1:8003".parse()?,
-]);
+// Configure memberlist for gossip-based discovery
+let memberlist_config = MemberlistConfig {
+    enabled: true,
+    bind_addr: Some("127.0.0.1:8001".parse()?),
+    advertise_addr: None,
+    seed_addrs: vec![
+        "127.0.0.1:8002".parse()?,
+        "127.0.0.1:8003".parse()?,
+    ],
+    node_name: Some(format!("node-{}", node_id)),
+    peer_management: PeerManagementConfig {
+        auto_add_peers: true,
+        auto_remove_peers: false,
+        auto_add_voters: false,
+        auto_remove_voters: false,
+    },
+};
 
-let config = CacheConfig::new(1, "127.0.0.1:9001".parse()?)
-    .with_memberlist(memberlist_config)
+// Define Raft peer addresses
+let seed_nodes = vec![
+    (2, "127.0.0.1:9002".parse()?),
+    (3, "127.0.0.1:9003".parse()?),
+];
+
+// Create MemberlistDiscovery
+let discovery = MemberlistDiscovery::new(node_id, raft_addr, &memberlist_config, &seed_nodes);
+
+// Configure Multi-Raft
+let multiraft_config = MultiRaftCacheConfig {
+    enabled: true,
+    num_shards: 16,    // 16 independent Raft groups
+    shard_capacity: 100_000,
+    auto_init_shards: true,  // Auto-initialize shards on startup
+    leader_broadcast_debounce_ms: 200,
+};
+
+// Build config
+let config = CacheConfig::new(node_id, raft_addr)
+    .with_seed_nodes(seed_nodes)
+    .with_cluster_discovery(discovery)
     .with_multiraft_config(multiraft_config);
 
 let cache = DistributedCache::new(config).await?;

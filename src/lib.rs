@@ -104,7 +104,7 @@ pub mod types;
 pub use cache::DistributedCache;
 pub use config::{
     CacheConfig, MemberlistConfig, MembershipConfig, MembershipMode, MultiRaftCacheConfig,
-    RaftConfig, RaftStorageType,
+    PeerManagementConfig, RaftConfig, RaftStorageType,
 };
 
 #[cfg(feature = "rocksdb-storage")]
@@ -114,6 +114,12 @@ pub use types::{CacheCommand, CacheStats, ClusterStatus, NodeId, PeerInfo};
 
 // Re-export cluster types
 pub use cluster::{ClusterMembership, MemberEvent};
+
+// Re-export cluster discovery trait and types (always available)
+pub use cluster::{
+    ClusterDiscovery, ClusterDiscoveryError, ClusterEvent, NodeMetadata, NodeRegistry,
+    NoOpClusterDiscovery, ShardLeaderMetadata, StaticClusterDiscovery, StaticDiscoveryConfig,
+};
 
 // Re-export checkpoint types
 pub use checkpoint::{
@@ -155,8 +161,19 @@ pub use multiraft::{
 pub use multiraft::TransferBatch as MigrationTransferBatch;
 pub use multiraft::TransferEntry as MigrationTransferEntry;
 
-// Re-export memberlist types for Multi-Raft integration
-pub use cluster::memberlist_cluster::ShardLeaderInfo;
+// Re-export memberlist types for Multi-Raft integration (when feature enabled)
+#[cfg(feature = "memberlist")]
+pub use cluster::memberlist_cluster::{
+    MemberlistCluster, MemberlistClusterConfig, MemberlistError, MemberlistEvent,
+    RaftNodeMetadata,
+};
+
+// Re-export MemberlistDiscovery (ClusterDiscovery implementation using memberlist)
+#[cfg(feature = "memberlist")]
+pub use cluster::MemberlistDiscovery;
+
+// Re-export ShardLeaderInfo from discovery module (always available)
+pub use cluster::ShardLeaderInfo;
 
 // Re-export consensus storage types
 pub use consensus::{MemStorage, RaftStorage};

@@ -117,9 +117,6 @@ struct RecoveryTestNode {
     /// The distributed cache instance (if running).
     cache: Option<Arc<DistributedCache>>,
 
-    /// Node configuration.
-    config: CacheConfig,
-
     /// Current state.
     state: NodeState,
 
@@ -203,21 +200,11 @@ impl RecoveryTestCluster {
             std::fs::create_dir_all(&checkpoint_dir)
                 .map_err(|e| Error::Internal(format!("Failed to create checkpoint dir: {}", e)))?;
 
-            // Build node configuration with OS-allocated memberlist port
-            let config = self.build_node_config(
-                *node_id,
-                *raft_port,
-                *memberlist_port,
-                &data_dir,
-                &checkpoint_dir,
-                &port_configs,
-            );
-
+            // Note: Config is built on-demand in start_node() since CacheConfig is not Clone
             nodes.insert(
                 *node_id,
                 RecoveryTestNode {
                     cache: None,
-                    config,
                     state: NodeState::NotStarted,
                     data_dir,
                     checkpoint_dir,
@@ -303,7 +290,7 @@ impl RecoveryTestCluster {
             .with_max_snapshots(self.config.checkpoint_max_snapshots)
             .with_compression(true);
 
-        // Memberlist configuration
+        // Create memberlist discovery
         let memberlist_addr: SocketAddr = format!("127.0.0.1:{}", memberlist_port).parse().unwrap();
         let memberlist_config = MemberlistConfig {
             enabled: true,
@@ -311,26 +298,29 @@ impl RecoveryTestCluster {
             advertise_addr: None,
             node_name: None,
             seed_addrs: memberlist_seeds,
-            auto_add_peers: true,
-            auto_remove_peers: false,
-            auto_add_voters: false,
-            auto_remove_voters: false,
+            peer_management: crate::config::PeerManagementConfig {
+                auto_add_peers: true,
+                auto_remove_peers: false,
+                auto_add_voters: false,
+                auto_remove_voters: false,
+            },
         };
 
-        CacheConfig {
+        // Create MemberlistDiscovery and add to config
+        let discovery = crate::cluster::MemberlistDiscovery::new(
             node_id,
             raft_addr,
-            seed_nodes,
-            max_capacity: 100_000,
-            default_ttl: Some(Duration::from_secs(3600)),
-            default_tti: None,
-            raft: raft_config,
-            membership: Default::default(),
-            memberlist: memberlist_config,
-            checkpoint: checkpoint_config,
-            forwarding: Default::default(),
-            multiraft: Default::default(),
-        }
+            &memberlist_config,
+            &seed_nodes,
+        );
+
+        CacheConfig::new(node_id, raft_addr)
+            .with_seed_nodes(seed_nodes)
+            .with_max_capacity(100_000)
+            .with_default_ttl(Duration::from_secs(3600))
+            .with_raft_config(raft_config)
+            .with_checkpoint_config(checkpoint_config)
+            .with_cluster_discovery(discovery)
     }
 
     /// Start all nodes in the cluster.
@@ -347,7 +337,8 @@ impl RecoveryTestCluster {
 
     /// Start a specific node.
     pub async fn start_node(&self, node_id: NodeId) -> Result<()> {
-        let config = {
+        // Get node state and directories
+        let (data_dir, checkpoint_dir, current_state) = {
             let nodes = self.nodes.read();
             let node = nodes
                 .get(&node_id)
@@ -357,8 +348,31 @@ impl RecoveryTestCluster {
                 return Ok(());
             }
 
-            node.config.clone()
+            (node.data_dir.clone(), node.checkpoint_dir.clone(), node.state)
         };
+
+        // Build port configs from stored allocations
+        let port_configs: Vec<(NodeId, u16, u16)> = {
+            let allocs = self.port_allocations.read();
+            allocs.iter().map(|(id, (raft, ml))| (*id, *raft, *ml)).collect()
+        };
+
+        // Get this node's ports
+        let (raft_port, memberlist_port) = {
+            let allocs = self.port_allocations.read();
+            *allocs.get(&node_id)
+                .ok_or_else(|| Error::Internal(format!("Port allocation for node {} not found", node_id)))?
+        };
+
+        // Rebuild the config (config is not Clone, so we rebuild it)
+        let config = self.build_node_config(
+            node_id,
+            raft_port,
+            memberlist_port,
+            &data_dir,
+            &checkpoint_dir,
+            &port_configs,
+        );
 
         info!(node_id, "Starting node");
 

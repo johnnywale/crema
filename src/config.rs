@@ -1,13 +1,13 @@
 //! Configuration types for the distributed cache.
 
 use crate::checkpoint::CheckpointConfig;
+use crate::cluster::ClusterDiscovery;
 use crate::types::NodeId;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::time::Duration;
 
 /// Main configuration for the distributed cache.
-#[derive(Debug, Clone)]
 pub struct CacheConfig {
     /// Unique identifier for this node.
     pub node_id: NodeId,
@@ -16,6 +16,7 @@ pub struct CacheConfig {
     pub raft_addr: SocketAddr,
 
     /// Seed nodes to join the cluster (node_id, address pairs).
+    /// Used as fallback when no cluster_discovery is provided.
     pub seed_nodes: Vec<(NodeId, SocketAddr)>,
 
     /// Maximum number of entries in the cache.
@@ -30,11 +31,24 @@ pub struct CacheConfig {
     /// Raft-specific configuration.
     pub raft: RaftConfig,
 
-    /// Membership configuration.
-    pub membership: MembershipConfig,
-
-    /// Memberlist gossip configuration.
-    pub memberlist: MemberlistConfig,
+    /// User-provided cluster discovery implementation.
+    /// If None, a NoOpClusterDiscovery will be created automatically.
+    ///
+    /// # Example
+    /// ```rust,ignore
+    /// use crema::{CacheConfig, NoOpClusterDiscovery, StaticClusterDiscovery};
+    ///
+    /// // Using NoOp discovery (single node or manual management)
+    /// let discovery = NoOpClusterDiscovery::new(1, "127.0.0.1:9000".parse().unwrap());
+    /// let config = CacheConfig::new(1, "127.0.0.1:9000".parse().unwrap())
+    ///     .with_cluster_discovery(discovery);
+    ///
+    /// // Using Static discovery (known peer addresses)
+    /// let discovery = StaticClusterDiscovery::new(1, addr, static_config);
+    /// let config = CacheConfig::new(1, addr)
+    ///     .with_cluster_discovery(discovery);
+    /// ```
+    pub cluster_discovery: Option<Box<dyn ClusterDiscovery + Send>>,
 
     /// Checkpoint configuration.
     pub checkpoint: CheckpointConfig,
@@ -56,14 +70,32 @@ impl Default for CacheConfig {
             default_ttl: Some(Duration::from_secs(3600)), // 1 hour
             default_tti: None,
             raft: RaftConfig::default(),
-            membership: MembershipConfig::default(),
-            memberlist: MemberlistConfig::default(),
+            cluster_discovery: None,
             checkpoint: CheckpointConfig::default(),
             forwarding: ForwardingConfig::default(),
             multiraft: MultiRaftCacheConfig::default(),
         }
     }
 }
+
+impl std::fmt::Debug for CacheConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CacheConfig")
+            .field("node_id", &self.node_id)
+            .field("raft_addr", &self.raft_addr)
+            .field("seed_nodes", &self.seed_nodes)
+            .field("max_capacity", &self.max_capacity)
+            .field("default_ttl", &self.default_ttl)
+            .field("default_tti", &self.default_tti)
+            .field("raft", &self.raft)
+            .field("cluster_discovery", &self.cluster_discovery.is_some())
+            .field("checkpoint", &self.checkpoint)
+            .field("forwarding", &self.forwarding)
+            .field("multiraft", &self.multiraft)
+            .finish()
+    }
+}
+
 
 impl CacheConfig {
     /// Create a new configuration with the given node ID and address.
@@ -77,6 +109,7 @@ impl CacheConfig {
 
     /// Set seed nodes for cluster discovery.
     /// Each seed node is a (node_id, address) pair.
+    /// Used as fallback when no cluster_discovery is provided.
     pub fn with_seed_nodes(mut self, seeds: Vec<(NodeId, SocketAddr)>) -> Self {
         self.seed_nodes = seeds;
         self
@@ -106,9 +139,37 @@ impl CacheConfig {
         self
     }
 
-    /// Set membership configuration.
-    pub fn with_membership_config(mut self, membership: MembershipConfig) -> Self {
-        self.membership = membership;
+    /// Set the cluster discovery implementation.
+    ///
+    /// The discovery is responsible for finding and tracking cluster members.
+    /// If not set, a NoOpClusterDiscovery will be created automatically.
+    ///
+    /// # Example
+    /// ```rust,ignore
+    /// use crema::{CacheConfig, NoOpClusterDiscovery, StaticClusterDiscovery};
+    ///
+    /// // NoOp discovery (single node)
+    /// let discovery = NoOpClusterDiscovery::new(1, addr);
+    /// let config = CacheConfig::new(1, addr)
+    ///     .with_cluster_discovery(discovery);
+    ///
+    /// // Static discovery (known peers)
+    /// let static_config = StaticDiscoveryConfig::new(peers);
+    /// let discovery = StaticClusterDiscovery::new(1, addr, static_config);
+    /// let config = CacheConfig::new(1, addr)
+    ///     .with_cluster_discovery(discovery);
+    /// ```
+    pub fn with_cluster_discovery<D: ClusterDiscovery + Send + 'static>(
+        mut self,
+        discovery: D,
+    ) -> Self {
+        self.cluster_discovery = Some(Box::new(discovery));
+        self
+    }
+
+    /// Set the cluster discovery from a boxed trait object.
+    pub fn with_cluster_discovery_boxed(mut self, discovery: Box<dyn ClusterDiscovery + Send>) -> Self {
+        self.cluster_discovery = Some(discovery);
         self
     }
 
@@ -127,24 +188,6 @@ impl CacheConfig {
     /// Enable or disable checkpointing.
     pub fn with_checkpointing_enabled(mut self, enabled: bool) -> Self {
         self.checkpoint.enabled = enabled;
-        self
-    }
-
-    /// Set memberlist configuration.
-    pub fn with_memberlist_config(mut self, memberlist: MemberlistConfig) -> Self {
-        self.memberlist = memberlist;
-        self
-    }
-
-    /// Enable or disable memberlist gossip.
-    pub fn with_memberlist_enabled(mut self, enabled: bool) -> Self {
-        self.memberlist.enabled = enabled;
-        self
-    }
-
-    /// Set memberlist bind address.
-    pub fn with_memberlist_addr(mut self, addr: SocketAddr) -> Self {
-        self.memberlist.bind_addr = Some(addr);
         self
     }
 
@@ -187,20 +230,25 @@ impl CacheConfig {
     /// Validate the configuration and return an error if invalid.
     ///
     /// Checks:
-    /// - Multi-Raft requires memberlist to be enabled
     /// - Multi-Raft shard count is within limits
     pub fn validate(&self) -> Result<(), String> {
-        // Multi-Raft requires memberlist for gossip-based shard leader routing
-        if self.multiraft.enabled && !self.memberlist.enabled {
-            return Err("Multi-Raft requires memberlist to be enabled for shard leader discovery".to_string());
-        }
-
         // Validate Multi-Raft config
         if let Some(err) = self.multiraft.validate() {
             return Err(err);
         }
 
         Ok(())
+    }
+
+    /// Check if a cluster discovery has been configured.
+    pub fn has_cluster_discovery(&self) -> bool {
+        self.cluster_discovery.is_some()
+    }
+
+    /// Take ownership of the cluster discovery.
+    /// This is used internally by DistributedCache::new().
+    pub fn take_cluster_discovery(&mut self) -> Option<Box<dyn ClusterDiscovery + Send>> {
+        self.cluster_discovery.take()
     }
 }
 
@@ -391,6 +439,64 @@ pub enum MembershipMode {
     Automatic,
 }
 
+/// Configuration for automatic peer management.
+///
+/// These settings control how the cache automatically manages Raft peers
+/// based on cluster discovery events.
+#[derive(Debug, Clone)]
+pub struct PeerManagementConfig {
+    /// Whether to automatically add discovered peers to Raft transport.
+    pub auto_add_peers: bool,
+
+    /// Whether to automatically remove failed peers from Raft transport.
+    pub auto_remove_peers: bool,
+
+    /// Whether to automatically propose ConfChange to add discovered nodes as Raft voters.
+    /// Only the leader will propose ConfChange. Requires auto_add_peers to be true.
+    pub auto_add_voters: bool,
+
+    /// Whether to automatically propose ConfChange to remove failed nodes from Raft voters.
+    /// Only the leader will propose ConfChange. Requires auto_remove_peers to be true.
+    pub auto_remove_voters: bool,
+}
+
+impl Default for PeerManagementConfig {
+    fn default() -> Self {
+        Self {
+            auto_add_peers: true,
+            auto_remove_peers: false, // Conservative default
+            auto_add_voters: false,   // Conservative default - requires explicit opt-in
+            auto_remove_voters: false, // Conservative default
+        }
+    }
+}
+
+impl PeerManagementConfig {
+    /// Enable automatic peer addition.
+    pub fn with_auto_add_peers(mut self, enabled: bool) -> Self {
+        self.auto_add_peers = enabled;
+        self
+    }
+
+    /// Enable automatic peer removal.
+    pub fn with_auto_remove_peers(mut self, enabled: bool) -> Self {
+        self.auto_remove_peers = enabled;
+        self
+    }
+
+    /// Enable automatic voter addition via Raft ConfChange.
+    pub fn with_auto_add_voters(mut self, enabled: bool) -> Self {
+        self.auto_add_voters = enabled;
+        self
+    }
+
+    /// Enable automatic voter removal via Raft ConfChange.
+    pub fn with_auto_remove_voters(mut self, enabled: bool) -> Self {
+        self.auto_remove_voters = enabled;
+        self
+    }
+}
+
 /// Memberlist gossip configuration.
 #[derive(Debug, Clone)]
 pub struct MemberlistConfig {
@@ -412,19 +518,8 @@ pub struct MemberlistConfig {
     /// Custom node name (defaults to "node-{node_id}").
     pub node_name: Option<String>,
 
-    /// Whether to automatically add discovered peers to Raft transport.
-    pub auto_add_peers: bool,
-
-    /// Whether to automatically remove failed peers from Raft transport.
-    pub auto_remove_peers: bool,
-
-    /// Whether to automatically propose ConfChange to add discovered nodes as Raft voters.
-    /// Only the leader will propose ConfChange. Requires auto_add_peers to be true.
-    pub auto_add_voters: bool,
-
-    /// Whether to automatically propose ConfChange to remove failed nodes from Raft voters.
-    /// Only the leader will propose ConfChange. Requires auto_remove_peers to be true.
-    pub auto_remove_voters: bool,
+    /// Peer management configuration.
+    pub peer_management: PeerManagementConfig,
 }
 
 impl Default for MemberlistConfig {
@@ -435,10 +530,7 @@ impl Default for MemberlistConfig {
             advertise_addr: None,
             seed_addrs: Vec::new(),
             node_name: None,
-            auto_add_peers: true,
-            auto_remove_peers: false, // Conservative default
-            auto_add_voters: false,   // Conservative default - requires explicit opt-in
-            auto_remove_voters: false, // Conservative default
+            peer_management: PeerManagementConfig::default(),
         }
     }
 }
@@ -477,29 +569,35 @@ impl MemberlistConfig {
         self
     }
 
+    /// Set peer management configuration.
+    pub fn with_peer_management(mut self, config: PeerManagementConfig) -> Self {
+        self.peer_management = config;
+        self
+    }
+
     /// Enable automatic peer addition.
     pub fn with_auto_add_peers(mut self, enabled: bool) -> Self {
-        self.auto_add_peers = enabled;
+        self.peer_management.auto_add_peers = enabled;
         self
     }
 
     /// Enable automatic peer removal.
     pub fn with_auto_remove_peers(mut self, enabled: bool) -> Self {
-        self.auto_remove_peers = enabled;
+        self.peer_management.auto_remove_peers = enabled;
         self
     }
 
     /// Enable automatic voter addition via Raft ConfChange.
     /// When enabled, the leader will propose ConfChange to add newly discovered nodes as voters.
     pub fn with_auto_add_voters(mut self, enabled: bool) -> Self {
-        self.auto_add_voters = enabled;
+        self.peer_management.auto_add_voters = enabled;
         self
     }
 
     /// Enable automatic voter removal via Raft ConfChange.
     /// When enabled, the leader will propose ConfChange to remove failed nodes from voters.
     pub fn with_auto_remove_voters(mut self, enabled: bool) -> Self {
-        self.auto_remove_voters = enabled;
+        self.peer_management.auto_remove_voters = enabled;
         self
     }
 
@@ -508,6 +606,27 @@ impl MemberlistConfig {
         self.bind_addr.unwrap_or_else(|| {
             SocketAddr::new(raft_addr.ip(), raft_addr.port() + 1000)
         })
+    }
+
+    // Backward compatibility accessors
+    /// Get auto_add_peers setting.
+    pub fn auto_add_peers(&self) -> bool {
+        self.peer_management.auto_add_peers
+    }
+
+    /// Get auto_remove_peers setting.
+    pub fn auto_remove_peers(&self) -> bool {
+        self.peer_management.auto_remove_peers
+    }
+
+    /// Get auto_add_voters setting.
+    pub fn auto_add_voters(&self) -> bool {
+        self.peer_management.auto_add_voters
+    }
+
+    /// Get auto_remove_voters setting.
+    pub fn auto_remove_voters(&self) -> bool {
+        self.peer_management.auto_remove_voters
     }
 }
 
@@ -678,6 +797,7 @@ mod tests {
         assert_eq!(config.node_id, 1);
         assert_eq!(config.max_capacity, 100_000);
         assert!(config.default_ttl.is_some());
+        assert!(config.cluster_discovery.is_none());
     }
 
     #[test]
@@ -727,25 +847,6 @@ mod tests {
             ..Default::default()
         };
         assert!(config.validate().is_none());
-    }
-
-    #[test]
-    fn test_cache_config_multiraft_requires_memberlist() {
-        // Multi-Raft enabled but memberlist disabled should fail validation
-        let config = CacheConfig::default()
-            .with_multiraft_enabled(true);
-        assert!(config.validate().is_err());
-
-        // Multi-Raft enabled with memberlist enabled should pass
-        let config = CacheConfig::default()
-            .with_memberlist_enabled(true)
-            .with_multiraft_enabled(true);
-        assert!(config.validate().is_ok());
-
-        // Multi-Raft disabled should pass regardless of memberlist
-        let config = CacheConfig::default()
-            .with_multiraft_enabled(false);
-        assert!(config.validate().is_ok());
     }
 
     #[test]

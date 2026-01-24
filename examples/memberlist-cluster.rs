@@ -15,7 +15,7 @@
 //! - Nodes can discover each other's addresses via gossip
 //! - Cluster membership events are available for monitoring
 
-use crema::{CacheConfig, DistributedCache, MemberlistConfig, RaftConfig};
+use crema::{CacheConfig, DistributedCache, MemberlistConfig, MemberlistDiscovery, PeerManagementConfig, RaftConfig};
 use std::env;
 use std::net::SocketAddr;
 use std::time::Duration;
@@ -90,11 +90,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         advertise_addr: None,
         seed_addrs: memberlist_seeds,
         node_name: Some(format!("cache-node-{}", node_id)),
-        auto_add_peers: true,    // Auto-add discovered peers to Raft transport
-        auto_remove_peers: false, // Don't auto-remove (safer)
-        auto_add_voters: false,  // We manually configure voters in this example
-        auto_remove_voters: false,
+        peer_management: PeerManagementConfig {
+            auto_add_peers: true,     // Auto-add discovered peers to Raft transport
+            auto_remove_peers: false, // Don't auto-remove (safer)
+            auto_add_voters: false,   // We manually configure voters in this example
+            auto_remove_voters: false,
+        },
     };
+
+    // Create MemberlistDiscovery for cluster discovery
+    let discovery = MemberlistDiscovery::new(
+        node_id,
+        my_raft_addr.parse()?,
+        &memberlist_config,
+        &raft_peers,
+    );
 
     // Create the cache configuration
     let config = CacheConfig::new(node_id, my_raft_addr.parse()?)
@@ -102,7 +112,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with_max_capacity(100_000)
         .with_default_ttl(Duration::from_secs(3600))
         .with_raft_config(raft_config)
-        .with_memberlist_config(memberlist_config);
+        .with_cluster_discovery(discovery);
 
     // Create the cache
     println!("Starting distributed cache with memberlist...");

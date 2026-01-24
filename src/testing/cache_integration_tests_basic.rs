@@ -11,7 +11,7 @@
 #[cfg(test)]
 mod tests {
     use crate::cache::DistributedCache;
-    use crate::config::{CacheConfig, MemberlistConfig, RaftConfig};
+    use crate::config::{CacheConfig, RaftConfig};
     use crate::types::NodeId;
     use std::net::SocketAddr;
     use std::sync::atomic::{AtomicU16, Ordering};
@@ -30,14 +30,10 @@ mod tests {
     fn single_node_config(node_id: NodeId, base_port: u16) -> CacheConfig {
         let raft_addr: SocketAddr = format!("127.0.0.1:{}", base_port).parse().unwrap();
 
-        CacheConfig {
-            node_id,
-            raft_addr,
-            seed_nodes: vec![],
-            max_capacity: 10_000,
-            default_ttl: Some(Duration::from_secs(3600)),
-            default_tti: None,
-            raft: RaftConfig {
+        CacheConfig::new(node_id, raft_addr)
+            .with_max_capacity(10_000)
+            .with_default_ttl(Duration::from_secs(3600))
+            .with_raft_config(RaftConfig {
                 election_tick: 5,      // 5 ticks = 500ms with 100ms tick
                 heartbeat_tick: 2,     // 2 ticks = 200ms
                 tick_interval_ms: 100, // 100ms per tick
@@ -46,13 +42,7 @@ mod tests {
                 pre_vote: true,
                 applied: 0,
                 storage_type: crate::config::RaftStorageType::Memory,
-            },
-            membership: Default::default(),
-            memberlist: MemberlistConfig::default(), // Disabled by default
-            checkpoint: Default::default(),
-            forwarding: Default::default(),
-            multiraft: Default::default(),
-        }
+            })
     }
 
     /// Create a cache config for a node in a multi-node cluster
@@ -72,20 +62,16 @@ mod tests {
             })
             .collect();
 
-        // 生产环境建议：
-        // 基础选举超时设为 10-20 (1s - 2s)
-        // 这样可以留出足够的网络往返时间（RTT）和磁盘 IO 时间
+        // Production recommendation:
+        // Base election timeout of 10-20 (1s - 2s)
+        // This allows enough network RTT and disk I/O time
         let base_election_tick = 15;
 
-        CacheConfig {
-            node_id,
-            raft_addr,
-            seed_nodes,
-            max_capacity: 10_000,
-            default_ttl: Some(Duration::from_secs(3600)),
-            default_tti: None,
-            raft: RaftConfig {
-                // 改进点：使用 100ms 作为基础 Tick
+        CacheConfig::new(node_id, raft_addr)
+            .with_seed_nodes(seed_nodes)
+            .with_max_capacity(10_000)
+            .with_default_ttl(Duration::from_secs(3600))
+            .with_raft_config(RaftConfig {
                 tick_interval_ms: 100,
                 election_tick: base_election_tick + (node_id as usize * 5),
                 heartbeat_tick: 2,
@@ -94,13 +80,7 @@ mod tests {
                 pre_vote: true,
                 applied: 0,
                 storage_type: crate::config::RaftStorageType::Memory,
-            },
-            membership: Default::default(),
-            memberlist: MemberlistConfig::default(),
-            checkpoint: Default::default(),
-            forwarding: Default::default(),
-            multiraft: Default::default(),
-        }
+            })
     }
 
     /// Wait for a condition with timeout
@@ -272,11 +252,11 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn tc4_restart_single_node() {
         let base_port = allocate_ports(1);
-        let config = single_node_config(1, base_port);
-        let election_time = election_timeout(&config);
+        let config1 = single_node_config(1, base_port);
+        let election_time = Duration::from_millis(config1.raft.tick_interval_ms * config1.raft.election_tick as u64);
 
         // First run
-        let cache1 = DistributedCache::new(config.clone())
+        let cache1 = DistributedCache::new(config1)
             .await
             .expect("Failed to create cache");
         let became_leader = wait_for_leader(&cache1, election_time * 3).await;
@@ -289,7 +269,8 @@ mod tests {
         sleep(Duration::from_millis(200)).await; // Allow cleanup
 
         // Restart with same config (same node ID, same port)
-        let cache2 = DistributedCache::new(config)
+        let config2 = single_node_config(1, base_port);
+        let cache2 = DistributedCache::new(config2)
             .await
             .expect("Failed to restart cache");
 

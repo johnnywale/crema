@@ -73,10 +73,12 @@ fn create_memberlist_config(
         advertise_addr: None,
         seed_addrs: seed_memberlist_addrs,
         node_name: Some(format!("cache-node-{}", node_id)),
-        auto_add_peers: true,   // Automatically add discovered peers to Raft transport
-        auto_remove_peers: false, // Don't auto-remove (safer default)
-        auto_add_voters: false,  // Don't auto-add voters in tests (we configure them manually)
-        auto_remove_voters: false, // Don't auto-remove voters in tests
+        peer_management: crate::config::PeerManagementConfig {
+            auto_add_peers: true,   // Automatically add discovered peers to Raft transport
+            auto_remove_peers: false, // Don't auto-remove (safer default)
+            auto_add_voters: false,  // Don't auto-add voters in tests (we configure them manually)
+            auto_remove_voters: false, // Don't auto-remove voters in tests
+        },
     };
 
     // Create Raft config with reasonable election settings
@@ -88,19 +90,20 @@ fn create_memberlist_config(
         ..Default::default()
     };
 
-    CacheConfig {
+    // Create MemberlistDiscovery and add to config
+    let discovery = crate::cluster::MemberlistDiscovery::new(
         node_id,
         raft_addr,
-        // Provide peer info for Raft voter configuration
-        // Memberlist will handle address updates and health monitoring
-        seed_nodes: peer_raft_addrs,
-        max_capacity: 10_000,
-        default_ttl: Some(Duration::from_secs(3600)),
-        default_tti: None,
-        raft: raft_config,
-        memberlist: memberlist_config,
-        ..Default::default()
-    }
+        &memberlist_config,
+        &peer_raft_addrs,
+    );
+
+    CacheConfig::new(node_id, raft_addr)
+        .with_seed_nodes(peer_raft_addrs)
+        .with_max_capacity(10_000)
+        .with_default_ttl(Duration::from_secs(3600))
+        .with_raft_config(raft_config)
+        .with_cluster_discovery(discovery)
 }
 
 /// Wait for a condition with timeout
@@ -559,10 +562,12 @@ mod tests {
             advertise_addr: None,
             seed_addrs: vec![], // Bootstrap node has no seeds
             node_name: Some("cache-node-1".to_string()),
-            auto_add_peers: true,
-            auto_remove_peers: false,
-            auto_add_voters: true, // Enable auto-add voters
-            auto_remove_voters: false,
+            peer_management: crate::config::PeerManagementConfig {
+                auto_add_peers: true,
+                auto_remove_peers: false,
+                auto_add_voters: true, // Enable auto-add voters
+                auto_remove_voters: false,
+            },
         };
 
         let raft_config_1 = RaftConfig {
@@ -573,17 +578,19 @@ mod tests {
             ..Default::default()
         };
 
-        let config1 = CacheConfig {
-            node_id: 1,
-            raft_addr: raft_addr_1,
-            seed_nodes: vec![], // Single-node bootstrap
-            max_capacity: 10_000,
-            default_ttl: Some(Duration::from_secs(3600)),
-            default_tti: None,
-            raft: raft_config_1,
-            memberlist: memberlist_config_1,
-            ..Default::default()
-        };
+        // Create MemberlistDiscovery for node 1
+        let discovery_1 = crate::cluster::MemberlistDiscovery::new(
+            1,
+            raft_addr_1,
+            &memberlist_config_1,
+            &[], // Single-node bootstrap has no seed nodes
+        );
+
+        let config1 = CacheConfig::new(1, raft_addr_1)
+            .with_max_capacity(10_000)
+            .with_default_ttl(Duration::from_secs(3600))
+            .with_raft_config(raft_config_1)
+            .with_cluster_discovery(discovery_1);
 
         info!("Starting node 1 (bootstrap single-node cluster)...");
         let cache1 = DistributedCache::new(config1)
@@ -615,10 +622,12 @@ mod tests {
             advertise_addr: None,
             seed_addrs: vec![ml_addr_1], // Join via node 1's memberlist
             node_name: Some("cache-node-2".to_string()),
-            auto_add_peers: true,
-            auto_remove_peers: false,
-            auto_add_voters: true, // Enable auto-add voters
-            auto_remove_voters: false,
+            peer_management: crate::config::PeerManagementConfig {
+                auto_add_peers: true,
+                auto_remove_peers: false,
+                auto_add_voters: true, // Enable auto-add voters
+                auto_remove_voters: false,
+            },
         };
 
         let raft_config_2 = RaftConfig {
@@ -629,19 +638,20 @@ mod tests {
             ..Default::default()
         };
 
-        let config2 = CacheConfig {
-            node_id: 2,
-            raft_addr: raft_addr_2,
-            // Need to specify node 1 as seed for Raft transport (so messages can be routed)
-            // But node 2 is NOT initially in node 1's voter list - it will be added via ConfChange
-            seed_nodes: vec![(1, raft_addr_1)],
-            max_capacity: 10_000,
-            default_ttl: Some(Duration::from_secs(3600)),
-            default_tti: None,
-            raft: raft_config_2,
-            memberlist: memberlist_config_2,
-            ..Default::default()
-        };
+        // Create MemberlistDiscovery for node 2
+        let discovery_2 = crate::cluster::MemberlistDiscovery::new(
+            2,
+            raft_addr_2,
+            &memberlist_config_2,
+            &[(1, raft_addr_1)], // Need to specify node 1 as seed for Raft transport
+        );
+
+        let config2 = CacheConfig::new(2, raft_addr_2)
+            .with_seed_nodes(vec![(1, raft_addr_1)])
+            .with_max_capacity(10_000)
+            .with_default_ttl(Duration::from_secs(3600))
+            .with_raft_config(raft_config_2)
+            .with_cluster_discovery(discovery_2);
 
         info!("Starting node 2 (joining via memberlist discovery)...");
         let cache2 = DistributedCache::new(config2)
