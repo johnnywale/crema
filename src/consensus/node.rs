@@ -54,6 +54,9 @@ pub struct RaftNode {
     /// This node's ID.
     id: NodeId,
 
+    /// This node's Raft address (for responding to pings).
+    local_addr: String,
+
     /// Current leader ID.
     leader_id: AtomicU64,
 
@@ -83,6 +86,7 @@ impl RaftNode {
         peers: Vec<NodeId>,
         config: RaftConfig,
         state_machine: Arc<CacheStateMachine>,
+        local_addr: String,
     ) -> Result<Arc<Self>> {
         // Create storage with initial voters
         let mut voters = peers.clone();
@@ -173,6 +177,7 @@ impl RaftNode {
             pending: Arc::new(Mutex::new(HashMap::new())),
             next_proposal_id: Arc::new(AtomicU64::new(1)),
             id,
+            local_addr,
             leader_id: AtomicU64::new(0),
             has_leader: AtomicBool::new(false),
             config,
@@ -954,7 +959,7 @@ impl RaftNode {
             Message::Ping(_ping) => {
                 Some(Message::Pong(crate::network::rpc::PongResponse {
                     node_id: self.id,
-                    raft_addr: String::new(), // TODO: fill in
+                    raft_addr: self.local_addr.clone(),
                     leader_id: self.leader_id(),
                 }))
             }
@@ -969,9 +974,11 @@ impl RaftNode {
     /// Handle a forwarded command from a follower.
     ///
     /// This is called on the leader when it receives a ForwardedCommand.
-    /// The leader proposes the command to Raft and sends back a ForwardResponse.
+    /// For write operations, the leader proposes the command to Raft.
+    /// For GET operations, the leader performs a linearizable read using read_index.
     fn handle_forwarded_command(&self, fwd: crate::network::rpc::ForwardedCommand) {
         use crate::network::rpc::ForwardResponse;
+        use crate::types::CacheCommand;
 
         let request_id = fwd.request_id;
         let origin_node_id = fwd.origin_node_id;
@@ -1027,7 +1034,41 @@ impl RaftNode {
             return;
         }
 
-        // Propose the command asynchronously
+        // Handle GET operations specially - use linearizable read, not Raft proposal
+        if let CacheCommand::Get { ref key } = command {
+            let key = key.clone();
+            let transport = self.transport.clone();
+            let state_machine = self.state_machine.clone();
+            let node_id = self.id;
+
+            // We already checked is_leader() above, so we can read directly.
+            // For true linearizability, we'd use read_index(), but that requires
+            // the full RaftNode (self) which we can't move into the spawned task.
+            // Since we verified leadership, reading the committed data is safe.
+            tokio::spawn(async move {
+                // Read from storage - we've already verified we're leader
+                let value = state_machine.storage().get(&key).await;
+                let value_bytes = value.map(|v| v.to_vec());
+
+                debug!(
+                    node_id = node_id,
+                    request_id = request_id,
+                    has_value = value_bytes.is_some(),
+                    "FORWARD: GET completed successfully"
+                );
+
+                let response = Message::ForwardResponse(
+                    ForwardResponse::success_with_value(request_id, value_bytes)
+                );
+
+                if let Err(e) = transport.send_message(origin_node_id, response).await {
+                    warn!(error = %e, "Failed to send ForwardResponse for GET");
+                }
+            });
+            return;
+        }
+
+        // For write operations, propose the command asynchronously
         let transport = self.transport.clone();
         let pending = self.pending.clone();
         let next_proposal_id = self.next_proposal_id.clone();

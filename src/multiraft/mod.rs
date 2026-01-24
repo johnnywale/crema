@@ -214,9 +214,9 @@ pub use persistent_migration_store::{
     PersistentMigrationStore,
 };
 pub use raft_migration::{
-    JanitorReport, NoOpShardRaftController, RaftChangeType, RaftMembershipChange,
-    RaftMigrationConfig, RaftMigrationCoordinator, RaftMigrationPhase, RaftMigrationProgress,
-    RaftMigrationStats, RaftShardMigration, ShardRaftController,
+    JanitorReport, NoOpShardRaftController, NodeAddressResolver, RaftChangeType,
+    RaftMembershipChange, RaftMigrationConfig, RaftMigrationCoordinator, RaftMigrationPhase,
+    RaftMigrationProgress, RaftMigrationStats, RaftShardMigration, ShardRaftController,
 };
 pub use router::{BatchRouter, RouterConfig, RoutingDecision, ShardRouter};
 pub use shard::{Shard, ShardAssignment, ShardConfig, ShardId, ShardInfo, ShardRange, ShardState};

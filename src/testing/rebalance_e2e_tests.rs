@@ -91,6 +91,17 @@ mod tests {
             ));
             migration_coordinator.set_raft_controller(Arc::new(NoOpShardRaftController));
 
+            // Set up address resolver using port_configs
+            let port_configs_clone = port_configs.clone();
+            let address_resolver: crate::multiraft::NodeAddressResolver =
+                Arc::new(move |node_id| {
+                    port_configs_clone
+                        .iter()
+                        .find(|(id, _)| *id == node_id)
+                        .map(|(_, port)| format!("127.0.0.1:{}", port).parse().unwrap())
+                });
+            migration_coordinator.set_node_address_resolver(address_resolver);
+
             Self {
                 nodes,
                 port_configs,
@@ -569,6 +580,11 @@ mod tests {
     async fn tc_reb_06_migration_statistics() {
         let coordinator = RaftMigrationCoordinator::new(1, RaftMigrationConfig::default());
         coordinator.set_raft_controller(Arc::new(NoOpShardRaftController));
+
+        // Set up mock address resolver for testing
+        let address_resolver: crate::multiraft::NodeAddressResolver =
+            Arc::new(|node_id| Some(format!("127.0.0.1:{}", 9000 + node_id).parse().unwrap()));
+        coordinator.set_node_address_resolver(address_resolver);
 
         // Initial stats
         let stats = coordinator.stats();

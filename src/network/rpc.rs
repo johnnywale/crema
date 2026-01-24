@@ -245,15 +245,29 @@ pub struct ForwardResponse {
 
     /// Error message if failed.
     pub error: Option<String>,
+
+    /// Optional value for GET operations.
+    pub value: Option<Vec<u8>>,
 }
 
 impl ForwardResponse {
-    /// Create a success response.
+    /// Create a success response for write operations.
     pub fn success(request_id: u64) -> Self {
         Self {
             request_id,
             success: true,
             error: None,
+            value: None,
+        }
+    }
+
+    /// Create a success response for GET operations with a value.
+    pub fn success_with_value(request_id: u64, value: Option<Vec<u8>>) -> Self {
+        Self {
+            request_id,
+            success: true,
+            error: None,
+            value,
         }
     }
 
@@ -263,6 +277,7 @@ impl ForwardResponse {
             request_id,
             success: false,
             error: Some(error.into()),
+            value: None,
         }
     }
 }

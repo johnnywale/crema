@@ -22,18 +22,33 @@ struct NodePorts {
 }
 
 /// Allocate OS-assigned ports for multiple nodes.
-/// Each node needs 2 ports: one for memberlist bind (UDP) and one for raft (TCP).
+/// Each node needs 2 ports: one for memberlist bind and one for raft.
 ///
-/// Note: memberlist uses UDP for its packet listener, so we must allocate UDP ports
-/// for bind_port. On Windows, TCP and UDP ports are in separate namespaces, and
-/// some port ranges may be excluded for UDP but not TCP.
+/// Note: memberlist uses BOTH UDP AND TCP on the same bind port (SWIM protocol).
+/// We must ensure both are available on the allocated port.
 async fn allocate_node_ports(count: usize) -> Vec<NodePorts> {
     let mut result = Vec::with_capacity(count);
     for _ in 0..count {
-        // Allocate memberlist bind port using UDP (memberlist uses UDP for packet listener)
-        let bind_socket = UdpSocket::bind("127.0.0.1:0").unwrap();
-        let bind_port = bind_socket.local_addr().unwrap().port();
-        drop(bind_socket);
+        // For memberlist bind port, we need BOTH UDP and TCP to be available on the same port.
+        // Strategy: allocate UDP first, then verify TCP is also available on the same port.
+        // If TCP fails, try again with a different port.
+        let bind_port = loop {
+            let udp_socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+            let port = udp_socket.local_addr().unwrap().port();
+            drop(udp_socket);
+
+            // Verify TCP is also available on this port
+            match TcpListener::bind(format!("127.0.0.1:{}", port)).await {
+                Ok(listener) => {
+                    drop(listener);
+                    break port;
+                }
+                Err(_) => {
+                    // TCP not available, try another port
+                    continue;
+                }
+            }
+        };
 
         // Allocate raft port using TCP
         let raft_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();

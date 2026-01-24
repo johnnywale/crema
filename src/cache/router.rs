@@ -259,6 +259,7 @@ mod tests {
             vec![1],
             config.raft.clone(),
             state_machine,
+            config.raft_addr.to_string(),
         ).unwrap();
 
         let router = CacheRouter::single(storage.clone(), raft);
@@ -279,6 +280,7 @@ mod tests {
             vec![1],
             config.raft.clone(),
             state_machine,
+            config.raft_addr.to_string(),
         ).unwrap();
 
         let router = CacheRouter::single(storage.clone(), raft);

@@ -33,6 +33,7 @@ use crate::types::NodeId;
 use dashmap::DashMap;
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
+use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -537,8 +538,10 @@ impl Default for RaftMigrationConfig {
 /// # Split-Brain Protection
 ///
 /// Each migration includes a coordinator_term that is validated before
+/// Callback type for resolving node addresses.
+pub type NodeAddressResolver = Arc<dyn Fn(NodeId) -> Option<SocketAddr> + Send + Sync>;
+
 /// executing operations, preventing zombie coordinators from interfering.
-#[derive(Debug)]
 pub struct RaftMigrationCoordinator {
     /// This node's ID.
     node_id: NodeId,
@@ -574,6 +577,25 @@ pub struct RaftMigrationCoordinator {
 
     /// Cleanup manager for failed migrations.
     cleanup_manager: Arc<MigrationCleanupManager>,
+
+    /// Node address resolver for looking up peer addresses.
+    node_address_resolver: RwLock<Option<NodeAddressResolver>>,
+}
+
+impl std::fmt::Debug for RaftMigrationCoordinator {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RaftMigrationCoordinator")
+            .field("node_id", &self.node_id)
+            .field("config", &self.config)
+            .field("active_migrations", &self.active_migrations.len())
+            .field("paused", &self.paused.load(Ordering::SeqCst))
+            .field("coordinator_term", &self.coordinator_term.load(Ordering::SeqCst))
+            .field("migrations_started", &self.migrations_started.load(Ordering::SeqCst))
+            .field("migrations_completed", &self.migrations_completed.load(Ordering::SeqCst))
+            .field("migrations_failed", &self.migrations_failed.load(Ordering::SeqCst))
+            .field("has_address_resolver", &self.node_address_resolver.read().is_some())
+            .finish()
+    }
 }
 
 impl RaftMigrationCoordinator {
@@ -593,7 +615,21 @@ impl RaftMigrationCoordinator {
             migrations_failed: AtomicU64::new(0),
             cancellation: CancellationToken::new(),
             cleanup_manager: Arc::new(MigrationCleanupManager::noop()),
+            node_address_resolver: RwLock::new(None),
         }
+    }
+
+    /// Set the node address resolver for looking up peer addresses.
+    pub fn set_node_address_resolver(&self, resolver: NodeAddressResolver) {
+        *self.node_address_resolver.write() = Some(resolver);
+    }
+
+    /// Resolve a node's address using the configured resolver.
+    fn resolve_node_address(&self, node_id: NodeId) -> Option<SocketAddr> {
+        self.node_address_resolver
+            .read()
+            .as_ref()
+            .and_then(|resolver| resolver(node_id))
     }
 
     /// Set the cleanup manager.
@@ -777,10 +813,12 @@ impl RaftMigrationCoordinator {
 
         self.transition_phase(shard_id, RaftMigrationPhase::AddingLearner)?;
 
-        // TODO: Get actual node address from cluster membership
-        let node_addr = format!("127.0.0.1:{}", 9000 + migration.change.target_node)
-            .parse()
-            .map_err(|e| Error::Internal(format!("Invalid address: {}", e)))?;
+        // Get node address from resolver, or fail if not available
+        let node_addr = self.resolve_node_address(migration.change.target_node)
+            .ok_or_else(|| Error::Internal(format!(
+                "Cannot resolve address for node {}: no address resolver configured or node not found",
+                migration.change.target_node
+            )))?;
 
         match controller.add_learner(shard_id, migration.change.target_node, node_addr).await {
             Ok(()) => {
@@ -1415,10 +1453,18 @@ mod tests {
         assert_eq!(report.history_trimmed, 0);
     }
 
+    /// Create a mock address resolver for testing that returns a fixed port based on node_id
+    fn mock_address_resolver() -> NodeAddressResolver {
+        Arc::new(|node_id| {
+            Some(format!("127.0.0.1:{}", 9000 + node_id).parse().unwrap())
+        })
+    }
+
     #[tokio::test]
     async fn test_coordinator_execute_migration() {
         let coordinator = RaftMigrationCoordinator::new(1, RaftMigrationConfig::default());
         coordinator.set_raft_controller(Arc::new(NoOpShardRaftController));
+        coordinator.set_node_address_resolver(mock_address_resolver());
 
         let change = RaftMembershipChange::new(1, RaftChangeType::AddLearner, 5);
         coordinator.plan_migration(change).unwrap();
@@ -1435,6 +1481,7 @@ mod tests {
     async fn test_coordinator_execute_transfer() {
         let coordinator = RaftMigrationCoordinator::new(1, RaftMigrationConfig::default());
         coordinator.set_raft_controller(Arc::new(NoOpShardRaftController));
+        coordinator.set_node_address_resolver(mock_address_resolver());
 
         let change = RaftMembershipChange::transfer(1, 2, 5);
         coordinator.plan_migration(change).unwrap();

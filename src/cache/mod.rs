@@ -63,7 +63,7 @@ pub struct DistributedCache {
 
     /// Pending forwarded requests awaiting leader response.
     /// Maps request_id -> oneshot sender for the response.
-    pending_forwards: Arc<DashMap<u64, oneshot::Sender<Result<()>>>>,
+    pending_forwards: Arc<DashMap<u64, oneshot::Sender<Result<Option<Bytes>>>>>,
 
     /// Counter for generating unique forward request IDs.
     next_forward_id: AtomicU64,
@@ -202,6 +202,7 @@ impl DistributedCache {
             initial_peers.clone(),
             raft_config,
             state_machine.clone(),
+            config.raft_addr.to_string(),
         )?;
 
         // Set checkpoint manager on Raft node if available
@@ -642,22 +643,18 @@ impl DistributedCache {
     /// let value = cache.get(b"key").await;
     /// ```
     pub async fn consistent_get(&self, key: &[u8]) -> Result<Option<Bytes>> {
-        // If not leader and forwarding is enabled, we could forward
-        // For now, require reads to be on leader for simplicity
+        // If not leader and forwarding is enabled, forward to leader
         if !self.raft.is_leader() {
             // Check if we should forward to leader
             if self.config.forwarding.enabled {
-                if let Some(leader_id) = self.raft.leader_id() {
+                if let Some(_leader_id) = self.raft.leader_id() {
                     debug!(
                         node_id = self.raft.id(),
-                        leader_id, "CONSISTENT_GET: Not leader, would forward to leader"
+                        "CONSISTENT_GET: Not leader, forwarding read to leader"
                     );
-                    // For now, return NotLeader error
-                    // TODO: Implement read forwarding when needed
-                    return Err(crate::error::RaftError::NotLeader {
-                        leader: Some(leader_id),
-                    }
-                    .into());
+                    // Forward the read to leader using existing forwarding mechanism
+                    let command = CacheCommand::Get { key: key.to_vec() };
+                    return self.forward_to_leader(command).await;
                 }
             }
             return Err(crate::error::RaftError::NotLeader {
@@ -743,7 +740,7 @@ impl DistributedCache {
                 "PUT: Forwarding to leader (not leader)"
             );
 
-            self.forward_to_leader(command).await
+            self.forward_to_leader(command).await.map(|_| ())
         }
     }
 
@@ -789,7 +786,7 @@ impl DistributedCache {
                 "PUT_TTL: Forwarding to leader (not leader)"
             );
 
-            self.forward_to_leader(command).await
+            self.forward_to_leader(command).await.map(|_| ())
         }
     }
 
@@ -825,7 +822,7 @@ impl DistributedCache {
                 "DELETE: Forwarding to leader (not leader)"
             );
 
-            self.forward_to_leader(command).await
+            self.forward_to_leader(command).await.map(|_| ())
         }
     }
 
@@ -855,7 +852,7 @@ impl DistributedCache {
                 "CLEAR: Forwarding to leader (not leader)"
             );
 
-            self.forward_to_leader(command).await
+            self.forward_to_leader(command).await.map(|_| ())
         }
     }
 
@@ -863,9 +860,10 @@ impl DistributedCache {
 
     /// Forward a command to the leader node.
     ///
-    /// This is called when this node receives a write request but is not the leader.
+    /// This is called when this node receives a request but is not the leader.
     /// The request is forwarded to the leader and we wait for the response.
-    async fn forward_to_leader(&self, command: CacheCommand) -> Result<()> {
+    /// Returns `Ok(None)` for write operations, `Ok(Some(value))` for GET operations.
+    async fn forward_to_leader(&self, command: CacheCommand) -> Result<Option<Bytes>> {
         // Check if forwarding is enabled
         if !self.config.forwarding.enabled {
             return Err(Error::Raft(crate::error::RaftError::NotLeader {
@@ -970,7 +968,8 @@ impl DistributedCache {
     pub fn handle_forward_response(&self, response: &ForwardResponse) {
         if let Some((_, tx)) = self.pending_forwards.remove(&response.request_id) {
             let result = if response.success {
-                Ok(())
+                // Convert Option<Vec<u8>> to Option<Bytes>
+                Ok(response.value.as_ref().map(|v| Bytes::from(v.clone())))
             } else {
                 Err(Error::RemoteError(
                     response.error.clone().unwrap_or_else(|| "unknown error".to_string()),
@@ -980,6 +979,7 @@ impl DistributedCache {
                 node_id = self.config.node_id,
                 request_id = response.request_id,
                 success = response.success,
+                has_value = response.value.is_some(),
                 "FORWARD: Completing pending forward"
             );
             let _ = tx.send(result);
@@ -993,7 +993,7 @@ impl DistributedCache {
     }
 
     /// Get the pending forwards map (for message handler access).
-    pub fn pending_forwards(&self) -> &Arc<DashMap<u64, oneshot::Sender<Result<()>>>> {
+    pub fn pending_forwards(&self) -> &Arc<DashMap<u64, oneshot::Sender<Result<Option<Bytes>>>>> {
         &self.pending_forwards
     }
 
@@ -1229,7 +1229,7 @@ impl DistributedCache {
 struct CacheMessageHandler {
     raft: Arc<RaftNode>,
     /// Pending forwarded requests awaiting leader response.
-    pending_forwards: Arc<DashMap<u64, oneshot::Sender<Result<()>>>>,
+    pending_forwards: Arc<DashMap<u64, oneshot::Sender<Result<Option<Bytes>>>>>,
     /// Node ID for logging.
     node_id: NodeId,
 }
@@ -1240,7 +1240,8 @@ impl MessageHandler for CacheMessageHandler {
         if let Message::ForwardResponse(ref response) = msg {
             if let Some((_, tx)) = self.pending_forwards.remove(&response.request_id) {
                 let result = if response.success {
-                    Ok(())
+                    // Convert Option<Vec<u8>> to Option<Bytes>
+                    Ok(response.value.as_ref().map(|v| Bytes::from(v.clone())))
                 } else {
                     Err(Error::RemoteError(
                         response.error.clone().unwrap_or_else(|| "unknown error".to_string()),
@@ -1250,6 +1251,7 @@ impl MessageHandler for CacheMessageHandler {
                     node_id = self.node_id,
                     request_id = response.request_id,
                     success = response.success,
+                    has_value = response.value.is_some(),
                     "FORWARD: Completing pending forward"
                 );
                 let _ = tx.send(result);
