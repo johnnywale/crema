@@ -732,7 +732,10 @@ async fn test_priority_preemption_logic() {
     })
     .await;
 
-    assert!(success, "Server did not receive any messages within the timeout");
+    assert!(
+        success,
+        "Server did not receive any messages within the timeout"
+    );
 
     // 6. Verify receive order
     let received = received_messages.lock().await;
@@ -941,7 +944,6 @@ where
     }
     false
 }
-
 
 /// A. Network Partition & Recovery Test
 /// Establish connection and send messages, then suddenly close Server, wait a while, restart Server.
@@ -1170,7 +1172,11 @@ async fn test_semaphore_fairness() {
 
     // Send messages to all 10 peers
     for i in 0..10 {
-        let _ = transport.send(create_test_message(1, (i + 2) as NodeId, MessageType::MsgHeartbeat));
+        let _ = transport.send(create_test_message(
+            1,
+            (i + 2) as NodeId,
+            MessageType::MsgHeartbeat,
+        ));
     }
 
     // Wait for connections to establish
@@ -1214,7 +1220,8 @@ async fn test_concurrent_shutdown() {
     let sender_handle = tokio::spawn(async move {
         for i in 0..100 {
             for peer in 2..7 {
-                let _ = transport_clone.send(create_test_message(1, peer, MessageType::MsgHeartbeat));
+                let _ =
+                    transport_clone.send(create_test_message(1, peer, MessageType::MsgHeartbeat));
             }
             if i % 10 == 0 {
                 tokio::time::sleep(Duration::from_millis(10)).await;
@@ -1295,7 +1302,10 @@ async fn test_idle_connection_timeout() {
     wait_for_metrics(&transport, |m| m.messages_sent >= 2).await;
 
     let final_metrics = transport.metrics();
-    assert_eq!(final_metrics.active_connections, 1, "Connection should be re-established");
+    assert_eq!(
+        final_metrics.active_connections, 1,
+        "Connection should be re-established"
+    );
 
     transport.shutdown().await;
 }

@@ -205,21 +205,15 @@ impl ShardStorageManager {
         let snapshots_dir = config.base_dir.join("snapshots");
         let metadata_dir = config.base_dir.join("metadata");
 
-        fs::create_dir_all(&snapshots_dir).map_err(|e| {
-            Error::Internal(format!(
-                "Failed to create snapshots directory: {}",
-                e
-            ))
-        })?;
-        fs::create_dir_all(&metadata_dir).map_err(|e| {
-            Error::Internal(format!(
-                "Failed to create metadata directory: {}",
-                e
-            ))
-        })?;
+        fs::create_dir_all(&snapshots_dir)
+            .map_err(|e| Error::Internal(format!("Failed to create snapshots directory: {}", e)))?;
+        fs::create_dir_all(&metadata_dir)
+            .map_err(|e| Error::Internal(format!("Failed to create metadata directory: {}", e)))?;
 
-        let mut registry = PersistedShardRegistry::default();
-        registry.node_id = node_id;
+        let mut registry = PersistedShardRegistry {
+            node_id,
+            ..Default::default()
+        };
 
         // Try to load existing registry
         let registry_path = metadata_dir.join("shard_registry.bin");
@@ -257,7 +251,10 @@ impl ShardStorageManager {
 
     /// Get the metadata file path.
     fn registry_path(&self) -> PathBuf {
-        self.config.base_dir.join("metadata").join("shard_registry.bin")
+        self.config
+            .base_dir
+            .join("metadata")
+            .join("shard_registry.bin")
     }
 
     /// Register a shard for storage management.
@@ -285,7 +282,9 @@ impl ShardStorageManager {
     /// Record that entries were applied to a shard.
     pub fn record_entries_applied(&self, shard_id: ShardId, count: u64) {
         if let Some(state) = self.shard_states.read().get(&shard_id) {
-            state.entries_since_snapshot.fetch_add(count, Ordering::Relaxed);
+            state
+                .entries_since_snapshot
+                .fetch_add(count, Ordering::Relaxed);
         }
     }
 
@@ -312,18 +311,11 @@ impl ShardStorageManager {
         raft_term: u64,
     ) -> Result<ShardSnapshotInfo> {
         let shard_dir = self.shard_snapshots_dir(shard_id);
-        fs::create_dir_all(&shard_dir).map_err(|e| {
-            Error::Internal(format!(
-                "Failed to create shard directory: {}",
-                e
-            ))
-        })?;
+        fs::create_dir_all(&shard_dir)
+            .map_err(|e| Error::Internal(format!("Failed to create shard directory: {}", e)))?;
 
         // Generate snapshot filename
-        let filename = format!(
-            "snapshot-{:010}-{:010}.snap",
-            raft_index, raft_term
-        );
+        let filename = format!("snapshot-{:010}-{:010}.snap", raft_index, raft_term);
         let path = shard_dir.join(&filename);
         let temp_path = shard_dir.join(format!("{}.tmp", filename));
 
@@ -336,8 +328,9 @@ impl ShardStorageManager {
         );
 
         // Create snapshot writer
-        let writer = SnapshotWriter::new(&temp_path, raft_index, raft_term, self.config.compress)
-            .map_err(|e| Error::Internal(format!("Failed to create snapshot writer: {}", e)))?;
+        let writer =
+            SnapshotWriter::new(&temp_path, raft_index, raft_term, self.config.compress)
+                .map_err(|e| Error::Internal(format!("Failed to create snapshot writer: {}", e)))?;
 
         // Write entries from storage
         // Note: We iterate through the cache's entries
@@ -349,28 +342,25 @@ impl ShardStorageManager {
         // In production, you'd want to implement proper iteration support.
 
         // Finalize the snapshot (writes footer and updates header)
-        let _metadata = writer.finalize()
+        let _metadata = writer
+            .finalize()
             .map_err(|e| Error::Internal(format!("Failed to finalize snapshot: {}", e)))?;
 
         // Atomic rename
-        fs::rename(&temp_path, &path).map_err(|e| {
-            Error::Internal(format!(
-                "Failed to rename snapshot: {}",
-                e
-            ))
-        })?;
+        fs::rename(&temp_path, &path)
+            .map_err(|e| Error::Internal(format!("Failed to rename snapshot: {}", e)))?;
 
         // Update state
         if let Some(state) = self.shard_states.read().get(&shard_id) {
             state.entries_since_snapshot.store(0, Ordering::Relaxed);
             *state.last_snapshot_time.write() = Instant::now();
-            state.last_snapshot_index.store(raft_index, Ordering::Relaxed);
+            state
+                .last_snapshot_index
+                .store(raft_index, Ordering::Relaxed);
             state.last_snapshot_term.store(raft_term, Ordering::Relaxed);
         }
 
-        let file_size = fs::metadata(&path)
-            .map(|m| m.len())
-            .unwrap_or(0);
+        let file_size = fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
 
         let info = ShardSnapshotInfo {
             shard_id,
@@ -408,17 +398,10 @@ impl ShardStorageManager {
         raft_term: u64,
     ) -> Result<ShardSnapshotInfo> {
         let shard_dir = self.shard_snapshots_dir(shard_id);
-        fs::create_dir_all(&shard_dir).map_err(|e| {
-            Error::Internal(format!(
-                "Failed to create shard directory: {}",
-                e
-            ))
-        })?;
+        fs::create_dir_all(&shard_dir)
+            .map_err(|e| Error::Internal(format!("Failed to create shard directory: {}", e)))?;
 
-        let filename = format!(
-            "snapshot-{:010}-{:010}.snap",
-            raft_index, raft_term
-        );
+        let filename = format!("snapshot-{:010}-{:010}.snap", raft_index, raft_term);
         let path = shard_dir.join(&filename);
         let temp_path = shard_dir.join(format!("{}.tmp", filename));
 
@@ -430,37 +413,36 @@ impl ShardStorageManager {
             "Creating shard snapshot with entries"
         );
 
-        let mut writer = SnapshotWriter::new(&temp_path, raft_index, raft_term, self.config.compress)
-            .map_err(|e| Error::Internal(format!("Failed to create snapshot writer: {}", e)))?;
+        let mut writer =
+            SnapshotWriter::new(&temp_path, raft_index, raft_term, self.config.compress)
+                .map_err(|e| Error::Internal(format!("Failed to create snapshot writer: {}", e)))?;
 
         let entry_count = entries.len() as u64;
         for entry in entries {
-            writer.write_entry(&entry)
+            writer
+                .write_entry(&entry)
                 .map_err(|e| Error::Internal(format!("Failed to write snapshot entry: {}", e)))?;
         }
 
-        let _metadata = writer.finalize()
+        let _metadata = writer
+            .finalize()
             .map_err(|e| Error::Internal(format!("Failed to finalize snapshot: {}", e)))?;
 
         // Atomic rename
-        fs::rename(&temp_path, &path).map_err(|e| {
-            Error::Internal(format!(
-                "Failed to rename snapshot: {}",
-                e
-            ))
-        })?;
+        fs::rename(&temp_path, &path)
+            .map_err(|e| Error::Internal(format!("Failed to rename snapshot: {}", e)))?;
 
         // Update state
         if let Some(state) = self.shard_states.read().get(&shard_id) {
             state.entries_since_snapshot.store(0, Ordering::Relaxed);
             *state.last_snapshot_time.write() = Instant::now();
-            state.last_snapshot_index.store(raft_index, Ordering::Relaxed);
+            state
+                .last_snapshot_index
+                .store(raft_index, Ordering::Relaxed);
             state.last_snapshot_term.store(raft_term, Ordering::Relaxed);
         }
 
-        let file_size = fs::metadata(&path)
-            .map(|m| m.len())
-            .unwrap_or(0);
+        let file_size = fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
 
         let info = ShardSnapshotInfo {
             shard_id,
@@ -490,18 +472,11 @@ impl ShardStorageManager {
 
         let mut snapshots: Vec<ShardSnapshotInfo> = Vec::new();
 
-        for entry in fs::read_dir(&shard_dir).map_err(|e| {
-            Error::Internal(format!(
-                "Failed to read shard directory: {}",
-                e
-            ))
-        })? {
-            let entry = entry.map_err(|e| {
-                Error::Internal(format!(
-                    "Failed to read directory entry: {}",
-                    e
-                ))
-            })?;
+        for entry in fs::read_dir(&shard_dir)
+            .map_err(|e| Error::Internal(format!("Failed to read shard directory: {}", e)))?
+        {
+            let entry = entry
+                .map_err(|e| Error::Internal(format!("Failed to read directory entry: {}", e)))?;
 
             let path = entry.path();
             if path.extension().map(|e| e == "snap").unwrap_or(false) {
@@ -607,15 +582,10 @@ impl ShardStorageManager {
 
         let mut snapshots: Vec<(PathBuf, u64)> = Vec::new();
 
-        for entry in fs::read_dir(&shard_dir).map_err(|e| {
-            Error::Internal(format!(
-                "Failed to read shard directory: {}",
-                e
-            ))
-        })? {
-            let entry = entry.map_err(|e| {
-                Error::Internal(e.to_string())
-            })?;
+        for entry in fs::read_dir(&shard_dir)
+            .map_err(|e| Error::Internal(format!("Failed to read shard directory: {}", e)))?
+        {
+            let entry = entry.map_err(|e| Error::Internal(e.to_string()))?;
 
             let path = entry.path();
             if path.extension().map(|e| e == "snap").unwrap_or(false) {
@@ -629,7 +599,10 @@ impl ShardStorageManager {
         snapshots.sort_by(|a, b| b.1.cmp(&a.1));
 
         // Remove old snapshots beyond max_snapshots_per_shard
-        for (path, index) in snapshots.into_iter().skip(self.config.max_snapshots_per_shard) {
+        for (path, index) in snapshots
+            .into_iter()
+            .skip(self.config.max_snapshots_per_shard)
+        {
             debug!(
                 shard_id = shard_id,
                 index = index,
@@ -688,7 +661,12 @@ impl ShardStorageManager {
     ///
     /// Leader hints allow fast recovery after restart by knowing which node
     /// was last known to be the leader for a shard, without waiting for gossip.
-    pub fn save_leader_hint(&self, shard_id: ShardId, leader_node_id: NodeId, epoch: u64) -> Result<()> {
+    pub fn save_leader_hint(
+        &self,
+        shard_id: ShardId,
+        leader_node_id: NodeId,
+        epoch: u64,
+    ) -> Result<()> {
         let timestamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
@@ -777,26 +755,14 @@ impl ShardStorageManager {
         let registry_path = self.registry_path();
         let temp_path = registry_path.with_extension("bin.tmp");
 
-        let data = bincode::serialize(&*self.registry.read()).map_err(|e| {
-            Error::Internal(format!(
-                "Failed to serialize registry: {}",
-                e
-            ))
-        })?;
+        let data = bincode::serialize(&*self.registry.read())
+            .map_err(|e| Error::Internal(format!("Failed to serialize registry: {}", e)))?;
 
-        fs::write(&temp_path, &data).map_err(|e| {
-            Error::Internal(format!(
-                "Failed to write registry: {}",
-                e
-            ))
-        })?;
+        fs::write(&temp_path, &data)
+            .map_err(|e| Error::Internal(format!("Failed to write registry: {}", e)))?;
 
-        fs::rename(&temp_path, &registry_path).map_err(|e| {
-            Error::Internal(format!(
-                "Failed to rename registry: {}",
-                e
-            ))
-        })?;
+        fs::rename(&temp_path, &registry_path)
+            .map_err(|e| Error::Internal(format!("Failed to rename registry: {}", e)))?;
 
         debug!("Persisted shard registry to {:?}", registry_path);
         Ok(())
@@ -920,6 +886,10 @@ mod tests {
         assert_eq!(loaded.members, vec![1, 2, 3]);
 
         // Verify registry file exists
-        assert!(temp_dir.path().join("metadata").join("shard_registry.bin").exists());
+        assert!(temp_dir
+            .path()
+            .join("metadata")
+            .join("shard_registry.bin")
+            .exists());
     }
 }

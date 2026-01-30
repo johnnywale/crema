@@ -239,10 +239,13 @@ impl FailpointRegistry {
 
     /// Get statistics for a failpoint.
     pub fn stats(&self, name: &str) -> Option<FailpointStats> {
-        self.failpoints.read().get(name).map(|state| FailpointStats {
-            hit_count: state.hit_count.load(Ordering::Relaxed),
-            triggered_count: state.triggered_count.load(Ordering::Relaxed),
-        })
+        self.failpoints
+            .read()
+            .get(name)
+            .map(|state| FailpointStats {
+                hit_count: state.hit_count.load(Ordering::Relaxed),
+                triggered_count: state.triggered_count.load(Ordering::Relaxed),
+            })
     }
 
     /// Get total hits across all failpoints.
@@ -466,7 +469,10 @@ mod tests {
     #[test]
     fn test_failpoint_sleep() {
         let registry = FailpointRegistry::new();
-        registry.enable("test_sleep", FailpointAction::Sleep(Duration::from_millis(10)));
+        registry.enable(
+            "test_sleep",
+            FailpointAction::Sleep(Duration::from_millis(10)),
+        );
 
         let result = registry.check("test_sleep");
         assert!(matches!(result, FailpointResult::Sleep(_)));
@@ -475,7 +481,10 @@ mod tests {
     #[tokio::test]
     async fn test_failpoint_sleep_async() {
         let registry = FailpointRegistry::new();
-        registry.enable("test_sleep_async", FailpointAction::Sleep(Duration::from_millis(10)));
+        registry.enable(
+            "test_sleep_async",
+            FailpointAction::Sleep(Duration::from_millis(10)),
+        );
 
         let start = std::time::Instant::now();
         let result = registry.check_async("test_sleep_async").await;

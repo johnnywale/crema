@@ -5,12 +5,14 @@ use crate::checkpoint::{
     CheckpointManager, RaftStateProvider, SnapshotMetadata,
 };
 use crate::config::RaftConfig;
+use crate::config::RaftStorageType;
 use crate::consensus::flow_control::FlowControl;
 use crate::consensus::health::{HealthChecker, HealthReport, HealthStatus};
 use crate::consensus::state_machine::CacheStateMachine;
-use crate::config::RaftStorageType;
 use crate::consensus::storage::RaftStorage;
-use crate::consensus::transport::{BackpressureCallback, RaftTransport};
+use crate::consensus::transport::{
+    BackpressureCallback, RaftMessageSender, RaftTransport, TransportConfig,
+};
 use crate::error::{RaftError, Result};
 use crate::network::rpc::Message;
 use crate::types::{CacheCommand, NodeId, ProposalResult};
@@ -23,7 +25,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, oneshot};
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, warn};
 
 /// Pending proposal waiting for commit.
 struct PendingProposal {
@@ -43,7 +45,8 @@ pub struct RaftNode {
     state_machine: Arc<CacheStateMachine>,
 
     /// Transport for sending messages.
-    transport: Arc<RaftTransport>,
+    /// Uses trait object to allow injection of shard-aware transport for Multi-Raft.
+    transport: Arc<dyn RaftMessageSender>,
 
     /// Pending proposals indexed by proposal ID.
     pending: Arc<Mutex<HashMap<u64, PendingProposal>>>,
@@ -80,13 +83,107 @@ pub struct RaftNode {
 }
 
 impl RaftNode {
-    /// Create a new Raft node.
+    /// Create a new Raft node with the default RaftTransport.
+    ///
+    /// This is the standard constructor for single-Raft setups. It creates
+    /// a new `RaftTransport` internally for message sending with backpressure
+    /// callback wired up to the flow control system.
+    ///
+    /// For Multi-Raft setups that require shard-aware routing, use
+    /// `new_with_transport()` instead.
     pub fn new(
         id: NodeId,
         peers: Vec<NodeId>,
         config: RaftConfig,
         state_machine: Arc<CacheStateMachine>,
         local_addr: String,
+    ) -> Result<Arc<Self>> {
+        // Create flow control for backpressure handling
+        let flow_control = Arc::new(FlowControl::new(config.max_inflight_msgs));
+
+        // Create backpressure callback wired to flow control
+        let flow_control_for_callback = flow_control.clone();
+        let node_id_for_callback = id;
+        let backpressure_callback: BackpressureCallback = Arc::new(move |event| {
+            debug!(
+                node_id = node_id_for_callback,
+                "Backpressure event received: {:?}", event
+            );
+            flow_control_for_callback.handle_backpressure_event(event);
+        });
+
+        // Create transport with backpressure callback wired up
+        let transport = Arc::new(RaftTransport::with_backpressure_callback(
+            id,
+            TransportConfig::default(),
+            backpressure_callback,
+        ));
+
+        Self::new_with_transport_and_flow_control(
+            id,
+            peers,
+            config,
+            state_machine,
+            local_addr,
+            transport,
+            Some(flow_control),
+        )
+    }
+
+    /// Create a new Raft node with a custom message sender.
+    ///
+    /// This constructor allows injection of a custom `RaftMessageSender` implementation,
+    /// enabling shard-aware message routing for Multi-Raft setups.
+    ///
+    /// Note: When using a custom transport, backpressure callbacks must be wired up
+    /// separately by the caller, as the transport is already created.
+    ///
+    /// # Arguments
+    ///
+    /// * `id` - This node's ID
+    /// * `peers` - Initial peers in the Raft cluster
+    /// * `config` - Raft configuration
+    /// * `state_machine` - State machine for applying committed entries
+    /// * `local_addr` - This node's address (for responding to pings)
+    /// * `transport` - Custom message sender (e.g., `ShardRaftTransport` for Multi-Raft)
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// // For Multi-Raft: use ShardRaftTransport
+    /// let shard_transport = Arc::new(ShardRaftTransport::new(shard_id, multiplexer));
+    /// let node = RaftNode::new_with_transport(id, peers, config, sm, addr, shard_transport)?;
+    /// ```
+    pub fn new_with_transport(
+        id: NodeId,
+        peers: Vec<NodeId>,
+        config: RaftConfig,
+        state_machine: Arc<CacheStateMachine>,
+        local_addr: String,
+        transport: Arc<dyn RaftMessageSender>,
+    ) -> Result<Arc<Self>> {
+        Self::new_with_transport_and_flow_control(
+            id,
+            peers,
+            config,
+            state_machine,
+            local_addr,
+            transport,
+            None, // Flow control created internally
+        )
+    }
+
+    /// Internal constructor with optional pre-created flow control.
+    ///
+    /// This allows `new()` to wire up backpressure callbacks before transport creation.
+    fn new_with_transport_and_flow_control(
+        id: NodeId,
+        peers: Vec<NodeId>,
+        config: RaftConfig,
+        state_machine: Arc<CacheStateMachine>,
+        local_addr: String,
+        transport: Arc<dyn RaftMessageSender>,
+        flow_control: Option<Arc<FlowControl>>,
     ) -> Result<Arc<Self>> {
         // Create storage with initial voters
         let mut voters = peers.clone();
@@ -150,24 +247,9 @@ impl RaftNode {
             );
         }
 
-        // Create transport
-        let transport = Arc::new(RaftTransport::new(id));
-
-        // Create flow control with configurable max inflight
-        let flow_control = Arc::new(FlowControl::new(config.max_inflight_msgs as usize));
-
-        // Register backpressure callback
-        // Note: The callback is prepared here for future integration when
-        // RaftTransport supports setting callbacks after creation.
-        let flow_control_for_callback = flow_control.clone();
-        let node_id_for_callback = id;
-        let _backpressure_callback: BackpressureCallback = Arc::new(move |event| {
-            debug!(
-                node_id = node_id_for_callback,
-                "Backpressure event received: {:?}", event
-            );
-            flow_control_for_callback.handle_backpressure_event(event);
-        });
+        // Use provided flow control or create new one
+        let flow_control =
+            flow_control.unwrap_or_else(|| Arc::new(FlowControl::new(config.max_inflight_msgs)));
 
         let raft_node = Arc::new(Self {
             node: Arc::new(Mutex::new(node)),
@@ -283,12 +365,17 @@ impl RaftNode {
     /// Internal method to create Raft snapshot at a specific index/term.
     fn create_raft_snapshot_internal(&self, index: u64, term: u64) -> Result<()> {
         // Collect all entries from the cache with expiration times
-        let entries = self.state_machine.storage().collect_entries_with_expiration();
+        let entries = self
+            .state_machine
+            .storage()
+            .collect_entries_with_expiration();
         let entry_count = entries.len();
 
         // Serialize entries using LZ4 compression (includes expiration times)
         let data = serialize_snapshot_data(
-            entries.iter().map(|(k, v, expires)| (k.as_ref(), v.as_ref(), *expires)),
+            entries
+                .iter()
+                .map(|(k, v, expires)| (k.as_ref(), v.as_ref(), *expires)),
         )
         .map_err(|e| RaftError::Internal(format!("Failed to serialize snapshot data: {}", e)))?;
 
@@ -297,9 +384,11 @@ impl RaftNode {
         // Get current conf_state from storage
         let conf_state = {
             let node = self.node.lock();
-            node.raft.store().initial_state().map_err(|e| {
-                RaftError::Internal(format!("Failed to get conf_state: {}", e))
-            })?.conf_state
+            node.raft
+                .store()
+                .initial_state()
+                .map_err(|e| RaftError::Internal(format!("Failed to get conf_state: {}", e)))?
+                .conf_state
         };
 
         // Create Raft Snapshot
@@ -314,11 +403,7 @@ impl RaftNode {
 
         debug!(
             node_id = self.id,
-            index,
-            term,
-            entry_count,
-            data_size,
-            "Created Raft snapshot for InstallSnapshot RPC"
+            index, term, entry_count, data_size, "Created Raft snapshot for InstallSnapshot RPC"
         );
 
         Ok(())
@@ -415,8 +500,12 @@ impl RaftNode {
         self.leader_id() == Some(self.id)
     }
 
-    /// Get the transport for adding peers.
-    pub fn transport(&self) -> &Arc<RaftTransport> {
+    /// Get the transport for adding peers and sending messages.
+    ///
+    /// Returns a reference to the message sender trait object, which may be
+    /// either a `RaftTransport` (for single-Raft) or a `ShardRaftTransport`
+    /// (for Multi-Raft).
+    pub fn transport(&self) -> &Arc<dyn RaftMessageSender> {
         &self.transport
     }
 
@@ -469,6 +558,7 @@ impl RaftNode {
     /// - `Ok(read_index)` - The index at which the read is linearizable
     /// - `Err(NotLeader)` - This node is not the leader
     /// - `Err(Timeout)` - Read-Index request timed out
+    #[allow(clippy::await_holding_lock)]
     pub async fn read_index(&self) -> Result<u64> {
         // Step 1: Check if we're the leader
         if !self.is_leader() {
@@ -490,7 +580,7 @@ impl RaftNode {
         // Step 3: Request read index from Raft
         {
             let mut node = self.node.lock();
-            node.read_index(ctx.clone().into());
+            node.read_index(ctx.clone());
         }
 
         // Step 4: Wait for ReadState with our context
@@ -555,10 +645,10 @@ impl RaftNode {
                                         applied = self.applied_index(),
                                         "READ_INDEX: Timeout waiting for apply"
                                     );
-                                    return Err(
-                                        RaftError::Internal("read-index apply timeout".to_string())
-                                            .into(),
-                                    );
+                                    return Err(RaftError::Internal(
+                                        "read-index apply timeout".to_string(),
+                                    )
+                                    .into());
                                 }
                                 tokio::task::yield_now().await;
                             }
@@ -704,25 +794,21 @@ impl RaftNode {
         }
 
         // Don't add a node that's already a voter
-        if change_type == raft::prelude::ConfChangeType::AddNode {
-            if self.voters().contains(&node_id) {
-                debug!(
-                    "CONF_CHANGE: Node {} is already a voter, skipping",
-                    node_id
-                );
-                return Ok(());
-            }
+        if change_type == raft::prelude::ConfChangeType::AddNode && self.voters().contains(&node_id)
+        {
+            debug!("CONF_CHANGE: Node {} is already a voter, skipping", node_id);
+            return Ok(());
         }
 
         // Don't remove a node that's not a voter
-        if change_type == raft::prelude::ConfChangeType::RemoveNode {
-            if !self.voters().contains(&node_id) {
-                debug!(
-                    "CONF_CHANGE: Node {} is not a voter, skipping removal",
-                    node_id
-                );
-                return Ok(());
-            }
+        if change_type == raft::prelude::ConfChangeType::RemoveNode
+            && !self.voters().contains(&node_id)
+        {
+            debug!(
+                "CONF_CHANGE: Node {} is not a voter, skipping removal",
+                node_id
+            );
+            return Ok(());
         }
 
         // Create ConfChange
@@ -956,13 +1042,11 @@ impl RaftNode {
                 }
                 None
             }
-            Message::Ping(_ping) => {
-                Some(Message::Pong(crate::network::rpc::PongResponse {
-                    node_id: self.id,
-                    raft_addr: self.local_addr.clone(),
-                    leader_id: self.leader_id(),
-                }))
-            }
+            Message::Ping(_ping) => Some(Message::Pong(crate::network::rpc::PongResponse {
+                node_id: self.id,
+                raft_addr: self.local_addr.clone(),
+                leader_id: self.leader_id(),
+            })),
             Message::ForwardedCommand(fwd) => {
                 self.handle_forwarded_command(fwd);
                 None // Response sent asynchronously
@@ -976,6 +1060,7 @@ impl RaftNode {
     /// This is called on the leader when it receives a ForwardedCommand.
     /// For write operations, the leader proposes the command to Raft.
     /// For GET operations, the leader performs a linearizable read using read_index.
+    #[allow(clippy::await_holding_lock)]
     fn handle_forwarded_command(&self, fwd: crate::network::rpc::ForwardedCommand) {
         use crate::network::rpc::ForwardResponse;
         use crate::types::CacheCommand;
@@ -1000,10 +1085,8 @@ impl RaftNode {
                 request_id = request_id,
                 "FORWARD: TTL expired, rejecting"
             );
-            let response = Message::ForwardResponse(ForwardResponse::error(
-                request_id,
-                "TTL expired",
-            ));
+            let response =
+                Message::ForwardResponse(ForwardResponse::error(request_id, "TTL expired"));
             let transport = self.transport.clone();
             tokio::spawn(async move {
                 if let Err(e) = transport.send_message(origin_node_id, response).await {
@@ -1057,9 +1140,10 @@ impl RaftNode {
                     "FORWARD: GET completed successfully"
                 );
 
-                let response = Message::ForwardResponse(
-                    ForwardResponse::success_with_value(request_id, value_bytes)
-                );
+                let response = Message::ForwardResponse(ForwardResponse::success_with_value(
+                    request_id,
+                    value_bytes,
+                ));
 
                 if let Err(e) = transport.send_message(origin_node_id, response).await {
                     warn!(error = %e, "Failed to send ForwardResponse for GET");
@@ -1080,10 +1164,8 @@ impl RaftNode {
         tokio::spawn(async move {
             // Pre-validate command
             if let Err(e) = Self::validate_command(&command) {
-                let response = Message::ForwardResponse(ForwardResponse::error(
-                    request_id,
-                    e.to_string(),
-                ));
+                let response =
+                    Message::ForwardResponse(ForwardResponse::error(request_id, e.to_string()));
                 if let Err(e) = transport.send_message(origin_node_id, response).await {
                     warn!(error = %e, "Failed to send ForwardResponse (validation failed)");
                 }
@@ -1094,10 +1176,8 @@ impl RaftNode {
             let data = match command.to_bytes() {
                 Ok(d) => d,
                 Err(e) => {
-                    let response = Message::ForwardResponse(ForwardResponse::error(
-                        request_id,
-                        e.to_string(),
-                    ));
+                    let response =
+                        Message::ForwardResponse(ForwardResponse::error(request_id, e.to_string()));
                     if let Err(e) = transport.send_message(origin_node_id, response).await {
                         warn!(error = %e, "Failed to send ForwardResponse (serialization failed)");
                     }
@@ -1120,10 +1200,8 @@ impl RaftNode {
                 let context = proposal_id.to_le_bytes().to_vec();
                 if let Err(e) = node.propose(context, data) {
                     pending.lock().remove(&proposal_id);
-                    let response = Message::ForwardResponse(ForwardResponse::error(
-                        request_id,
-                        e.to_string(),
-                    ));
+                    let response =
+                        Message::ForwardResponse(ForwardResponse::error(request_id, e.to_string()));
                     if let Err(e) = transport.send_message(origin_node_id, response).await {
                         warn!(error = %e, "Failed to send ForwardResponse (propose failed)");
                     }
@@ -1264,6 +1342,7 @@ impl RaftNode {
     /// CRITICAL FIX: To prevent "not leader but has new msg after advance" panic,
     /// we must hold the lock from ready() through advance(). The panic occurs when
     /// step() changes leadership status between ready() and advance().
+    #[allow(clippy::await_holding_lock)]
     pub async fn process_ready(&self) {
         // Report unreachable peers to Raft before processing ready
         let unreachable_peers = self.flow_control.unreachable_peers();
@@ -1656,7 +1735,17 @@ impl RaftNode {
         // Apply the conf change to the raft node
         let conf_state = {
             let mut node = self.node.lock();
-            let conf_state = node.apply_conf_change(&cc).expect("apply_conf_change failed");
+            let conf_state = match node.apply_conf_change(&cc) {
+                Ok(cs) => cs,
+                Err(e) => {
+                    error!(
+                        node_id = self.id,
+                        error = %e,
+                        "APPLY_CONF_CHANGE: Failed to apply conf change"
+                    );
+                    return;
+                }
+            };
             debug!(
                 node_id = self.id,
                 "APPLY_CONF_CHANGE: New conf_state - voters={:?}, learners={:?}",
@@ -1682,8 +1771,7 @@ impl RaftNode {
         } else if cc.get_change_type() == raft::prelude::ConfChangeType::RemoveNode {
             debug!(
                 node_id = self.id,
-                "APPLY_CONF_CHANGE: Removing peer {} from transport",
-                cc.node_id
+                "APPLY_CONF_CHANGE: Removing peer {} from transport", cc.node_id
             );
             self.transport.remove_peer(cc.node_id);
         }
@@ -1745,14 +1833,10 @@ impl RaftNode {
     pub async fn run_tick_loop(self: Arc<Self>, mut shutdown_rx: mpsc::Receiver<()>) {
         let tick_interval = Duration::from_millis(self.config.tick_interval_ms);
         let mut interval = tokio::time::interval(tick_interval);
-        let mut tick_count = 0u64;
 
         loop {
             tokio::select! {
                 _ = interval.tick() => {
-                    tick_count += 1;
-                    // debug!("TICK_LOOP: node={} tick #{}, term={}, is_leader={}",
-                    //     self.id, tick_count, self.term(), self.is_leader());
                     self.tick();
                     self.process_ready().await;
                     // 关键：强制 yield，让异步发送任务有机会运行
@@ -1818,6 +1902,7 @@ impl RaftNode {
     /// 3. Processes final ready state
     /// 4. Shuts down transport
     /// 5. Optionally creates a final snapshot
+    #[allow(clippy::await_holding_lock)]
     pub async fn shutdown(self: Arc<Self>) -> Result<()> {
         debug!(node_id = self.id, "Starting graceful shutdown");
 
@@ -1921,7 +2006,7 @@ impl std::fmt::Debug for RaftNode {
     }
 }
 
-/// Implement RaftStateProvider for Arc<RaftNode> to allow checkpoint manager
+/// Implement `RaftStateProvider` for `Arc<RaftNode>` to allow checkpoint manager
 /// to query the current applied state.
 impl RaftStateProvider for Arc<RaftNode> {
     fn get_applied_state(&self) -> (u64, u64) {

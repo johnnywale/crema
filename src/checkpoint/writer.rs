@@ -17,9 +17,7 @@ enum WriterInner {
         encoder: FrameEncoder<CrcWriter<BufWriter<File>>>,
     },
     /// Uncompressed output with CRC tracking
-    Uncompressed {
-        writer: CrcWriter<BufWriter<File>>,
-    },
+    Uncompressed { writer: CrcWriter<BufWriter<File>> },
 }
 
 /// Wrapper that calculates CRC32 while writing.

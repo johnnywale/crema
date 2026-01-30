@@ -50,13 +50,15 @@ impl ConsistencyChecker {
 
     /// Record a write operation.
     pub fn record_write(&mut self, key: &str, value: &str) {
-        self.expected_state.insert(key.to_string(), value.to_string());
+        self.expected_state
+            .insert(key.to_string(), value.to_string());
         self.deleted_keys.remove(key);
     }
 
     /// Record a write operation with TTL.
     pub fn record_write_with_ttl(&mut self, key: &str, value: &str) {
-        self.expected_state.insert(key.to_string(), value.to_string());
+        self.expected_state
+            .insert(key.to_string(), value.to_string());
         self.deleted_keys.remove(key);
         self.ttl_keys.insert(key.to_string());
     }
@@ -157,17 +159,16 @@ impl ConsistencyChecker {
                     // Expected
                 }
                 Err(e) => {
-                    errors.push(format!("Key '{}': read error checking deletion: {}", key, e));
+                    errors.push(format!(
+                        "Key '{}': read error checking deletion: {}",
+                        key, e
+                    ));
                 }
             }
         }
 
         if errors.is_empty() {
-            info!(
-                node_id,
-                checked,
-                "Node verification passed"
-            );
+            info!(node_id, checked, "Node verification passed");
             Ok(())
         } else {
             error!(

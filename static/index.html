@@ -1,0 +1,319 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Crema Dashboard</title>
+    <link rel="stylesheet" href="/styles.css">
+    <script defer src="https://cdn.jsdelivr.net/npm/alpinejs@3.x.x/dist/cdn.min.js"></script>
+    <script src="/app.js"></script>
+</head>
+<body>
+    <div class="container" x-data="dashboard">
+        <!-- Header -->
+        <header>
+            <h1>Crema Dashboard</h1>
+            <div class="node-info">
+                <div class="connection-status">
+                    <span class="status-dot" :class="connected ? 'connected' : 'disconnected'"></span>
+                    <span x-text="connected ? 'Connected' : 'Disconnected'"></span>
+                </div>
+                <span class="badge badge-node" x-text="'Node ' + nodeId"></span>
+                <span class="badge" :class="isLeader ? 'badge-leader' : 'badge-follower'"
+                      x-text="isLeader ? 'Leader' : 'Follower'"></span>
+            </div>
+        </header>
+
+        <!-- Stats Grid -->
+        <div class="dashboard-grid">
+            <!-- Cluster Status -->
+            <div class="card">
+                <div class="card-header">
+                    <span class="card-title">Cluster Status</span>
+                </div>
+                <div class="stat-grid">
+                    <div class="stat-item">
+                        <span class="stat-label">Term</span>
+                        <span class="stat-value" x-text="term"></span>
+                    </div>
+                    <div class="stat-item">
+                        <span class="stat-label">Leader</span>
+                        <span class="stat-value" x-text="leaderId !== null ? 'Node ' + leaderId : 'None'"></span>
+                    </div>
+                    <div class="stat-item">
+                        <span class="stat-label">Peers</span>
+                        <span class="stat-value" x-text="raftPeerCount"></span>
+                    </div>
+                    <div class="stat-item">
+                        <span class="stat-label">Applied</span>
+                        <span class="stat-value" x-text="formatNumber(appliedIndex)"></span>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Cache Stats -->
+            <div class="card">
+                <div class="card-header">
+                    <span class="card-title">Cache Stats</span>
+                </div>
+                <div class="stat-grid">
+                    <div class="stat-item">
+                        <span class="stat-label">Entries</span>
+                        <span class="stat-value info" x-text="formatNumber(entryCount)"></span>
+                    </div>
+                    <div class="stat-item">
+                        <span class="stat-label">Hit Rate</span>
+                        <span class="stat-value success" x-text="formatPercent(hitRate)"></span>
+                    </div>
+                    <div class="stat-item">
+                        <span class="stat-label">Hits</span>
+                        <span class="stat-value" x-text="formatNumber(hits)"></span>
+                    </div>
+                    <div class="stat-item">
+                        <span class="stat-label">Misses</span>
+                        <span class="stat-value" x-text="formatNumber(misses)"></span>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Throughput -->
+            <div class="card">
+                <div class="card-header">
+                    <span class="card-title">Throughput</span>
+                </div>
+                <div class="throughput-display">
+                    <div class="throughput-value" x-text="formatOpsPerSec(operationsPerSec)"></div>
+                    <div class="throughput-unit">ops/sec</div>
+                </div>
+                <div class="stat-grid" style="margin-top: 1rem;">
+                    <div class="stat-item">
+                        <span class="stat-label">GETs</span>
+                        <span class="stat-value" x-text="formatNumber(getTotal)"></span>
+                    </div>
+                    <div class="stat-item">
+                        <span class="stat-label">PUTs</span>
+                        <span class="stat-value" x-text="formatNumber(putTotal)"></span>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Cache Operations -->
+        <div class="card operations-card">
+            <div class="card-header">
+                <span class="card-title">Cache Operations</span>
+            </div>
+            <div class="operations-form" :class="{ 'loading': opLoading }">
+                <div class="form-group">
+                    <label>Key</label>
+                    <input type="text" x-model="opKey" placeholder="user:123" @keyup.enter="doPut()">
+                </div>
+                <div class="form-group">
+                    <label>Value</label>
+                    <input type="text" x-model="opValue" placeholder="Alice" @keyup.enter="doPut()">
+                </div>
+                <div class="form-group">
+                    <label>TTL (sec)</label>
+                    <input type="number" x-model="opTtl" placeholder="60" style="width: 80px;">
+                </div>
+                <div class="btn-group">
+                    <button class="btn btn-success" @click="doPut()">PUT</button>
+                    <button class="btn btn-primary" @click="doGet()">GET</button>
+                    <button class="btn btn-danger" @click="doDelete()">DELETE</button>
+                    <button class="btn btn-secondary" @click="clearForm()">Clear</button>
+                </div>
+            </div>
+            <div class="operation-result" x-show="opResult" :class="opResultType" x-text="opResult"></div>
+        </div>
+
+        <!-- Slot Routing Status (shown only if enabled) -->
+        <div class="card" x-show="slotRoutingEnabled">
+            <div class="card-header">
+                <span class="card-title">Slot Routing</span>
+                <span class="badge badge-info" x-text="'Epoch ' + slotEpoch"></span>
+            </div>
+            <div class="stat-grid">
+                <div class="stat-item">
+                    <span class="stat-label">Total Slots</span>
+                    <span class="stat-value" x-text="totalSlots"></span>
+                </div>
+                <div class="stat-item">
+                    <span class="stat-label">Active Migrations</span>
+                    <span class="stat-value" :class="activeMigrations > 0 ? 'warning' : ''" x-text="activeMigrations"></span>
+                </div>
+                <div class="stat-item">
+                    <span class="stat-label">Completed</span>
+                    <span class="stat-value success" x-text="completedMigrations"></span>
+                </div>
+                <div class="stat-item">
+                    <span class="stat-label">Keys Migrated</span>
+                    <span class="stat-value" x-text="formatNumber(totalKeysMigrated)"></span>
+                </div>
+            </div>
+        </div>
+
+        <!-- Multi-Raft Shards (shown only if enabled) -->
+        <div class="card" x-show="multiraftEnabled">
+            <div class="card-header">
+                <span class="card-title">Shard Distribution (<span x-text="totalShards"></span> shards)</span>
+                <div class="shard-header-right">
+                    <span class="badge badge-node" x-text="localLeaderShards + ' local leaders'"></span>
+                    <div class="shard-controls" x-show="slotRoutingEnabled">
+                        <button class="btn btn-sm btn-success" @click="addShard()" :disabled="shardOperationLoading">
+                            + Add Shard
+                        </button>
+                        <button class="btn btn-sm btn-danger" @click="showRemoveShardDialog()" :disabled="shardOperationLoading || totalShards <= 1">
+                            - Remove
+                        </button>
+                    </div>
+                </div>
+            </div>
+            <div class="shard-grid">
+                <template x-for="shard in shards" :key="shard.shard_id">
+                    <div class="shard-item" :class="getShardClass(shard)">
+                        <div class="shard-id" x-text="'S' + shard.shard_id"></div>
+                        <div class="shard-leader" x-text="getLeaderDisplay(shard)"></div>
+                        <div class="shard-slots">
+                            <span x-text="shard.slot_count + ' slots'"></span>
+                            <span x-show="shard.incoming_slots > 0" class="migration-in">+<span x-text="shard.incoming_slots"></span></span>
+                            <span x-show="shard.outgoing_slots > 0" class="migration-out">-<span x-text="shard.outgoing_slots"></span></span>
+                        </div>
+                        <div class="shard-entries" x-text="formatNumber(shard.entry_count)"></div>
+                        <div class="slot-bar">
+                            <div class="slot-bar-fill" :style="'width:' + (shard.slot_count / 10.24) + '%'"></div>
+                        </div>
+                    </div>
+                </template>
+            </div>
+            <div class="shard-total" x-show="totalEntries > 0">
+                Total: <span x-text="formatNumber(totalEntries)"></span> entries
+            </div>
+        </div>
+
+        <!-- Remove Shard Dialog -->
+        <div class="modal-overlay" x-show="showRemoveDialog" @click.self="showRemoveDialog = false">
+            <div class="modal-dialog">
+                <div class="modal-header">
+                    <span class="modal-title">Remove Shard</span>
+                    <button class="modal-close" @click="showRemoveDialog = false">&times;</button>
+                </div>
+                <div class="modal-body">
+                    <p>Select a shard to remove:</p>
+                    <div class="shard-select-grid">
+                        <template x-for="shard in shards" :key="'remove-' + shard.shard_id">
+                            <button class="shard-select-btn" :class="{ 'selected': removeShardTarget === shard.shard_id }"
+                                    @click="removeShardTarget = shard.shard_id">
+                                <span x-text="'S' + shard.shard_id"></span>
+                                <span class="shard-select-info" x-text="shard.slot_count + ' slots'"></span>
+                            </button>
+                        </template>
+                    </div>
+                </div>
+                <div class="modal-footer">
+                    <button class="btn btn-secondary" @click="showRemoveDialog = false">Cancel</button>
+                    <button class="btn btn-danger" @click="removeShard()" :disabled="removeShardTarget === null">
+                        Remove Shard
+                    </button>
+                </div>
+            </div>
+        </div>
+
+        <!-- Latency -->
+        <div class="dashboard-grid">
+            <div class="card">
+                <div class="card-header">
+                    <span class="card-title">GET Latency</span>
+                </div>
+                <table class="latency-table">
+                    <thead>
+                        <tr>
+                            <th>Percentile</th>
+                            <th>Value</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        <tr>
+                            <td>p50</td>
+                            <td x-text="formatLatency(getLatencyP50)"></td>
+                        </tr>
+                        <tr>
+                            <td>p90</td>
+                            <td x-text="formatLatency(getLatencyP90)"></td>
+                        </tr>
+                        <tr>
+                            <td>p99</td>
+                            <td x-text="formatLatency(getLatencyP99)"></td>
+                        </tr>
+                        <tr>
+                            <td>avg</td>
+                            <td x-text="formatLatency(avgGetLatencyMs)"></td>
+                        </tr>
+                    </tbody>
+                </table>
+            </div>
+
+            <div class="card">
+                <div class="card-header">
+                    <span class="card-title">PUT Latency</span>
+                </div>
+                <table class="latency-table">
+                    <thead>
+                        <tr>
+                            <th>Percentile</th>
+                            <th>Value</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        <tr>
+                            <td>p50</td>
+                            <td x-text="formatLatency(putLatencyP50)"></td>
+                        </tr>
+                        <tr>
+                            <td>p90</td>
+                            <td x-text="formatLatency(putLatencyP90)"></td>
+                        </tr>
+                        <tr>
+                            <td>p99</td>
+                            <td x-text="formatLatency(putLatencyP99)"></td>
+                        </tr>
+                        <tr>
+                            <td>avg</td>
+                            <td x-text="formatLatency(avgPutLatencyMs)"></td>
+                        </tr>
+                    </tbody>
+                </table>
+            </div>
+
+            <div class="card">
+                <div class="card-header">
+                    <span class="card-title">Operations</span>
+                </div>
+                <div class="stat-grid">
+                    <div class="stat-item">
+                        <span class="stat-label">PUT Success</span>
+                        <span class="stat-value success" x-text="formatNumber(putSuccess)"></span>
+                    </div>
+                    <div class="stat-item">
+                        <span class="stat-label">PUT Failures</span>
+                        <span class="stat-value error" x-text="formatNumber(putFailures)"></span>
+                    </div>
+                    <div class="stat-item">
+                        <span class="stat-label">Active Shards</span>
+                        <span class="stat-value" x-text="activeShards || '-'"></span>
+                    </div>
+                    <div class="stat-item">
+                        <span class="stat-label">Multi-Raft</span>
+                        <span class="stat-value" :class="multiraftEnabled ? 'success' : ''"
+                              x-text="multiraftEnabled ? 'Enabled' : 'Disabled'"></span>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Footer -->
+        <footer style="text-align: center; padding: 2rem 0; color: var(--text-muted); font-size: 0.875rem;">
+            Crema Distributed Cache Dashboard
+        </footer>
+    </div>
+</body>
+</html>

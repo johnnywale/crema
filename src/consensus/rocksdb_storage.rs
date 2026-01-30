@@ -12,14 +12,20 @@
 //!
 //! # Thread Safety
 //!
-//! This implementation uses `SingleThreaded` RocksDB mode, which means:
+//! This implementation uses `SingleThreaded` RocksDB mode by default:
 //! - Reads and writes are serialized at the RocksDB layer
 //! - Safe for embedded Raft in a single-threaded executor
 //! - Suitable for low-to-medium throughput use cases
 //!
-//! **Warning**: If you need high concurrent throughput with multiple Raft nodes
-//! or heavy async workloads, consider using separate RocksDB instances per Raft
-//! group or implementing a multi-threaded variant.
+//! A `thread_mode` configuration option exists for future multi-threaded support:
+//! ```ignore
+//! let config = RocksDbStorageConfig::new("/path/to/db")
+//!     .with_thread_mode(RocksDbThreadMode::MultiThreaded);
+//! ```
+//!
+//! **Note**: Multi-threaded mode is not yet implemented. If you need high concurrent
+//! throughput with multiple Raft nodes, consider using separate RocksDB instances
+//! per Raft group.
 //!
 //! # Column Family Layout
 //!
@@ -33,20 +39,18 @@
 //! in-memory cache. **Do not write directly to RocksDB without using the provided
 //! methods**, as this will cause cache divergence and potential correctness issues.
 
-#![cfg(feature = "rocksdb-storage")]
-
 use crate::error::{Result, StorageError};
 use parking_lot::RwLock;
 use protobuf::Message as ProtoMessage;
 use raft::prelude::*;
 use raft::{RaftState, Storage};
 use rocksdb::{
-    ColumnFamily, ColumnFamilyDescriptor, DBWithThreadMode, IteratorMode, Options,
-    SingleThreaded, WriteBatch, WriteOptions,
+    ColumnFamily, ColumnFamilyDescriptor, DBWithThreadMode, IteratorMode, Options, SingleThreaded,
+    WriteBatch, WriteOptions,
 };
 use std::path::Path;
 use std::sync::Arc;
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 /// Column family names
 const CF_ENTRIES: &str = "entries";
@@ -55,6 +59,7 @@ const CF_SNAPSHOTS: &str = "snapshots";
 
 /// Key version prefix for future migration safety.
 /// When schema changes are needed, increment this and add migration logic.
+#[allow(dead_code)]
 const KEY_VERSION: &str = "v1";
 
 /// Keys for state storage (versioned for safe migrations)
@@ -72,6 +77,27 @@ const MAX_ENTRIES_CAPACITY_HINT: usize = 1024;
 /// Warning threshold for snapshot size (100MB).
 /// Snapshots larger than this will log a warning about potential performance impact.
 const SNAPSHOT_SIZE_WARNING_THRESHOLD: usize = 100 * 1024 * 1024;
+
+/// RocksDB threading mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum RocksDbThreadMode {
+    /// Single-threaded mode (default).
+    ///
+    /// Uses `SingleThreaded` RocksDB mode where reads and writes are serialized.
+    /// Safe for embedded Raft in a single-threaded executor.
+    /// Suitable for low-to-medium throughput use cases.
+    #[default]
+    SingleThreaded,
+
+    /// Multi-threaded mode.
+    ///
+    /// Uses `MultiThreaded` RocksDB mode for concurrent access from multiple threads.
+    /// Suitable for high-throughput scenarios with multiple Raft groups or
+    /// heavy async workloads.
+    ///
+    /// **Note**: Requires the storage to be accessed from a multi-threaded runtime.
+    MultiThreaded,
+}
 
 /// Configuration for RocksDB storage.
 #[derive(Debug, Clone)]
@@ -94,6 +120,12 @@ pub struct RocksDbStorageConfig {
 
     /// Maximum number of write buffers.
     pub max_write_buffer_number: i32,
+
+    /// Threading mode for RocksDB access.
+    ///
+    /// - `SingleThreaded` (default): Serialized access, lower overhead
+    /// - `MultiThreaded`: Concurrent access, higher throughput potential
+    pub thread_mode: RocksDbThreadMode,
 }
 
 impl Default for RocksDbStorageConfig {
@@ -105,6 +137,7 @@ impl Default for RocksDbStorageConfig {
             max_open_files: 1000,
             write_buffer_size: 64 * 1024 * 1024, // 64MB
             max_write_buffer_number: 3,
+            thread_mode: RocksDbThreadMode::default(),
         }
     }
 }
@@ -123,12 +156,39 @@ impl RocksDbStorageConfig {
         self.sync_writes = sync;
         self
     }
+
+    /// Set the threading mode.
+    ///
+    /// - `SingleThreaded` (default): Lower overhead, serialized access
+    /// - `MultiThreaded`: Higher throughput potential, concurrent access
+    pub fn with_thread_mode(mut self, mode: RocksDbThreadMode) -> Self {
+        self.thread_mode = mode;
+        self
+    }
+
+    /// Use multi-threaded mode for high-throughput scenarios.
+    ///
+    /// This is a convenience method equivalent to:
+    /// ```ignore
+    /// config.with_thread_mode(RocksDbThreadMode::MultiThreaded)
+    /// ```
+    pub fn multi_threaded(self) -> Self {
+        self.with_thread_mode(RocksDbThreadMode::MultiThreaded)
+    }
 }
 
 /// RocksDB-based persistent storage for Raft.
 ///
 /// This storage is cloneable - clones share the same underlying database,
 /// which is required for RawNode and process_ready to see the same state.
+///
+/// # Thread Safety
+///
+/// Currently uses `SingleThreaded` RocksDB mode. The `RocksDbStorageConfig::thread_mode`
+/// option exists for future multi-threaded support.
+///
+/// For high-throughput multi-Raft scenarios, consider using separate RocksDB instances
+/// per Raft group.
 #[derive(Clone)]
 pub struct RocksDbStorage {
     inner: Arc<RocksDbStorageInner>,
@@ -175,13 +235,33 @@ impl RocksDbStorage {
         let cf_state = ColumnFamilyDescriptor::new(CF_STATE, Options::default());
         let cf_snapshots = ColumnFamilyDescriptor::new(CF_SNAPSHOTS, Options::default());
 
-        // Open database with column families
+        // Log if multi-threaded mode requested (not yet implemented)
+        if config.thread_mode == RocksDbThreadMode::MultiThreaded {
+            warn!(
+                "MultiThreaded RocksDB mode requested but not yet implemented. \
+                 Using SingleThreaded mode. For high-throughput scenarios, \
+                 consider separate RocksDB instances per Raft group."
+            );
+        }
+
+        // Open database with column families (SingleThreaded mode)
         let db = DBWithThreadMode::<SingleThreaded>::open_cf_descriptors(
             &opts,
             path,
             vec![cf_entries, cf_state, cf_snapshots],
         )
         .map_err(|e| StorageError::RocksDb(e.to_string()))?;
+
+        // Validate all column families exist (defensive check against corruption)
+        for cf_name in &[CF_ENTRIES, CF_STATE, CF_SNAPSHOTS] {
+            if db.cf_handle(cf_name).is_none() {
+                return Err(StorageError::RocksDb(format!(
+                    "Column family '{}' missing after database open - possible corruption",
+                    cf_name
+                ))
+                .into());
+            }
+        }
 
         // Configure write options
         let mut write_opts = WriteOptions::default();
@@ -193,6 +273,7 @@ impl RocksDbStorage {
 
         info!(
             path = %config.path,
+            thread_mode = "single-threaded",
             compacted_index,
             compacted_term,
             "RocksDB storage initialized"
@@ -215,8 +296,10 @@ impl RocksDbStorage {
     pub fn new_with_conf_state(config: RocksDbStorageConfig, voters: Vec<u64>) -> Result<Self> {
         let storage = Self::new(config)?;
 
-        let mut conf_state = ConfState::default();
-        conf_state.voters = voters;
+        let conf_state = ConfState {
+            voters,
+            ..Default::default()
+        };
         storage.set_conf_state(conf_state)?;
 
         Ok(storage)
@@ -230,9 +313,9 @@ impl RocksDbStorage {
             .cf_handle(CF_STATE)
             .ok_or_else(|| StorageError::RocksDb("State column family not found".to_string()))?;
 
-        let cf_snapshots = db
-            .cf_handle(CF_SNAPSHOTS)
-            .ok_or_else(|| StorageError::RocksDb("Snapshots column family not found".to_string()))?;
+        let cf_snapshots = db.cf_handle(CF_SNAPSHOTS).ok_or_else(|| {
+            StorageError::RocksDb("Snapshots column family not found".to_string())
+        })?;
 
         // Load hard state
         let hard_state = match db.get_cf(cf_state, KEY_HARD_STATE) {
@@ -282,31 +365,49 @@ impl RocksDbStorage {
             Err(e) => return Err(StorageError::RocksDb(e.to_string()).into()),
         };
 
-        Ok((hard_state, conf_state, compacted_index, compacted_term, snapshot))
+        Ok((
+            hard_state,
+            conf_state,
+            compacted_index,
+            compacted_term,
+            snapshot,
+        ))
     }
 
     /// Get the entries column family.
+    ///
+    /// # Panics
+    /// Panics if column family doesn't exist. This is validated at initialization
+    /// time, so this can only happen if the database is corrupted after open.
     fn cf_entries(&self) -> &ColumnFamily {
         self.inner
             .db
             .cf_handle(CF_ENTRIES)
-            .expect("Entries column family should exist")
+            .expect("Entries column family validated at init")
     }
 
     /// Get the state column family.
+    ///
+    /// # Panics
+    /// Panics if column family doesn't exist. This is validated at initialization
+    /// time, so this can only happen if the database is corrupted after open.
     fn cf_state(&self) -> &ColumnFamily {
         self.inner
             .db
             .cf_handle(CF_STATE)
-            .expect("State column family should exist")
+            .expect("State column family validated at init")
     }
 
     /// Get the snapshots column family.
+    ///
+    /// # Panics
+    /// Panics if column family doesn't exist. This is validated at initialization
+    /// time, so this can only happen if the database is corrupted after open.
     fn cf_snapshots(&self) -> &ColumnFamily {
         self.inner
             .db
             .cf_handle(CF_SNAPSHOTS)
-            .expect("Snapshots column family should exist")
+            .expect("Snapshots column family validated at init")
     }
 
     /// Convert index to key bytes (big-endian for proper ordering).
@@ -315,9 +416,18 @@ impl RocksDbStorage {
     }
 
     /// Convert key bytes to index.
+    /// Returns 0 if key is not exactly 8 bytes (defensive fallback).
     fn key_to_index(key: &[u8]) -> u64 {
-        let bytes: [u8; 8] = key.try_into().expect("Key should be 8 bytes");
-        u64::from_be_bytes(bytes)
+        match key.try_into() {
+            Ok(bytes) => u64::from_be_bytes(bytes),
+            Err(_) => {
+                tracing::error!(
+                    key_len = key.len(),
+                    "key_to_index: Invalid key length, expected 8 bytes"
+                );
+                0
+            }
+        }
     }
 
     /// Set the hard state.
@@ -333,7 +443,12 @@ impl RocksDbStorage {
         // Write to DB first
         self.inner
             .db
-            .put_cf_opt(self.cf_state(), KEY_HARD_STATE, &data, &self.inner.write_opts)
+            .put_cf_opt(
+                self.cf_state(),
+                KEY_HARD_STATE,
+                &data,
+                &self.inner.write_opts,
+            )
             .map_err(|e| StorageError::RocksDb(e.to_string()))?;
 
         // Then update cache (after successful DB write)
@@ -354,7 +469,12 @@ impl RocksDbStorage {
         // Write to DB first
         self.inner
             .db
-            .put_cf_opt(self.cf_state(), KEY_CONF_STATE, &data, &self.inner.write_opts)
+            .put_cf_opt(
+                self.cf_state(),
+                KEY_CONF_STATE,
+                &data,
+                &self.inner.write_opts,
+            )
             .map_err(|e| StorageError::RocksDb(e.to_string()))?;
 
         // Then update cache (after successful DB write)
@@ -377,13 +497,20 @@ impl RocksDbStorage {
         let last_index = self.last_index_internal()?;
         let first_new = entries[0].index;
 
-        // Debug assertion: compacted_index should be <= last_index
-        debug_assert!(
-            compacted_index <= last_index || last_index == compacted_index,
-            "Compacted index {} should be <= last index {}",
-            compacted_index,
-            last_index
-        );
+        // Validate storage invariant: compacted_index should be <= last_index
+        // This check runs in all builds (not just debug) to catch corruption
+        if compacted_index > last_index && last_index != compacted_index {
+            error!(
+                compacted_index = compacted_index,
+                last_index = last_index,
+                "Storage invariant violated: compacted index exceeds last index"
+            );
+            return Err(StorageError::Io(format!(
+                "Storage invariant violated: compacted index {} > last index {}",
+                compacted_index, last_index
+            ))
+            .into());
+        }
 
         // 1. Check if entries are already compacted
         if first_new < first_index {
@@ -476,13 +603,18 @@ impl RocksDbStorage {
             if hs.term < term {
                 hs.term = term;
             }
-            let data = hs
-                .write_to_bytes()
-                .map_err(|e| StorageError::RocksDb(format!("Failed to serialize hard state: {}", e)))?;
+            let data = hs.write_to_bytes().map_err(|e| {
+                StorageError::RocksDb(format!("Failed to serialize hard state: {}", e))
+            })?;
             // Write to DB first
             self.inner
                 .db
-                .put_cf_opt(self.cf_state(), KEY_HARD_STATE, &data, &self.inner.write_opts)
+                .put_cf_opt(
+                    self.cf_state(),
+                    KEY_HARD_STATE,
+                    &data,
+                    &self.inner.write_opts,
+                )
                 .map_err(|e| StorageError::RocksDb(e.to_string()))?;
             // Cache is updated via the mutable reference above
         }
@@ -505,16 +637,8 @@ impl RocksDbStorage {
         }
 
         // Update compacted index and term
-        batch.put_cf(
-            self.cf_state(),
-            KEY_COMPACTED_INDEX,
-            index.to_be_bytes(),
-        );
-        batch.put_cf(
-            self.cf_state(),
-            KEY_COMPACTED_TERM,
-            term.to_be_bytes(),
-        );
+        batch.put_cf(self.cf_state(), KEY_COMPACTED_INDEX, index.to_be_bytes());
+        batch.put_cf(self.cf_state(), KEY_COMPACTED_TERM, term.to_be_bytes());
 
         // Serialize and store snapshot
         let snapshot_data = snapshot
@@ -546,7 +670,12 @@ impl RocksDbStorage {
         *self.inner.cached_compacted_term.write() = term;
         *self.inner.cached_snapshot.write() = snapshot;
 
-        info!(index, term, snapshot_size_bytes = snapshot_size, "Applied snapshot to RocksDB");
+        info!(
+            index,
+            term,
+            snapshot_size_bytes = snapshot_size,
+            "Applied snapshot to RocksDB"
+        );
 
         Ok(())
     }
@@ -623,9 +752,8 @@ impl RocksDbStorage {
 
     /// Get the last index in the log.
     pub fn last_index(&self) -> u64 {
-        self.last_index_internal().unwrap_or_else(|_| {
-            *self.inner.cached_compacted_index.read()
-        })
+        self.last_index_internal()
+            .unwrap_or_else(|_| *self.inner.cached_compacted_index.read())
     }
 
     /// Internal last_index that can return errors.
@@ -633,7 +761,10 @@ impl RocksDbStorage {
         let compacted_index = *self.inner.cached_compacted_index.read();
 
         // Iterate in reverse to find the last entry
-        let iter = self.inner.db.iterator_cf(self.cf_entries(), IteratorMode::End);
+        let iter = self
+            .inner
+            .db
+            .iterator_cf(self.cf_entries(), IteratorMode::End);
 
         for item in iter {
             match item {
@@ -735,7 +866,12 @@ impl RocksDbStorage {
         // Then update cache
         *self.inner.cached_snapshot.write() = snapshot;
 
-        tracing::info!(index, term, snapshot_size_bytes = snapshot_size, "Stored snapshot for InstallSnapshot");
+        tracing::info!(
+            index,
+            term,
+            snapshot_size_bytes = snapshot_size,
+            "Stored snapshot for InstallSnapshot"
+        );
 
         Ok(())
     }
@@ -988,12 +1124,14 @@ mod tests {
                 .collect();
 
             storage.append(&entries).unwrap();
-            storage.set_hard_state(HardState {
-                term: 1,
-                vote: 2,
-                commit: 3,
-                ..Default::default()
-            }).unwrap();
+            storage
+                .set_hard_state(HardState {
+                    term: 1,
+                    vote: 2,
+                    commit: 3,
+                    ..Default::default()
+                })
+                .unwrap();
             storage.flush().unwrap();
         }
 

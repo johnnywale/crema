@@ -11,19 +11,13 @@
 //! - Shards are distributed across nodes
 //! - Tests verify that requests are correctly routed/forwarded
 
-use crate::error::Error;
 use crate::metrics::CacheMetrics;
-use crate::multiraft::{
-    MultiRaftConfig, MultiRaftCoordinator, ShardForwarder, ShardForwardingConfig,
-    ShardStorageConfig, ShardStorageManager,
-};
+use crate::multiraft::{MultiRaftConfig, MultiRaftCoordinator};
 use crate::types::NodeId;
-use bytes::Bytes;
-use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::Duration;
 
 /// Create a Multi-Raft coordinator for testing.
+#[allow(dead_code)]
 fn create_test_coordinator(node_id: NodeId, num_shards: u32) -> Arc<MultiRaftCoordinator> {
     let metrics = Arc::new(CacheMetrics::new());
     let config = MultiRaftConfig::new(num_shards)
@@ -35,8 +29,15 @@ fn create_test_coordinator(node_id: NodeId, num_shards: u32) -> Arc<MultiRaftCoo
 
 #[cfg(test)]
 mod tests {
-    use tempfile::TempDir;
     use super::*;
+    use crate::error::Error;
+    use crate::multiraft::{
+        ShardForwarder, ShardForwardingConfig, ShardStorageConfig, ShardStorageManager,
+    };
+    use bytes::Bytes;
+    use std::net::SocketAddr;
+    use std::time::Duration;
+    use tempfile::TempDir;
 
     /// Test Case 1: ShardForwarder basic functionality
     ///

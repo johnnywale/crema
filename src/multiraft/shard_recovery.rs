@@ -318,10 +318,8 @@ impl RecoveryCoordinatorBuilder {
 
     /// Build the recovery coordinator.
     pub fn build(self) -> Result<(ShardRecoveryCoordinator, Arc<ShardStorageManager>)> {
-        let storage_manager = Arc::new(ShardStorageManager::new(
-            self.storage_config,
-            self.node_id,
-        )?);
+        let storage_manager =
+            Arc::new(ShardStorageManager::new(self.storage_config, self.node_id)?);
 
         let coordinator = ShardRecoveryCoordinator::new(self.node_id, storage_manager.clone());
 

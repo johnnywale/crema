@@ -16,7 +16,10 @@
 //! - Write throughput scales linearly with shard count
 //! - Memberlist is required for gossip-based shard leader discovery
 
-use crema::{CacheConfig, DistributedCache, MemberlistConfig, MemberlistDiscovery, MultiRaftCacheConfig, PeerManagementConfig, RaftConfig};
+use crema::{
+    CacheConfig, DistributedCache, MemberlistConfig, MemberlistDiscovery, MultiRaftCacheConfig,
+    PeerManagementConfig, RaftConfig,
+};
 use std::collections::HashMap;
 use std::env;
 use std::net::SocketAddr;
@@ -107,6 +110,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         shard_capacity: 10_000,
         auto_init_shards: true,
         leader_broadcast_debounce_ms: 200,
+        per_shard_raft_enabled: false,
+        ..Default::default()
     };
 
     println!("Multi-Raft Configuration:");

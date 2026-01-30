@@ -13,10 +13,10 @@
 //! In a full cluster, checkpointing would be triggered automatically
 //! based on Raft log entries.
 
-use crema::checkpoint::{CheckpointConfig, CheckpointManager, SnapshotReader};
-use crema::cache::storage::CacheStorage;
-use crema::config::CacheConfig;
 use bytes::Bytes;
+use crema::cache::storage::CacheStorage;
+use crema::checkpoint::{CheckpointConfig, CheckpointManager, SnapshotReader};
+use crema::config::CacheConfig;
 use std::env;
 use std::fs;
 use std::sync::Arc;
@@ -40,10 +40,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Configure checkpoint settings
     let checkpoint_config = CheckpointConfig::new(checkpoint_dir)
-        .with_log_threshold(100)           // Snapshot after 100 entries
+        .with_log_threshold(100) // Snapshot after 100 entries
         .with_time_interval(Duration::from_secs(300)) // Or every 5 minutes
-        .with_compression(true)            // Enable LZ4 compression
-        .with_max_snapshots(3);            // Keep last 3 snapshots
+        .with_compression(true) // Enable LZ4 compression
+        .with_max_snapshots(3); // Keep last 3 snapshots
 
     println!("Checkpoint Configuration:");
     println!("  Directory:      {}", checkpoint_dir);
@@ -87,7 +87,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     println!();
     println!("Cache populated with {} entries", storage.entry_count());
-    println!("Entries since last snapshot: {}", manager.entries_since_snapshot());
+    println!(
+        "Entries since last snapshot: {}",
+        manager.entries_since_snapshot()
+    );
     println!();
 
     // Part 2: Create a snapshot
@@ -100,7 +103,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let raft_index = 1000;
     let raft_term = 5;
 
-    println!("Creating snapshot at Raft index={}, term={}", raft_index, raft_term);
+    println!(
+        "Creating snapshot at Raft index={}, term={}",
+        raft_index, raft_term
+    );
     let metadata = manager.create_snapshot(raft_index, raft_term).await?;
 
     println!();
@@ -150,7 +156,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("Loading snapshot from: {}", snapshot_info.path.display());
         let loaded_index = manager.load_snapshot(&snapshot_info.path).await?;
         println!("Snapshot loaded! Raft index restored to: {}", loaded_index);
-        println!("Cache entry count after recovery: {}", storage.entry_count());
+        println!(
+            "Cache entry count after recovery: {}",
+            storage.entry_count()
+        );
         println!();
 
         // Verify data was recovered
@@ -163,7 +172,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     if recovered == *expected_value {
                         println!("  '{}' = '{}' [OK]", key, recovered);
                     } else {
-                        println!("  '{}' = '{}' [MISMATCH: expected '{}']", key, recovered, expected_value);
+                        println!(
+                            "  '{}' = '{}' [MISMATCH: expected '{}']",
+                            key, recovered, expected_value
+                        );
                     }
                 }
                 None => {

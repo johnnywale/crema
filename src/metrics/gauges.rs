@@ -132,11 +132,7 @@ pub struct LabeledGauge<const N: usize> {
 
 impl<const N: usize> LabeledGauge<N> {
     /// Create a new labeled gauge.
-    pub fn new(
-        name: &'static str,
-        help: &'static str,
-        label_names: [&'static str; N],
-    ) -> Self {
+    pub fn new(name: &'static str, help: &'static str, label_names: [&'static str; N]) -> Self {
         Self {
             name,
             help,

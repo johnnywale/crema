@@ -1,0 +1,614 @@
+/* Crema Dashboard Styles */
+
+:root {
+    --bg-primary: #1a1b26;
+    --bg-secondary: #24283b;
+    --bg-tertiary: #414868;
+    --text-primary: #c0caf5;
+    --text-secondary: #a9b1d6;
+    --text-muted: #565f89;
+    --accent-blue: #7aa2f7;
+    --accent-green: #9ece6a;
+    --accent-red: #f7768e;
+    --accent-yellow: #e0af68;
+    --accent-purple: #bb9af7;
+    --accent-cyan: #7dcfff;
+    --border-color: #414868;
+    --success: #9ece6a;
+    --error: #f7768e;
+    --warning: #e0af68;
+}
+
+* {
+    box-sizing: border-box;
+    margin: 0;
+    padding: 0;
+}
+
+body {
+    font-family: 'JetBrains Mono', 'Fira Code', 'SF Mono', monospace;
+    background: var(--bg-primary);
+    color: var(--text-primary);
+    min-height: 100vh;
+    line-height: 1.6;
+}
+
+.container {
+    max-width: 1400px;
+    margin: 0 auto;
+    padding: 1rem;
+}
+
+/* Header */
+header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 1rem 0;
+    border-bottom: 1px solid var(--border-color);
+    margin-bottom: 1.5rem;
+}
+
+header h1 {
+    font-size: 1.5rem;
+    font-weight: 600;
+    color: var(--accent-cyan);
+}
+
+.node-info {
+    display: flex;
+    gap: 1rem;
+    align-items: center;
+}
+
+.badge {
+    padding: 0.25rem 0.75rem;
+    border-radius: 4px;
+    font-size: 0.875rem;
+    font-weight: 500;
+}
+
+.badge-leader {
+    background: var(--accent-green);
+    color: var(--bg-primary);
+}
+
+.badge-follower {
+    background: var(--bg-tertiary);
+    color: var(--text-secondary);
+}
+
+.badge-node {
+    background: var(--accent-blue);
+    color: var(--bg-primary);
+}
+
+.badge-info {
+    background: var(--accent-cyan);
+    color: var(--bg-primary);
+}
+
+/* Grid Layout */
+.dashboard-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+    gap: 1rem;
+    margin-bottom: 1.5rem;
+}
+
+/* Cards */
+.card {
+    background: var(--bg-secondary);
+    border-radius: 8px;
+    border: 1px solid var(--border-color);
+    padding: 1rem;
+}
+
+.card-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 1rem;
+    padding-bottom: 0.5rem;
+    border-bottom: 1px solid var(--border-color);
+}
+
+.card-title {
+    font-size: 0.875rem;
+    font-weight: 600;
+    color: var(--text-muted);
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+}
+
+/* Stats */
+.stat-grid {
+    display: grid;
+    grid-template-columns: repeat(2, 1fr);
+    gap: 0.75rem;
+}
+
+.stat-item {
+    display: flex;
+    flex-direction: column;
+}
+
+.stat-label {
+    font-size: 0.75rem;
+    color: var(--text-muted);
+    margin-bottom: 0.25rem;
+}
+
+.stat-value {
+    font-size: 1.25rem;
+    font-weight: 600;
+    color: var(--text-primary);
+}
+
+.stat-value.large {
+    font-size: 2rem;
+}
+
+.stat-value.success { color: var(--accent-green); }
+.stat-value.error { color: var(--accent-red); }
+.stat-value.warning { color: var(--accent-yellow); }
+.stat-value.info { color: var(--accent-blue); }
+
+/* Cache Operations Form */
+.operations-card {
+    grid-column: 1 / -1;
+}
+
+.operations-form {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.75rem;
+    align-items: flex-end;
+}
+
+.form-group {
+    display: flex;
+    flex-direction: column;
+    gap: 0.25rem;
+}
+
+.form-group label {
+    font-size: 0.75rem;
+    color: var(--text-muted);
+    text-transform: uppercase;
+}
+
+.form-group input {
+    padding: 0.5rem 0.75rem;
+    border: 1px solid var(--border-color);
+    border-radius: 4px;
+    background: var(--bg-primary);
+    color: var(--text-primary);
+    font-family: inherit;
+    font-size: 0.875rem;
+    width: 180px;
+}
+
+.form-group input:focus {
+    outline: none;
+    border-color: var(--accent-blue);
+}
+
+.form-group input::placeholder {
+    color: var(--text-muted);
+}
+
+.btn-group {
+    display: flex;
+    gap: 0.5rem;
+}
+
+.btn {
+    padding: 0.5rem 1rem;
+    border: none;
+    border-radius: 4px;
+    font-family: inherit;
+    font-size: 0.875rem;
+    font-weight: 500;
+    cursor: pointer;
+    transition: opacity 0.2s, transform 0.1s;
+}
+
+.btn:hover {
+    opacity: 0.9;
+}
+
+.btn:active {
+    transform: scale(0.98);
+}
+
+.btn-primary {
+    background: var(--accent-blue);
+    color: var(--bg-primary);
+}
+
+.btn-success {
+    background: var(--accent-green);
+    color: var(--bg-primary);
+}
+
+.btn-danger {
+    background: var(--accent-red);
+    color: var(--bg-primary);
+}
+
+.btn-secondary {
+    background: var(--bg-tertiary);
+    color: var(--text-primary);
+}
+
+/* Operation Result */
+.operation-result {
+    margin-top: 1rem;
+    padding: 0.75rem;
+    border-radius: 4px;
+    font-size: 0.875rem;
+    font-family: inherit;
+}
+
+.operation-result.success {
+    background: rgba(158, 206, 106, 0.1);
+    border: 1px solid var(--accent-green);
+    color: var(--accent-green);
+}
+
+.operation-result.error {
+    background: rgba(247, 118, 142, 0.1);
+    border: 1px solid var(--accent-red);
+    color: var(--accent-red);
+}
+
+.operation-result.info {
+    background: rgba(122, 162, 247, 0.1);
+    border: 1px solid var(--accent-blue);
+    color: var(--accent-blue);
+}
+
+/* Shard Grid */
+.shard-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(80px, 1fr));
+    gap: 0.5rem;
+}
+
+.shard-item {
+    padding: 0.5rem;
+    border-radius: 4px;
+    text-align: center;
+    font-size: 0.75rem;
+    border: 1px solid var(--border-color);
+    transition: transform 0.2s;
+}
+
+.shard-item:hover {
+    transform: scale(1.05);
+}
+
+.shard-id {
+    font-weight: 600;
+    margin-bottom: 0.25rem;
+}
+
+.shard-leader {
+    color: var(--text-muted);
+}
+
+.shard-entries {
+    font-size: 0.75rem;
+    color: var(--text-secondary);
+    font-weight: 500;
+}
+
+.shard-percent {
+    font-size: 0.65rem;
+    color: var(--text-muted);
+}
+
+.shard-slots {
+    font-size: 0.7rem;
+    color: var(--text-secondary);
+}
+
+/* Slot bar in shard boxes */
+.slot-bar {
+    height: 4px;
+    background: var(--bg-tertiary);
+    border-radius: 2px;
+    margin-top: 4px;
+    overflow: hidden;
+}
+
+.slot-bar-fill {
+    height: 100%;
+    background: var(--accent-cyan);
+    border-radius: 2px;
+    transition: width 0.3s ease;
+}
+
+/* Migration indicators */
+.migration-in {
+    color: var(--success);
+    font-size: 0.65rem;
+    margin-left: 0.25rem;
+}
+
+.migration-out {
+    color: var(--warning);
+    font-size: 0.65rem;
+    margin-left: 0.25rem;
+}
+
+/* Migration animation */
+.shard-migrating {
+    animation: pulse-migration 1.5s ease-in-out infinite;
+}
+
+@keyframes pulse-migration {
+    0%, 100% { opacity: 1; }
+    50% { opacity: 0.7; }
+}
+
+.shard-total {
+    margin-top: 0.75rem;
+    padding-top: 0.75rem;
+    border-top: 1px solid var(--border);
+    font-size: 0.85rem;
+    color: var(--text-secondary);
+    text-align: center;
+}
+
+/* Shard colors by node */
+.shard-node-1 { background: rgba(122, 162, 247, 0.2); border-color: var(--accent-blue); }
+.shard-node-2 { background: rgba(158, 206, 106, 0.2); border-color: var(--accent-green); }
+.shard-node-3 { background: rgba(187, 154, 247, 0.2); border-color: var(--accent-purple); }
+.shard-node-4 { background: rgba(224, 175, 104, 0.2); border-color: var(--accent-yellow); }
+.shard-node-5 { background: rgba(125, 207, 255, 0.2); border-color: var(--accent-cyan); }
+.shard-local { border-width: 2px; }
+
+/* Shard header with controls */
+.shard-header-right {
+    display: flex;
+    align-items: center;
+    gap: 1rem;
+}
+
+/* Shard control buttons */
+.shard-controls {
+    display: flex;
+    gap: 0.5rem;
+}
+
+.btn-sm {
+    padding: 0.25rem 0.5rem;
+    font-size: 0.75rem;
+}
+
+.btn:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
+}
+
+/* Modal dialog for remove shard */
+.modal-overlay {
+    position: fixed;
+    top: 0;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    background: rgba(0, 0, 0, 0.7);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    z-index: 1000;
+}
+
+.modal-dialog {
+    background: var(--bg-secondary);
+    border: 1px solid var(--border-color);
+    border-radius: 8px;
+    min-width: 300px;
+    max-width: 500px;
+}
+
+.modal-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 1rem;
+    border-bottom: 1px solid var(--border-color);
+}
+
+.modal-title {
+    font-size: 1rem;
+    font-weight: 600;
+    color: var(--text-primary);
+}
+
+.modal-close {
+    background: none;
+    border: none;
+    color: var(--text-muted);
+    font-size: 1.5rem;
+    cursor: pointer;
+    padding: 0;
+    line-height: 1;
+}
+
+.modal-close:hover {
+    color: var(--text-primary);
+}
+
+.modal-body {
+    padding: 1rem;
+}
+
+.modal-body p {
+    margin-bottom: 1rem;
+    color: var(--text-secondary);
+}
+
+.modal-footer {
+    display: flex;
+    justify-content: flex-end;
+    gap: 0.5rem;
+    padding: 1rem;
+    border-top: 1px solid var(--border-color);
+}
+
+/* Shard select grid for remove dialog */
+.shard-select-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(80px, 1fr));
+    gap: 0.5rem;
+}
+
+.shard-select-btn {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    padding: 0.5rem;
+    background: var(--bg-primary);
+    border: 1px solid var(--border-color);
+    border-radius: 4px;
+    color: var(--text-primary);
+    cursor: pointer;
+    font-family: inherit;
+    transition: all 0.2s;
+}
+
+.shard-select-btn:hover {
+    border-color: var(--accent-blue);
+}
+
+.shard-select-btn.selected {
+    border-color: var(--accent-red);
+    background: rgba(247, 118, 142, 0.1);
+}
+
+.shard-select-info {
+    font-size: 0.65rem;
+    color: var(--text-muted);
+}
+
+/* Latency Table */
+.latency-table {
+    width: 100%;
+    font-size: 0.875rem;
+}
+
+.latency-table th,
+.latency-table td {
+    padding: 0.5rem;
+    text-align: left;
+}
+
+.latency-table th {
+    color: var(--text-muted);
+    font-weight: 500;
+    font-size: 0.75rem;
+    text-transform: uppercase;
+}
+
+.latency-table tr {
+    border-bottom: 1px solid var(--border-color);
+}
+
+.latency-table tr:last-child {
+    border-bottom: none;
+}
+
+/* Throughput */
+.throughput-display {
+    text-align: center;
+    padding: 1rem 0;
+}
+
+.throughput-value {
+    font-size: 2.5rem;
+    font-weight: 700;
+    color: var(--accent-cyan);
+}
+
+.throughput-unit {
+    font-size: 0.875rem;
+    color: var(--text-muted);
+}
+
+/* Connection Status */
+.connection-status {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    font-size: 0.875rem;
+}
+
+.status-dot {
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    animation: pulse 2s infinite;
+}
+
+.status-dot.connected {
+    background: var(--accent-green);
+}
+
+.status-dot.disconnected {
+    background: var(--accent-red);
+    animation: none;
+}
+
+@keyframes pulse {
+    0%, 100% { opacity: 1; }
+    50% { opacity: 0.5; }
+}
+
+/* Responsive */
+@media (max-width: 768px) {
+    .dashboard-grid {
+        grid-template-columns: 1fr;
+    }
+
+    .operations-form {
+        flex-direction: column;
+        align-items: stretch;
+    }
+
+    .form-group input {
+        width: 100%;
+    }
+
+    .btn-group {
+        flex-wrap: wrap;
+    }
+}
+
+/* Loading state */
+.loading {
+    opacity: 0.5;
+    pointer-events: none;
+}
+
+/* Scrollbar */
+::-webkit-scrollbar {
+    width: 8px;
+    height: 8px;
+}
+
+::-webkit-scrollbar-track {
+    background: var(--bg-primary);
+}
+
+::-webkit-scrollbar-thumb {
+    background: var(--bg-tertiary);
+    border-radius: 4px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+    background: var(--text-muted);
+}

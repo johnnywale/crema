@@ -188,7 +188,7 @@ impl std::fmt::Display for RaftMigrationPhase {
 }
 
 /// Progress information for a Raft-native migration.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct RaftMigrationProgress {
     /// Current Raft index on the learner.
     pub learner_match_index: u64,
@@ -210,20 +210,6 @@ pub struct RaftMigrationProgress {
 
     /// Last updated timestamp.
     pub last_updated: u64,
-}
-
-impl Default for RaftMigrationProgress {
-    fn default() -> Self {
-        Self {
-            learner_match_index: 0,
-            leader_commit_index: 0,
-            snapshot_sent: false,
-            snapshot_applied: false,
-            lag_entries: 0,
-            eta_seconds: None,
-            last_updated: 0,
-        }
-    }
 }
 
 impl RaftMigrationProgress {
@@ -304,7 +290,12 @@ impl RaftShardMigration {
         self.phase = phase;
         self.phase_started_at = Some(Instant::now());
 
-        if matches!(phase, RaftMigrationPhase::Completed | RaftMigrationPhase::Failed | RaftMigrationPhase::Cancelled) {
+        if matches!(
+            phase,
+            RaftMigrationPhase::Completed
+                | RaftMigrationPhase::Failed
+                | RaftMigrationPhase::Cancelled
+        ) {
             self.completed_at = Some(
                 std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
@@ -321,7 +312,12 @@ impl RaftShardMigration {
     }
 
     /// Update progress from Raft status.
-    pub fn update_progress(&mut self, learner_match: u64, leader_commit: u64, snapshot_applied: bool) {
+    pub fn update_progress(
+        &mut self,
+        learner_match: u64,
+        leader_commit: u64,
+        snapshot_applied: bool,
+    ) {
         self.progress.learner_match_index = learner_match;
         self.progress.leader_commit_index = leader_commit;
         self.progress.snapshot_applied = snapshot_applied;
@@ -366,7 +362,12 @@ impl RaftShardMigration {
 #[async_trait::async_trait]
 pub trait ShardRaftController: Send + Sync + std::fmt::Debug {
     /// Add a learner to the shard's Raft group.
-    async fn add_learner(&self, shard_id: ShardId, node_id: NodeId, node_addr: std::net::SocketAddr) -> Result<()>;
+    async fn add_learner(
+        &self,
+        shard_id: ShardId,
+        node_id: NodeId,
+        node_addr: std::net::SocketAddr,
+    ) -> Result<()>;
 
     /// Promote a learner to voter.
     async fn promote_to_voter(&self, shard_id: ShardId, node_id: NodeId) -> Result<()>;
@@ -381,7 +382,11 @@ pub trait ShardRaftController: Send + Sync + std::fmt::Debug {
     async fn get_leader(&self, shard_id: ShardId) -> Result<Option<NodeId>>;
 
     /// Get the match index for a learner (how caught up they are).
-    async fn get_learner_progress(&self, shard_id: ShardId, learner_id: NodeId) -> Result<(u64, u64, bool)>;
+    async fn get_learner_progress(
+        &self,
+        shard_id: ShardId,
+        learner_id: NodeId,
+    ) -> Result<(u64, u64, bool)>;
 
     /// Get the current commit index for a shard.
     async fn get_commit_index(&self, shard_id: ShardId) -> Result<u64>;
@@ -417,7 +422,12 @@ pub struct NoOpShardRaftController;
 
 #[async_trait::async_trait]
 impl ShardRaftController for NoOpShardRaftController {
-    async fn add_learner(&self, _shard_id: ShardId, _node_id: NodeId, _node_addr: std::net::SocketAddr) -> Result<()> {
+    async fn add_learner(
+        &self,
+        _shard_id: ShardId,
+        _node_id: NodeId,
+        _node_addr: std::net::SocketAddr,
+    ) -> Result<()> {
         Ok(())
     }
 
@@ -437,7 +447,11 @@ impl ShardRaftController for NoOpShardRaftController {
         Ok(Some(1))
     }
 
-    async fn get_learner_progress(&self, _shard_id: ShardId, _learner_id: NodeId) -> Result<(u64, u64, bool)> {
+    async fn get_learner_progress(
+        &self,
+        _shard_id: ShardId,
+        _learner_id: NodeId,
+    ) -> Result<(u64, u64, bool)> {
         // Returns (learner_match_index, leader_commit_index, snapshot_applied)
         Ok((100, 100, true))
     }
@@ -589,11 +603,26 @@ impl std::fmt::Debug for RaftMigrationCoordinator {
             .field("config", &self.config)
             .field("active_migrations", &self.active_migrations.len())
             .field("paused", &self.paused.load(Ordering::SeqCst))
-            .field("coordinator_term", &self.coordinator_term.load(Ordering::SeqCst))
-            .field("migrations_started", &self.migrations_started.load(Ordering::SeqCst))
-            .field("migrations_completed", &self.migrations_completed.load(Ordering::SeqCst))
-            .field("migrations_failed", &self.migrations_failed.load(Ordering::SeqCst))
-            .field("has_address_resolver", &self.node_address_resolver.read().is_some())
+            .field(
+                "coordinator_term",
+                &self.coordinator_term.load(Ordering::SeqCst),
+            )
+            .field(
+                "migrations_started",
+                &self.migrations_started.load(Ordering::SeqCst),
+            )
+            .field(
+                "migrations_completed",
+                &self.migrations_completed.load(Ordering::SeqCst),
+            )
+            .field(
+                "migrations_failed",
+                &self.migrations_failed.load(Ordering::SeqCst),
+            )
+            .field(
+                "has_address_resolver",
+                &self.node_address_resolver.read().is_some(),
+            )
             .finish()
     }
 }
@@ -710,7 +739,8 @@ impl RaftMigrationCoordinator {
         change.coordinator_term = self.coordinator_term();
 
         let migration = RaftShardMigration::new(change);
-        self.active_migrations.insert(migration.change.shard_id, migration.clone());
+        self.active_migrations
+            .insert(migration.change.shard_id, migration.clone());
 
         self.migrations_started.fetch_add(1, Ordering::Relaxed);
 
@@ -739,7 +769,10 @@ impl RaftMigrationCoordinator {
     /// Execute a migration through all phases.
     #[tracing::instrument(skip(self), fields(node_id = %self.node_id, shard_id = %shard_id))]
     pub async fn execute_migration(&self, shard_id: ShardId) -> Result<()> {
-        let controller = self.raft_controller.read().clone()
+        let controller = self
+            .raft_controller
+            .read()
+            .clone()
             .ok_or_else(|| Error::Internal("No Raft controller set".to_string()))?;
 
         loop {
@@ -753,7 +786,8 @@ impl RaftMigrationCoordinator {
                 continue;
             }
 
-            let migration = self.get_migration(shard_id)
+            let migration = self
+                .get_migration(shard_id)
                 .ok_or(Error::MigrationNotFound(shard_id))?;
 
             // Validate coordinator term (fencing)
@@ -795,7 +829,9 @@ impl RaftMigrationCoordinator {
                 }
                 RaftMigrationPhase::Failed | RaftMigrationPhase::Cancelled => {
                     return Err(Error::MigrationFailed(
-                        migration.error.unwrap_or_else(|| "Unknown error".to_string())
+                        migration
+                            .error
+                            .unwrap_or_else(|| "Unknown error".to_string()),
                     ));
                 }
             }
@@ -807,8 +843,13 @@ impl RaftMigrationCoordinator {
 
     /// Execute the add learner phase.
     #[tracing::instrument(skip(self, controller), fields(shard_id = %shard_id))]
-    async fn execute_add_learner(&self, controller: &Arc<dyn ShardRaftController>, shard_id: ShardId) -> Result<()> {
-        let migration = self.get_migration(shard_id)
+    async fn execute_add_learner(
+        &self,
+        controller: &Arc<dyn ShardRaftController>,
+        shard_id: ShardId,
+    ) -> Result<()> {
+        let migration = self
+            .get_migration(shard_id)
             .ok_or(Error::MigrationNotFound(shard_id))?;
 
         self.transition_phase(shard_id, RaftMigrationPhase::AddingLearner)?;
@@ -820,7 +861,10 @@ impl RaftMigrationCoordinator {
                 migration.change.target_node
             )))?;
 
-        match controller.add_learner(shard_id, migration.change.target_node, node_addr).await {
+        match controller
+            .add_learner(shard_id, migration.change.target_node, node_addr)
+            .await
+        {
             Ok(()) => {
                 tracing::info!(
                     migration_id = %migration.id,
@@ -838,7 +882,11 @@ impl RaftMigrationCoordinator {
 
     /// Wait for snapshot to be applied.
     #[tracing::instrument(skip(self, controller), fields(shard_id = %shard_id))]
-    async fn wait_for_snapshot(&self, controller: &Arc<dyn ShardRaftController>, shard_id: ShardId) -> Result<()> {
+    async fn wait_for_snapshot(
+        &self,
+        controller: &Arc<dyn ShardRaftController>,
+        shard_id: ShardId,
+    ) -> Result<()> {
         let start = Instant::now();
 
         loop {
@@ -851,7 +899,8 @@ impl RaftMigrationCoordinator {
                 return Err(Error::MigrationTimeout);
             }
 
-            let migration = self.get_migration(shard_id)
+            let migration = self
+                .get_migration(shard_id)
                 .ok_or(Error::MigrationNotFound(shard_id))?;
 
             let (learner_match, leader_commit, snapshot_applied) = controller
@@ -879,7 +928,11 @@ impl RaftMigrationCoordinator {
 
     /// Wait for learner to catch up with the log.
     #[tracing::instrument(skip(self, controller), fields(shard_id = %shard_id))]
-    async fn wait_for_catchup(&self, controller: &Arc<dyn ShardRaftController>, shard_id: ShardId) -> Result<()> {
+    async fn wait_for_catchup(
+        &self,
+        controller: &Arc<dyn ShardRaftController>,
+        shard_id: ShardId,
+    ) -> Result<()> {
         let start = Instant::now();
 
         loop {
@@ -892,7 +945,8 @@ impl RaftMigrationCoordinator {
                 return Err(Error::MigrationTimeout);
             }
 
-            let migration = self.get_migration(shard_id)
+            let migration = self
+                .get_migration(shard_id)
                 .ok_or(Error::MigrationNotFound(shard_id))?;
 
             let (learner_match, leader_commit, snapshot_applied) = controller
@@ -930,11 +984,19 @@ impl RaftMigrationCoordinator {
 
     /// Execute the promote to voter phase.
     #[tracing::instrument(skip(self, controller), fields(shard_id = %shard_id))]
-    async fn execute_promote_to_voter(&self, controller: &Arc<dyn ShardRaftController>, shard_id: ShardId) -> Result<()> {
-        let migration = self.get_migration(shard_id)
+    async fn execute_promote_to_voter(
+        &self,
+        controller: &Arc<dyn ShardRaftController>,
+        shard_id: ShardId,
+    ) -> Result<()> {
+        let migration = self
+            .get_migration(shard_id)
             .ok_or(Error::MigrationNotFound(shard_id))?;
 
-        match controller.promote_to_voter(shard_id, migration.change.target_node).await {
+        match controller
+            .promote_to_voter(shard_id, migration.change.target_node)
+            .await
+        {
             Ok(()) => {
                 tracing::info!(
                     migration_id = %migration.id,
@@ -959,11 +1021,18 @@ impl RaftMigrationCoordinator {
 
     /// Execute the remove old node phase.
     #[tracing::instrument(skip(self, controller), fields(shard_id = %shard_id))]
-    async fn execute_remove_old_node(&self, controller: &Arc<dyn ShardRaftController>, shard_id: ShardId) -> Result<()> {
-        let migration = self.get_migration(shard_id)
+    async fn execute_remove_old_node(
+        &self,
+        controller: &Arc<dyn ShardRaftController>,
+        shard_id: ShardId,
+    ) -> Result<()> {
+        let migration = self
+            .get_migration(shard_id)
             .ok_or(Error::MigrationNotFound(shard_id))?;
 
-        let old_node = migration.change.remove_after
+        let old_node = migration
+            .change
+            .remove_after
             .ok_or_else(|| Error::Internal("No old node to remove".to_string()))?;
 
         // If old node is the leader, transfer leadership first
@@ -976,7 +1045,9 @@ impl RaftMigrationCoordinator {
                         new_leader = migration.change.target_node,
                         "Transferring leadership before removal"
                     );
-                    controller.transfer_leader(shard_id, migration.change.target_node).await?;
+                    controller
+                        .transfer_leader(shard_id, migration.change.target_node)
+                        .await?;
                     // Wait a bit for leadership transfer
                     tokio::time::sleep(Duration::from_millis(500)).await;
                 }
@@ -1028,11 +1099,8 @@ impl RaftMigrationCoordinator {
 
             // Schedule cleanup in the background
             // This is non-blocking to avoid slowing down the main migration flow
-            self.cleanup_manager.schedule_cleanup(
-                migration_id,
-                shard_id,
-                target_node,
-            );
+            self.cleanup_manager
+                .schedule_cleanup(migration_id, shard_id, target_node);
 
             tracing::warn!(
                 migration_id = %migration_id,
@@ -1050,7 +1118,9 @@ impl RaftMigrationCoordinator {
 
     /// Complete a migration.
     fn complete_migration(&self, shard_id: ShardId) -> Result<()> {
-        let migration = self.active_migrations.remove(&shard_id)
+        let migration = self
+            .active_migrations
+            .remove(&shard_id)
             .map(|(_, m)| m)
             .ok_or(Error::MigrationNotFound(shard_id))?;
 
@@ -1075,7 +1145,9 @@ impl RaftMigrationCoordinator {
 
     /// Cancel a migration.
     pub fn cancel_migration(&self, shard_id: ShardId) -> Result<RaftShardMigration> {
-        let (_, mut migration) = self.active_migrations.remove(&shard_id)
+        let (_, mut migration) = self
+            .active_migrations
+            .remove(&shard_id)
             .ok_or(Error::MigrationNotFound(shard_id))?;
 
         migration.transition_to(RaftMigrationPhase::Cancelled);
@@ -1133,7 +1205,8 @@ impl RaftMigrationCoordinator {
         let mut report = JanitorReport::default();
 
         // 1. Find and clean up stalled migrations
-        let stalled_shards: Vec<ShardId> = self.active_migrations
+        let stalled_shards: Vec<ShardId> = self
+            .active_migrations
             .iter()
             .filter(|entry| entry.is_stalled(self.config.max_phase_duration))
             .map(|entry| *entry.key())
@@ -1150,7 +1223,13 @@ impl RaftMigrationCoordinator {
                 );
 
                 // Mark as failed (this also triggers cleanup)
-                if self.fail_migration(shard_id, "Stalled migration detected by janitor".to_string()).is_ok() {
+                if self
+                    .fail_migration(
+                        shard_id,
+                        "Stalled migration detected by janitor".to_string(),
+                    )
+                    .is_ok()
+                {
                     report.stalled_cleaned += 1;
                     report.cleanups_triggered += 1;
                 }
@@ -1230,10 +1309,7 @@ impl RaftMigrationCoordinator {
         }
 
         if report.had_errors() {
-            tracing::warn!(
-                error_count = report.errors.len(),
-                "Janitor run had errors"
-            );
+            tracing::warn!(error_count = report.errors.len(), "Janitor run had errors");
         }
 
         report
@@ -1344,8 +1420,8 @@ mod tests {
 
     #[test]
     fn test_coordinator_term_fencing() {
-        let change = RaftMembershipChange::new(1, RaftChangeType::AddLearner, 5)
-            .with_coordinator_term(5);
+        let change =
+            RaftMembershipChange::new(1, RaftChangeType::AddLearner, 5).with_coordinator_term(5);
         assert_eq!(change.coordinator_term, 5);
     }
 
@@ -1392,7 +1468,10 @@ mod tests {
 
         assert_eq!(migration.phase, RaftMigrationPhase::Planned);
         assert!(coordinator.is_migrating(1));
-        assert_eq!(migration.change.coordinator_term, coordinator.coordinator_term());
+        assert_eq!(
+            migration.change.coordinator_term,
+            coordinator.coordinator_term()
+        );
     }
 
     #[test]
@@ -1401,10 +1480,15 @@ mod tests {
         config.max_concurrent = 2;
         let coordinator = RaftMigrationCoordinator::new(1, config);
 
-        coordinator.plan_migration(RaftMembershipChange::new(1, RaftChangeType::AddLearner, 5)).unwrap();
-        coordinator.plan_migration(RaftMembershipChange::new(2, RaftChangeType::AddLearner, 5)).unwrap();
+        coordinator
+            .plan_migration(RaftMembershipChange::new(1, RaftChangeType::AddLearner, 5))
+            .unwrap();
+        coordinator
+            .plan_migration(RaftMembershipChange::new(2, RaftChangeType::AddLearner, 5))
+            .unwrap();
 
-        let result = coordinator.plan_migration(RaftMembershipChange::new(3, RaftChangeType::AddLearner, 5));
+        let result =
+            coordinator.plan_migration(RaftMembershipChange::new(3, RaftChangeType::AddLearner, 5));
         assert!(matches!(result, Err(Error::TooManyMigrations)));
     }
 
@@ -1412,9 +1496,12 @@ mod tests {
     fn test_coordinator_duplicate_shard() {
         let coordinator = RaftMigrationCoordinator::new(1, RaftMigrationConfig::default());
 
-        coordinator.plan_migration(RaftMembershipChange::new(1, RaftChangeType::AddLearner, 5)).unwrap();
+        coordinator
+            .plan_migration(RaftMembershipChange::new(1, RaftChangeType::AddLearner, 5))
+            .unwrap();
 
-        let result = coordinator.plan_migration(RaftMembershipChange::new(1, RaftChangeType::AddLearner, 6));
+        let result =
+            coordinator.plan_migration(RaftMembershipChange::new(1, RaftChangeType::AddLearner, 6));
         assert!(matches!(result, Err(Error::ShardAlreadyMigrating(1))));
     }
 
@@ -1425,13 +1512,15 @@ mod tests {
         coordinator.pause();
         assert!(coordinator.is_paused());
 
-        let result = coordinator.plan_migration(RaftMembershipChange::new(1, RaftChangeType::AddLearner, 5));
+        let result =
+            coordinator.plan_migration(RaftMembershipChange::new(1, RaftChangeType::AddLearner, 5));
         assert!(matches!(result, Err(Error::MigrationPaused)));
 
         coordinator.resume();
         assert!(!coordinator.is_paused());
 
-        let result = coordinator.plan_migration(RaftMembershipChange::new(1, RaftChangeType::AddLearner, 5));
+        let result =
+            coordinator.plan_migration(RaftMembershipChange::new(1, RaftChangeType::AddLearner, 5));
         assert!(result.is_ok());
     }
 
@@ -1455,9 +1544,7 @@ mod tests {
 
     /// Create a mock address resolver for testing that returns a fixed port based on node_id
     fn mock_address_resolver() -> NodeAddressResolver {
-        Arc::new(|node_id| {
-            Some(format!("127.0.0.1:{}", 9000 + node_id).parse().unwrap())
-        })
+        Arc::new(|node_id| Some(format!("127.0.0.1:{}", 9000 + node_id).parse().unwrap()))
     }
 
     #[tokio::test]

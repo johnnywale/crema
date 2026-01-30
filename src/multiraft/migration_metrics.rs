@@ -38,9 +38,15 @@ impl MigrationMetrics {
         Self {
             migrations_active: Gauge::new("migrations_active", "Number of active migrations"),
             migrations_started: Counter::new("migrations_started", "Total migrations started"),
-            migrations_completed: Counter::new("migrations_completed", "Total migrations completed"),
+            migrations_completed: Counter::new(
+                "migrations_completed",
+                "Total migrations completed",
+            ),
             migrations_failed: Counter::new("migrations_failed", "Total migrations failed"),
-            migrations_cancelled: Counter::new("migrations_cancelled", "Total migrations cancelled"),
+            migrations_cancelled: Counter::new(
+                "migrations_cancelled",
+                "Total migrations cancelled",
+            ),
             migration_duration: Histogram::with_buckets(
                 "migration_duration",
                 "Migration duration in seconds",

@@ -6,8 +6,7 @@
 #![cfg(test)]
 
 use crate::testing::recovery::{
-    FailpointAction, FailpointRegistry, NodeState, RecoveryTestCluster,
-    RecoveryTestConfig,
+    FailpointAction, FailpointRegistry, NodeState, RecoveryTestCluster, RecoveryTestConfig,
 };
 use std::panic::AssertUnwindSafe;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -81,7 +80,10 @@ async fn test_snapshot_only_recovery() {
     cluster.start_all().await.unwrap();
 
     // Wait for leader election
-    let leader = cluster.wait_for_leader(Duration::from_secs(10)).await.unwrap();
+    let leader = cluster
+        .wait_for_leader(Duration::from_secs(10))
+        .await
+        .unwrap();
     info!(leader, "Leader elected");
 
     // Write enough data to trigger a snapshot
@@ -99,7 +101,10 @@ async fn test_snapshot_only_recovery() {
     info!(leader, "Leader crashed");
 
     // Wait for new leader
-    let new_leader = cluster.wait_for_leader(Duration::from_secs(15)).await.unwrap();
+    let new_leader = cluster
+        .wait_for_leader(Duration::from_secs(15))
+        .await
+        .unwrap();
     assert_ne!(new_leader, leader, "New leader should be different");
     info!(new_leader, "New leader elected");
 
@@ -123,12 +128,18 @@ async fn test_snapshot_only_recovery() {
 /// NOTE: This test requires persistent storage to work correctly.
 /// With in-memory storage, logs are lost on crash.
 #[tokio::test]
-#[cfg_attr(not(feature = "rocksdb-storage"), ignore = "requires persistent storage (rocksdb-storage feature)")]
+#[cfg_attr(
+    not(feature = "rocksdb-storage"),
+    ignore = "requires persistent storage (rocksdb-storage feature)"
+)]
 async fn test_log_replay_only_recovery() {
     let cluster = create_test_cluster().await;
     cluster.start_all().await.unwrap();
 
-    let leader = cluster.wait_for_leader(Duration::from_secs(10)).await.unwrap();
+    let leader = cluster
+        .wait_for_leader(Duration::from_secs(10))
+        .await
+        .unwrap();
 
     // Write a small amount of data (less than snapshot threshold)
     write_test_data(&cluster, 20, "logonly").await;
@@ -167,12 +178,18 @@ async fn test_log_replay_only_recovery() {
 /// Test recovery from snapshot plus additional log entries.
 /// NOTE: Requires persistent storage for log replay after snapshot.
 #[tokio::test]
-#[cfg_attr(not(feature = "rocksdb-storage"), ignore = "requires persistent storage (rocksdb-storage feature)")]
+#[cfg_attr(
+    not(feature = "rocksdb-storage"),
+    ignore = "requires persistent storage (rocksdb-storage feature)"
+)]
 async fn test_snapshot_plus_log_recovery() {
     let cluster = create_test_cluster().await;
     cluster.start_all().await.unwrap();
 
-    let leader = cluster.wait_for_leader(Duration::from_secs(10)).await.unwrap();
+    let leader = cluster
+        .wait_for_leader(Duration::from_secs(10))
+        .await
+        .unwrap();
 
     // Write data to trigger snapshot
     write_test_data(&cluster, 60, "before").await;
@@ -219,12 +236,18 @@ async fn test_snapshot_plus_log_recovery() {
 /// The implementation uses absolute expiration times in CacheCommand and filters expired
 /// entries during snapshot load and Raft log replay.
 #[tokio::test]
-#[cfg_attr(not(feature = "rocksdb-storage"), ignore = "requires persistent storage (rocksdb-storage feature)")]
+#[cfg_attr(
+    not(feature = "rocksdb-storage"),
+    ignore = "requires persistent storage (rocksdb-storage feature)"
+)]
 async fn test_recovery_with_expired_entries() {
     let cluster = create_test_cluster().await;
     cluster.start_all().await.unwrap();
 
-    let leader = cluster.wait_for_leader(Duration::from_secs(10)).await.unwrap();
+    let leader = cluster
+        .wait_for_leader(Duration::from_secs(10))
+        .await
+        .unwrap();
 
     // Identify which follower we'll crash before writing data
     let followers: Vec<_> = cluster
@@ -243,14 +266,20 @@ async fn test_recovery_with_expired_entries() {
         .write_with_ttl("ttl_key_2", "value2", Some(Duration::from_secs(60)))
         .await
         .unwrap();
-    cluster.write("permanent_key", "permanent_value").await.unwrap();
+    cluster
+        .write("permanent_key", "permanent_value")
+        .await
+        .unwrap();
 
     // Wait for replication to the follower and verify it has the data
     tokio::time::sleep(Duration::from_millis(500)).await;
 
     // Verify follower has replicated all entries
     let leader_index = cluster.get_applied_index(leader).unwrap();
-    cluster.wait_for_replication(leader_index, Duration::from_secs(10)).await.unwrap();
+    cluster
+        .wait_for_replication(leader_index, Duration::from_secs(10))
+        .await
+        .unwrap();
 
     // Force snapshot on the follower (not the leader) so it has a local snapshot to recover from
     // This captures the follower's current state including the TTL entry
@@ -258,9 +287,12 @@ async fn test_recovery_with_expired_entries() {
 
     // Verify the follower snapshot index matches what we expect
     let follower_index_after_snapshot = cluster.get_applied_index(follower).unwrap();
-    assert!(follower_index_after_snapshot >= leader_index,
+    assert!(
+        follower_index_after_snapshot >= leader_index,
         "Follower snapshot should include all entries: follower={}, leader={}",
-        follower_index_after_snapshot, leader_index);
+        follower_index_after_snapshot,
+        leader_index
+    );
 
     // Wait for short TTL to expire
     tokio::time::sleep(Duration::from_secs(3)).await;
@@ -302,7 +334,10 @@ async fn test_recovery_preserves_applied_index() {
     let cluster = create_test_cluster().await;
     cluster.start_all().await.unwrap();
 
-    let leader = cluster.wait_for_leader(Duration::from_secs(10)).await.unwrap();
+    let leader = cluster
+        .wait_for_leader(Duration::from_secs(10))
+        .await
+        .unwrap();
 
     // Write some data
     write_test_data(&cluster, 50, "index").await;
@@ -317,7 +352,10 @@ async fn test_recovery_preserves_applied_index() {
     cluster.crash_node(leader).await.unwrap();
 
     // Wait for new leader
-    let _ = cluster.wait_for_leader(Duration::from_secs(10)).await.unwrap();
+    let _ = cluster
+        .wait_for_leader(Duration::from_secs(10))
+        .await
+        .unwrap();
 
     cluster.recover_node(leader).await.unwrap();
     tokio::time::sleep(Duration::from_secs(2)).await;
@@ -345,7 +383,10 @@ async fn test_crash_during_snapshot_write() {
     let cluster = create_test_cluster().await;
     cluster.start_all().await.unwrap();
 
-    let leader = cluster.wait_for_leader(Duration::from_secs(10)).await.unwrap();
+    let leader = cluster
+        .wait_for_leader(Duration::from_secs(10))
+        .await
+        .unwrap();
 
     // Write data
     write_test_data(&cluster, 30, "crash_snap").await;
@@ -367,7 +408,10 @@ async fn test_crash_during_snapshot_write() {
     cluster.crash_node(leader).await.unwrap();
 
     // Wait for new leader
-    let new_leader = cluster.wait_for_leader(Duration::from_secs(15)).await.unwrap();
+    let new_leader = cluster
+        .wait_for_leader(Duration::from_secs(15))
+        .await
+        .unwrap();
 
     // Recover the crashed node
     cluster.recover_node(leader).await.unwrap();
@@ -385,7 +429,10 @@ async fn test_crash_during_log_append() {
     let cluster = create_test_cluster().await;
     cluster.start_all().await.unwrap();
 
-    let leader = cluster.wait_for_leader(Duration::from_secs(10)).await.unwrap();
+    let leader = cluster
+        .wait_for_leader(Duration::from_secs(10))
+        .await
+        .unwrap();
 
     // Write some initial data
     write_test_data(&cluster, 20, "append").await;
@@ -402,7 +449,10 @@ async fn test_crash_during_log_append() {
     }
 
     // Wait for new leader
-    let new_leader = cluster.wait_for_leader(Duration::from_secs(15)).await.unwrap();
+    let new_leader = cluster
+        .wait_for_leader(Duration::from_secs(15))
+        .await
+        .unwrap();
 
     // Recover
     cluster.recover_node(leader).await.unwrap();
@@ -420,12 +470,18 @@ async fn test_crash_during_log_append() {
 /// Test crash after commit but before apply.
 /// NOTE: Requires persistent storage to replay committed but unapplied entries.
 #[tokio::test]
-#[cfg_attr(not(feature = "rocksdb-storage"), ignore = "requires persistent storage (rocksdb-storage feature)")]
+#[cfg_attr(
+    not(feature = "rocksdb-storage"),
+    ignore = "requires persistent storage (rocksdb-storage feature)"
+)]
 async fn test_crash_after_commit_before_apply() {
     let cluster = create_test_cluster().await;
     cluster.start_all().await.unwrap();
 
-    let leader = cluster.wait_for_leader(Duration::from_secs(10)).await.unwrap();
+    let leader = cluster
+        .wait_for_leader(Duration::from_secs(10))
+        .await
+        .unwrap();
 
     // Write data
     write_test_data(&cluster, 30, "commit").await;
@@ -467,7 +523,10 @@ async fn test_crash_during_apply() {
     let cluster = create_test_cluster().await;
     cluster.start_all().await.unwrap();
 
-    let leader = cluster.wait_for_leader(Duration::from_secs(10)).await.unwrap();
+    let leader = cluster
+        .wait_for_leader(Duration::from_secs(10))
+        .await
+        .unwrap();
 
     // Write data rapidly
     for i in 0..50 {
@@ -480,7 +539,10 @@ async fn test_crash_during_apply() {
     cluster.crash_node(leader).await.unwrap();
 
     // Wait for new leader
-    let new_leader = cluster.wait_for_leader(Duration::from_secs(15)).await.unwrap();
+    let new_leader = cluster
+        .wait_for_leader(Duration::from_secs(15))
+        .await
+        .unwrap();
 
     // Recover
     cluster.recover_node(leader).await.unwrap();
@@ -498,7 +560,10 @@ async fn test_crash_during_compaction() {
     let cluster = create_test_cluster().await;
     cluster.start_all().await.unwrap();
 
-    let leader = cluster.wait_for_leader(Duration::from_secs(10)).await.unwrap();
+    let leader = cluster
+        .wait_for_leader(Duration::from_secs(10))
+        .await
+        .unwrap();
 
     // Write enough data to trigger compaction
     write_test_data(&cluster, 100, "compact").await;
@@ -511,7 +576,10 @@ async fn test_crash_during_compaction() {
     cluster.crash_node(leader).await.unwrap();
 
     // Wait for new leader
-    let new_leader = cluster.wait_for_leader(Duration::from_secs(15)).await.unwrap();
+    let new_leader = cluster
+        .wait_for_leader(Duration::from_secs(15))
+        .await
+        .unwrap();
 
     // Recover
     cluster.recover_node(leader).await.unwrap();
@@ -536,7 +604,10 @@ async fn test_leader_crash_and_recovery() {
     let cluster = create_test_cluster().await;
     cluster.start_all().await.unwrap();
 
-    let original_leader = cluster.wait_for_leader(Duration::from_secs(10)).await.unwrap();
+    let original_leader = cluster
+        .wait_for_leader(Duration::from_secs(10))
+        .await
+        .unwrap();
     info!(original_leader, "Original leader elected");
 
     // Write some data
@@ -548,7 +619,10 @@ async fn test_leader_crash_and_recovery() {
     info!(original_leader, "Leader crashed");
 
     // Wait for new leader election
-    let new_leader = cluster.wait_for_leader(Duration::from_secs(15)).await.unwrap();
+    let new_leader = cluster
+        .wait_for_leader(Duration::from_secs(15))
+        .await
+        .unwrap();
     assert_ne!(new_leader, original_leader, "New leader should be elected");
     info!(new_leader, "New leader elected");
 
@@ -579,12 +653,18 @@ async fn test_leader_crash_and_recovery() {
 /// Test follower crash and rejoin.
 /// NOTE: Requires persistent storage to verify data after follower recovery.
 #[tokio::test]
-#[cfg_attr(not(feature = "rocksdb-storage"), ignore = "requires persistent storage (rocksdb-storage feature)")]
+#[cfg_attr(
+    not(feature = "rocksdb-storage"),
+    ignore = "requires persistent storage (rocksdb-storage feature)"
+)]
 async fn test_follower_crash_and_rejoin() {
     let cluster = create_test_cluster().await;
     cluster.start_all().await.unwrap();
 
-    let leader = cluster.wait_for_leader(Duration::from_secs(10)).await.unwrap();
+    let leader = cluster
+        .wait_for_leader(Duration::from_secs(10))
+        .await
+        .unwrap();
 
     // Get a follower
     let followers: Vec<_> = cluster
@@ -629,12 +709,18 @@ async fn test_follower_crash_and_rejoin() {
 /// Test multiple nodes crashing sequentially.
 /// NOTE: Requires persistent storage for nodes to recover with their data.
 #[tokio::test]
-#[cfg_attr(not(feature = "rocksdb-storage"), ignore = "requires persistent storage (rocksdb-storage feature)")]
+#[cfg_attr(
+    not(feature = "rocksdb-storage"),
+    ignore = "requires persistent storage (rocksdb-storage feature)"
+)]
 async fn test_multiple_node_sequential_crash() {
     let cluster = create_cluster_with_nodes(5).await;
     cluster.start_all().await.unwrap();
 
-    let leader = cluster.wait_for_leader(Duration::from_secs(10)).await.unwrap();
+    let leader = cluster
+        .wait_for_leader(Duration::from_secs(10))
+        .await
+        .unwrap();
 
     // Write initial data
     write_test_data(&cluster, 30, "sequential").await;
@@ -680,12 +766,18 @@ async fn test_multiple_node_sequential_crash() {
 /// Test minority crash continues serving.
 /// NOTE: Requires persistent storage for recovered nodes to have data.
 #[tokio::test]
-#[cfg_attr(not(feature = "rocksdb-storage"), ignore = "requires persistent storage (rocksdb-storage feature)")]
+#[cfg_attr(
+    not(feature = "rocksdb-storage"),
+    ignore = "requires persistent storage (rocksdb-storage feature)"
+)]
 async fn test_minority_crash_continues_serving() {
     let cluster = create_cluster_with_nodes(5).await;
     cluster.start_all().await.unwrap();
 
-    let leader = cluster.wait_for_leader(Duration::from_secs(10)).await.unwrap();
+    let leader = cluster
+        .wait_for_leader(Duration::from_secs(10))
+        .await
+        .unwrap();
 
     // Get followers
     let followers: Vec<_> = cluster
@@ -725,7 +817,10 @@ async fn test_majority_crash_recovery() {
     let cluster = create_cluster_with_nodes(5).await;
     cluster.start_all().await.unwrap();
 
-    let leader = cluster.wait_for_leader(Duration::from_secs(10)).await.unwrap();
+    let leader = cluster
+        .wait_for_leader(Duration::from_secs(10))
+        .await
+        .unwrap();
 
     // Write initial data
     write_test_data(&cluster, 20, "before_majority_crash").await;
@@ -742,7 +837,10 @@ async fn test_majority_crash_recovery() {
     cluster.crash_node(leader).await.unwrap();
     cluster.crash_node(followers[0]).await.unwrap();
     cluster.crash_node(followers[1]).await.unwrap();
-    info!("Crashed majority: {}, {}, {}", leader, followers[0], followers[1]);
+    info!(
+        "Crashed majority: {}, {}, {}",
+        leader, followers[0], followers[1]
+    );
 
     // Cluster should not be able to elect a leader
     tokio::time::sleep(Duration::from_secs(2)).await;
@@ -758,7 +856,10 @@ async fn test_majority_crash_recovery() {
     info!("Recovered nodes to restore majority");
 
     // Wait for leader election
-    let new_leader = cluster.wait_for_leader(Duration::from_secs(15)).await.unwrap();
+    let new_leader = cluster
+        .wait_for_leader(Duration::from_secs(15))
+        .await
+        .unwrap();
     info!(new_leader, "New leader elected after recovery");
 
     // Data should be intact
@@ -789,7 +890,10 @@ async fn test_recovery_during_migration() {
     let cluster = create_test_cluster().await;
     cluster.start_all().await.unwrap();
 
-    let leader = cluster.wait_for_leader(Duration::from_secs(10)).await.unwrap();
+    let leader = cluster
+        .wait_for_leader(Duration::from_secs(10))
+        .await
+        .unwrap();
 
     // Simulate high write load (similar to migration)
     for i in 0..100 {
@@ -802,7 +906,10 @@ async fn test_recovery_during_migration() {
     cluster.crash_node(leader).await.unwrap();
 
     // Wait for new leader
-    let new_leader = cluster.wait_for_leader(Duration::from_secs(15)).await.unwrap();
+    let new_leader = cluster
+        .wait_for_leader(Duration::from_secs(15))
+        .await
+        .unwrap();
 
     // Recover
     cluster.recover_node(leader).await.unwrap();
@@ -824,7 +931,10 @@ async fn test_client_reconnect_after_leader_change() {
     let cluster = create_test_cluster().await;
     cluster.start_all().await.unwrap();
 
-    let original_leader = cluster.wait_for_leader(Duration::from_secs(10)).await.unwrap();
+    let original_leader = cluster
+        .wait_for_leader(Duration::from_secs(10))
+        .await
+        .unwrap();
 
     // Write some data
     cluster.write("reconnect_key", "value1").await.unwrap();
@@ -833,7 +943,10 @@ async fn test_client_reconnect_after_leader_change() {
     cluster.crash_node(original_leader).await.unwrap();
 
     // Wait for new leader
-    let new_leader = cluster.wait_for_leader(Duration::from_secs(15)).await.unwrap();
+    let new_leader = cluster
+        .wait_for_leader(Duration::from_secs(15))
+        .await
+        .unwrap();
 
     // Client should be able to write to new leader
     cluster.write("reconnect_key_2", "value2").await.unwrap();
@@ -857,12 +970,18 @@ async fn test_client_reconnect_after_leader_change() {
 /// Test router update after recovery.
 /// NOTE: Requires persistent storage for recovered leader to have data.
 #[tokio::test]
-#[cfg_attr(not(feature = "rocksdb-storage"), ignore = "requires persistent storage (rocksdb-storage feature)")]
+#[cfg_attr(
+    not(feature = "rocksdb-storage"),
+    ignore = "requires persistent storage (rocksdb-storage feature)"
+)]
 async fn test_router_update_after_recovery() {
     let cluster = create_test_cluster().await;
     cluster.start_all().await.unwrap();
 
-    let leader = cluster.wait_for_leader(Duration::from_secs(10)).await.unwrap();
+    let leader = cluster
+        .wait_for_leader(Duration::from_secs(10))
+        .await
+        .unwrap();
 
     // Write data
     write_test_data(&cluster, 20, "router").await;
@@ -870,7 +989,10 @@ async fn test_router_update_after_recovery() {
     // Crash and recover the leader multiple times
     for i in 0..3 {
         cluster.crash_node(leader).await.unwrap();
-        let new_leader = cluster.wait_for_leader(Duration::from_secs(15)).await.unwrap();
+        let new_leader = cluster
+            .wait_for_leader(Duration::from_secs(15))
+            .await
+            .unwrap();
 
         // Write under new leader
         let key = format!("after_failover_{}", i);
@@ -893,7 +1015,10 @@ async fn test_in_flight_request_during_crash() {
     let cluster = create_test_cluster().await;
     cluster.start_all().await.unwrap();
 
-    let leader = cluster.wait_for_leader(Duration::from_secs(10)).await.unwrap();
+    let leader = cluster
+        .wait_for_leader(Duration::from_secs(10))
+        .await
+        .unwrap();
 
     // Write initial data
     write_test_data(&cluster, 10, "inflight").await;
@@ -911,7 +1036,10 @@ async fn test_in_flight_request_during_crash() {
     cluster.crash_node(leader).await.unwrap();
 
     // Wait for new leader
-    let new_leader = cluster.wait_for_leader(Duration::from_secs(15)).await.unwrap();
+    let new_leader = cluster
+        .wait_for_leader(Duration::from_secs(15))
+        .await
+        .unwrap();
 
     // Recover
     cluster.recover_node(leader).await.unwrap();
@@ -933,12 +1061,18 @@ async fn test_in_flight_request_during_crash() {
 /// Test rolling restart preserves data.
 /// NOTE: Requires persistent storage for nodes to preserve data across restarts.
 #[tokio::test]
-#[cfg_attr(not(feature = "rocksdb-storage"), ignore = "requires persistent storage (rocksdb-storage feature)")]
+#[cfg_attr(
+    not(feature = "rocksdb-storage"),
+    ignore = "requires persistent storage (rocksdb-storage feature)"
+)]
 async fn test_rolling_restart_preserves_data() {
     let cluster = create_test_cluster().await;
     cluster.start_all().await.unwrap();
 
-    let _ = cluster.wait_for_leader(Duration::from_secs(10)).await.unwrap();
+    let _ = cluster
+        .wait_for_leader(Duration::from_secs(10))
+        .await
+        .unwrap();
 
     // Write initial data
     write_test_data(&cluster, 50, "rolling").await;
@@ -961,7 +1095,10 @@ async fn test_rolling_restart_preserves_data() {
     }
 
     // Wait for cluster to stabilize
-    let _ = cluster.wait_for_leader(Duration::from_secs(10)).await.unwrap();
+    let _ = cluster
+        .wait_for_leader(Duration::from_secs(10))
+        .await
+        .unwrap();
     tokio::time::sleep(Duration::from_secs(2)).await;
 
     // Data should be preserved
@@ -973,12 +1110,18 @@ async fn test_rolling_restart_preserves_data() {
 /// Test network partition and heal (simulated via crash/recover).
 /// NOTE: Requires persistent storage for healed nodes to have data.
 #[tokio::test]
-#[cfg_attr(not(feature = "rocksdb-storage"), ignore = "requires persistent storage (rocksdb-storage feature)")]
+#[cfg_attr(
+    not(feature = "rocksdb-storage"),
+    ignore = "requires persistent storage (rocksdb-storage feature)"
+)]
 async fn test_network_partition_and_heal() {
     let cluster = create_cluster_with_nodes(5).await;
     cluster.start_all().await.unwrap();
 
-    let leader = cluster.wait_for_leader(Duration::from_secs(10)).await.unwrap();
+    let leader = cluster
+        .wait_for_leader(Duration::from_secs(10))
+        .await
+        .unwrap();
 
     // Write initial data
     write_test_data(&cluster, 30, "partition").await;
@@ -1018,12 +1161,18 @@ async fn test_network_partition_and_heal() {
 /// Test random crash sequence.
 /// NOTE: Requires persistent storage for nodes to recover with their data.
 #[tokio::test]
-#[cfg_attr(not(feature = "rocksdb-storage"), ignore = "requires persistent storage (rocksdb-storage feature)")]
+#[cfg_attr(
+    not(feature = "rocksdb-storage"),
+    ignore = "requires persistent storage (rocksdb-storage feature)"
+)]
 async fn test_random_crash_sequence() {
     let cluster = create_cluster_with_nodes(5).await;
     cluster.start_all().await.unwrap();
 
-    let _ = cluster.wait_for_leader(Duration::from_secs(10)).await.unwrap();
+    let _ = cluster
+        .wait_for_leader(Duration::from_secs(10))
+        .await
+        .unwrap();
 
     // Write initial data
     write_test_data(&cluster, 30, "random_crash").await;
@@ -1032,12 +1181,12 @@ async fn test_random_crash_sequence() {
     // Random crash/recover sequence (keeping majority)
     let nodes = cluster.node_ids();
     let crash_sequence = vec![
-        (nodes[0], true),   // crash
-        (nodes[1], true),   // crash (now 3/5 up)
-        (nodes[0], false),  // recover (now 4/5 up)
-        (nodes[2], true),   // crash (now 3/5 up)
-        (nodes[1], false),  // recover (now 4/5 up)
-        (nodes[2], false),  // recover (all up)
+        (nodes[0], true),  // crash
+        (nodes[1], true),  // crash (now 3/5 up)
+        (nodes[0], false), // recover (now 4/5 up)
+        (nodes[2], true),  // crash (now 3/5 up)
+        (nodes[1], false), // recover (now 4/5 up)
+        (nodes[2], false), // recover (all up)
     ];
 
     for (node, crash) in crash_sequence {
@@ -1072,7 +1221,10 @@ async fn test_crash_with_concurrent_writes() {
     let cluster = create_test_cluster().await;
     cluster.start_all().await.unwrap();
 
-    let leader = cluster.wait_for_leader(Duration::from_secs(10)).await.unwrap();
+    let leader = cluster
+        .wait_for_leader(Duration::from_secs(10))
+        .await
+        .unwrap();
 
     // Write initial data
     write_test_data(&cluster, 20, "concurrent").await;
@@ -1088,7 +1240,10 @@ async fn test_crash_with_concurrent_writes() {
     cluster.crash_node(leader).await.unwrap();
 
     // Wait for new leader
-    let new_leader = cluster.wait_for_leader(Duration::from_secs(15)).await.unwrap();
+    let new_leader = cluster
+        .wait_for_leader(Duration::from_secs(15))
+        .await
+        .unwrap();
 
     // Continue writing under new leader
     write_test_data(&cluster, 10, "after_concurrent_crash").await;
@@ -1113,7 +1268,10 @@ async fn test_metrics_after_recovery() {
     let cluster = create_test_cluster().await;
     cluster.start_all().await.unwrap();
 
-    let leader = cluster.wait_for_leader(Duration::from_secs(10)).await.unwrap();
+    let leader = cluster
+        .wait_for_leader(Duration::from_secs(10))
+        .await
+        .unwrap();
 
     // Write data
     write_test_data(&cluster, 50, "metrics").await;
@@ -1124,7 +1282,10 @@ async fn test_metrics_after_recovery() {
 
     // Crash and recover
     cluster.crash_node(leader).await.unwrap();
-    let _ = cluster.wait_for_leader(Duration::from_secs(15)).await.unwrap();
+    let _ = cluster
+        .wait_for_leader(Duration::from_secs(15))
+        .await
+        .unwrap();
     cluster.recover_node(leader).await.unwrap();
     tokio::time::sleep(Duration::from_secs(2)).await;
 
@@ -1146,7 +1307,10 @@ async fn test_raft_state_consistency() {
     let cluster = create_cluster_with_nodes(5).await;
     cluster.start_all().await.unwrap();
 
-    let _ = cluster.wait_for_leader(Duration::from_secs(10)).await.unwrap();
+    let _ = cluster
+        .wait_for_leader(Duration::from_secs(10))
+        .await
+        .unwrap();
 
     // Write data
     write_test_data(&cluster, 100, "raft_state").await;
@@ -1193,7 +1357,10 @@ async fn test_snapshot_metadata_integrity() {
     let cluster = create_test_cluster().await;
     cluster.start_all().await.unwrap();
 
-    let leader = cluster.wait_for_leader(Duration::from_secs(10)).await.unwrap();
+    let leader = cluster
+        .wait_for_leader(Duration::from_secs(10))
+        .await
+        .unwrap();
 
     // Write enough data to trigger snapshot
     write_test_data(&cluster, 100, "snapshot_meta").await;
@@ -1207,7 +1374,10 @@ async fn test_snapshot_metadata_integrity() {
 
     // Crash and recover
     cluster.crash_node(leader).await.unwrap();
-    let _ = cluster.wait_for_leader(Duration::from_secs(15)).await.unwrap();
+    let _ = cluster
+        .wait_for_leader(Duration::from_secs(15))
+        .await
+        .unwrap();
     cluster.recover_node(leader).await.unwrap();
     tokio::time::sleep(Duration::from_secs(2)).await;
 

@@ -72,7 +72,6 @@ impl CacheStorage {
 
         result
     }
-    
 
     /// Check if a key exists in the cache.
     pub fn contains(&self, key: &[u8]) -> bool {
@@ -92,12 +91,14 @@ impl CacheStorage {
     pub async fn insert_with_ttl(&self, key: Bytes, value: Bytes, ttl: Duration) {
         use std::time::{SystemTime, UNIX_EPOCH};
 
-        // Calculate absolute expiration time
+        // Calculate absolute expiration time (using saturating operations to prevent overflow)
         let now_ms = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
-            .as_millis() as u64;
-        let expires_at_ms = now_ms + ttl.as_millis() as u64;
+            .as_millis()
+            .min(u128::from(u64::MAX)) as u64;
+        let ttl_ms = ttl.as_millis().min(u128::from(u64::MAX)) as u64;
+        let expires_at_ms = now_ms.saturating_add(ttl_ms);
 
         // Store expiration time
         self.expirations.write().insert(key.clone(), expires_at_ms);
@@ -182,10 +183,7 @@ impl CacheStorage {
     /// Note: This is a point-in-time snapshot. Concurrent modifications may not
     /// be fully captured.
     pub fn collect_entries(&self) -> Vec<(Bytes, Bytes)> {
-        self.cache
-            .iter()
-            .map(|(k, v)| ((*k).clone(), v))
-            .collect()
+        self.cache.iter().map(|(k, v)| ((*k).clone(), v)).collect()
     }
 
     /// Collect all entries with their expiration times for snapshot creation.

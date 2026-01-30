@@ -1,4 +1,4 @@
-.PHONY: all build check test test-verbose clippy fmt clean doc run-basic run-cluster help
+.PHONY: all build check test test-verbose nextest nextest-ci nextest-quick clippy fmt clean doc run-basic run-cluster help
 
 # Default target
 all: check clippy test
@@ -27,6 +27,23 @@ test-verbose:
 test-one:
 	@test -n "$(TEST)" || (echo "Usage: make test-one TEST=<test_name>" && exit 1)
 	cargo test $(TEST)
+
+# Run tests with nextest (recommended)
+nextest:
+	cargo nextest run --features full,dashboard
+
+# Run nextest with CI profile
+nextest-ci:
+	cargo nextest run --features full,dashboard --profile ci
+
+# Run nextest quick (fail-fast)
+nextest-quick:
+	cargo nextest run --features full,dashboard --profile quick
+
+# Run nextest with filter (usage: make nextest-filter FILTER=slot)
+nextest-filter:
+	@test -n "$(FILTER)" || (echo "Usage: make nextest-filter FILTER=<pattern>" && exit 1)
+	cargo nextest run --features full,dashboard -E 'test($(FILTER))'
 
 # Run clippy lints
 clippy:
@@ -94,7 +111,11 @@ help:
 	@echo "  clean          Clean build artifacts"
 	@echo ""
 	@echo "Test targets:"
-	@echo "  test           Run all tests"
+	@echo "  nextest        Run tests with nextest (recommended)"
+	@echo "  nextest-ci     Run nextest with CI profile (more retries)"
+	@echo "  nextest-quick  Run nextest quick (fail-fast)"
+	@echo "  nextest-filter Run nextest with filter (FILTER=<pattern>)"
+	@echo "  test           Run all tests (legacy cargo test)"
 	@echo "  test-verbose   Run tests with output"
 	@echo "  test-one       Run a specific test (TEST=<name>)"
 	@echo ""

@@ -310,7 +310,12 @@ impl ChaosController {
     }
 
     /// Manually create a network partition.
-    pub fn create_partition(&self, side_a: HashSet<NodeId>, side_b: HashSet<NodeId>, duration: Duration) {
+    pub fn create_partition(
+        &self,
+        side_a: HashSet<NodeId>,
+        side_b: HashSet<NodeId>,
+        duration: Duration,
+    ) {
         let partition = NetworkPartition {
             side_a,
             side_b,

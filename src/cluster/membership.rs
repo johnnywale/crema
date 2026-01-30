@@ -25,9 +25,6 @@ struct NodeState {
     /// Node information.
     info: PeerInfo,
 
-    /// When the node was first discovered.
-    discovered_at: Instant,
-
     /// When the node was last seen.
     last_seen: Instant,
 
@@ -40,11 +37,9 @@ struct NodeState {
 
 impl NodeState {
     fn new(info: PeerInfo) -> Self {
-        let now = Instant::now();
         Self {
             info,
-            discovered_at: now,
-            last_seen: now,
+            last_seen: Instant::now(),
             failed_checks: 0,
             is_healthy: true,
         }
@@ -426,10 +421,13 @@ mod tests {
 
     #[test]
     fn test_remove_raft_peer() {
-        let (membership, _rx) = ClusterMembership::new(1, MembershipConfig {
-            min_peers: 1,
-            ..test_config()
-        });
+        let (membership, _rx) = ClusterMembership::new(
+            1,
+            MembershipConfig {
+                min_peers: 1,
+                ..test_config()
+            },
+        );
 
         membership.handle_node_discovered(2, "127.0.0.1:9002".parse().unwrap());
         membership.add_raft_peer(2).unwrap();

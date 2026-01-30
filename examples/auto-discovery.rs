@@ -17,7 +17,10 @@
 //! - Gossip-based node discovery
 //! - No need to know all node IPs upfront
 
-use crema::{CacheConfig, DistributedCache, MemberlistConfig, MemberlistDiscovery, PeerManagementConfig, RaftConfig};
+use crema::{
+    CacheConfig, DistributedCache, MemberlistConfig, MemberlistDiscovery, PeerManagementConfig,
+    RaftConfig,
+};
 use std::env;
 use std::net::SocketAddr;
 use std::time::Duration;
@@ -87,14 +90,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         seed_addrs: memberlist_seeds.clone(),
         node_name: Some(format!("cache-node-{}", node_id)),
         peer_management: PeerManagementConfig {
-            auto_add_peers: true,     // Auto-add discovered peers to Raft transport
-            auto_remove_peers: false, // Don't auto-remove (safer)
-            auto_add_voters: true,    // ** KEY: Auto-add discovered nodes as Raft voters **
+            auto_add_peers: true,      // Auto-add discovered peers to Raft transport
+            auto_remove_peers: false,  // Don't auto-remove (safer)
+            auto_add_voters: true,     // ** KEY: Auto-add discovered nodes as Raft voters **
             auto_remove_voters: false, // Don't auto-remove voters
         },
     };
     // Create MemberlistDiscovery for auto-discovery
-    let discovery = MemberlistDiscovery::new(node_id, my_raft_addr, &memberlist_config, &raft_peers);
+    let discovery =
+        MemberlistDiscovery::new(node_id, my_raft_addr, &memberlist_config, &raft_peers);
 
     // Create the cache configuration
     let config = CacheConfig::new(node_id, my_raft_addr)
@@ -124,11 +128,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         println!(
             "[{:2}s] Term: {:2}, Leader: {:?}, Voters: {:?}, Is Leader: {}",
-            i,
-            status.term,
-            status.leader_id,
-            voters,
-            status.is_leader
+            i, status.term, status.leader_id, voters, status.is_leader
         );
 
         if status.leader_id.is_some() {
@@ -179,11 +179,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         for i in 0..5 {
             let key = format!("auto-key-{}", i);
             match cache.get(key.as_bytes()).await {
-                Some(value) => println!(
-                    "  GET '{}' = '{}'",
-                    key,
-                    String::from_utf8_lossy(&value)
-                ),
+                Some(value) => println!("  GET '{}' = '{}'", key, String::from_utf8_lossy(&value)),
                 None => println!("  GET '{}' = (not found)", key),
             }
         }
@@ -200,11 +196,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         for i in 0..5 {
             let key = format!("auto-key-{}", i);
             match cache.get(key.as_bytes()).await {
-                Some(value) => println!(
-                    "  GET '{}' = '{}'",
-                    key,
-                    String::from_utf8_lossy(&value)
-                ),
+                Some(value) => println!("  GET '{}' = '{}'", key, String::from_utf8_lossy(&value)),
                 None => println!("  GET '{}' = (not found yet)", key),
             }
         }

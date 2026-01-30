@@ -33,7 +33,6 @@ pub enum Message {
     ForwardResponse(ForwardResponse),
 
     // ==================== Multi-Raft Shard Forwarding ====================
-
     /// Forwarded command from a node to the shard leader (cross-node, cross-shard).
     /// Used in Multi-Raft mode when a request arrives at a node that doesn't
     /// host the target shard's leader.
@@ -42,8 +41,12 @@ pub enum Message {
     /// Response to a shard forwarded command.
     ShardForwardResponse(ShardForwardResponse),
 
-    // ==================== Migration Messages ====================
+    // ==================== Per-Shard Raft Messages ====================
+    /// Raft message for a specific shard's Raft group.
+    /// Used in Multi-Raft Phase 2 for per-shard replication.
+    ShardRaft(ShardRaftMessage),
 
+    // ==================== Migration Messages ====================
     /// Request to fetch a batch of entries from a shard during migration.
     MigrationFetchRequest(MigrationFetchRequest),
 
@@ -86,6 +89,49 @@ impl RaftMessageWrapper {
     /// Decode the Raft message.
     pub fn to_raft_message(&self) -> Result<RaftMessage, protobuf::ProtobufError> {
         RaftMessage::parse_from_bytes(&self.data)
+    }
+}
+
+// ==================== Per-Shard Raft Messages ====================
+
+/// Raft message for a specific shard's Raft group.
+///
+/// In Multi-Raft Phase 2, each shard has its own independent Raft group.
+/// This message wraps a Raft message with the shard ID to enable routing
+/// to the correct shard's RaftNode.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ShardRaftMessage {
+    /// The shard ID this Raft message belongs to.
+    pub shard_id: ShardId,
+
+    /// The wrapped Raft message.
+    pub raft_message: RaftMessageWrapper,
+}
+
+impl ShardRaftMessage {
+    /// Create a new shard Raft message.
+    pub fn new(shard_id: ShardId, raft_message: RaftMessageWrapper) -> Self {
+        Self {
+            shard_id,
+            raft_message,
+        }
+    }
+
+    /// Create from a Raft message.
+    pub fn from_raft_message(
+        shard_id: ShardId,
+        msg: &RaftMessage,
+    ) -> Result<Self, protobuf::ProtobufError> {
+        let raft_message = RaftMessageWrapper::from_raft_message(msg)?;
+        Ok(Self {
+            shard_id,
+            raft_message,
+        })
+    }
+
+    /// Decode the Raft message.
+    pub fn to_raft_message(&self) -> Result<RaftMessage, protobuf::ProtobufError> {
+        self.raft_message.to_raft_message()
     }
 }
 
@@ -213,7 +259,12 @@ impl ForwardedCommand {
     }
 
     /// Create with specific TTL.
-    pub fn with_ttl(request_id: u64, origin_node_id: NodeId, command: CacheCommand, ttl: u8) -> Self {
+    pub fn with_ttl(
+        request_id: u64,
+        origin_node_id: NodeId,
+        command: CacheCommand,
+        ttl: u8,
+    ) -> Self {
         Self {
             request_id,
             origin_node_id,
@@ -448,14 +499,24 @@ pub struct MigrationFetchRequest {
     pub batch_size: usize,
 }
 
+/// Maximum allowed batch size for migration requests.
+const MAX_MIGRATION_BATCH_SIZE: usize = 10_000;
+
 impl MigrationFetchRequest {
     /// Create a new fetch request.
-    pub fn new(request_id: u64, shard_id: ShardId, last_key: Option<Vec<u8>>, batch_size: usize) -> Self {
+    ///
+    /// Batch size is clamped to [1, 10000] to prevent resource exhaustion.
+    pub fn new(
+        request_id: u64,
+        shard_id: ShardId,
+        last_key: Option<Vec<u8>>,
+        batch_size: usize,
+    ) -> Self {
         Self {
             request_id,
             shard_id,
             last_key,
-            batch_size,
+            batch_size: batch_size.clamp(1, MAX_MIGRATION_BATCH_SIZE),
         }
     }
 }
@@ -481,9 +542,10 @@ impl MigrationEntry {
         }
     }
 
-    /// Get the size of this entry in bytes.
+    /// Get the estimated size of this entry in bytes for batch throttling.
+    /// Uses a fixed 8 bytes for expires_at_nanos (approximation is sufficient for throttling).
     pub fn size(&self) -> usize {
-        self.key.len() + self.value.len() + 8 // 8 for expires_at_nanos
+        self.key.len() + self.value.len() + 8
     }
 }
 
@@ -506,7 +568,12 @@ pub struct MigrationFetchResponse {
 
 impl MigrationFetchResponse {
     /// Create a successful response with entries.
-    pub fn success(request_id: u64, entries: Vec<MigrationEntry>, is_final: bool, sequence: u64) -> Self {
+    pub fn success(
+        request_id: u64,
+        entries: Vec<MigrationEntry>,
+        is_final: bool,
+        sequence: u64,
+    ) -> Self {
         Self {
             request_id,
             success: true,
@@ -550,7 +617,12 @@ pub struct MigrationApplyRequest {
 
 impl MigrationApplyRequest {
     /// Create a new apply request.
-    pub fn new(request_id: u64, shard_id: ShardId, entries: Vec<MigrationEntry>, sequence: u64) -> Self {
+    pub fn new(
+        request_id: u64,
+        shard_id: ShardId,
+        entries: Vec<MigrationEntry>,
+        sequence: u64,
+    ) -> Self {
         Self {
             request_id,
             shard_id,
@@ -607,7 +679,10 @@ pub struct MigrationShardStatsRequest {
 impl MigrationShardStatsRequest {
     /// Create a new stats request.
     pub fn new(request_id: u64, shard_id: ShardId) -> Self {
-        Self { request_id, shard_id }
+        Self {
+            request_id,
+            shard_id,
+        }
     }
 }
 
@@ -755,7 +830,10 @@ pub fn encode_message(msg: &Message) -> Result<Vec<u8>, bincode::Error> {
 ///
 /// This is more efficient than encode_message when you already have a BytesMut
 /// buffer to write into, as it avoids intermediate allocations.
-pub fn encode_message_into(msg: &Message, buffer: &mut bytes::BytesMut) -> Result<usize, bincode::Error> {
+pub fn encode_message_into(
+    msg: &Message,
+    buffer: &mut bytes::BytesMut,
+) -> Result<usize, bincode::Error> {
     // First, calculate the serialized size
     let size = bincode::serialized_size(msg)? as usize;
 

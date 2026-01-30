@@ -96,7 +96,7 @@ mod multi_node_tests {
         sleep(Duration::from_millis(100)).await;
         let config3 = utils::cluster_node_config(3, &port_configs);
         sleep(Duration::from_millis(100)).await;
-        
+
         let cache1 = DistributedCache::new(config1).await.unwrap();
         let cache2 = DistributedCache::new(config2).await.unwrap();
         let cache3 = DistributedCache::new(config3).await.unwrap();
@@ -205,9 +205,15 @@ mod multi_node_tests {
         let port_configs = utils::allocate_os_ports(&[1, 2, 3]).await;
 
         // Create configs directly - CacheConfig is not Clone, so we'll recreate for restart
-        let cache1 = DistributedCache::new(utils::cluster_node_config(1, &port_configs)).await.unwrap();
-        let cache2 = DistributedCache::new(utils::cluster_node_config(2, &port_configs)).await.unwrap();
-        let cache3 = DistributedCache::new(utils::cluster_node_config(3, &port_configs)).await.unwrap();
+        let cache1 = DistributedCache::new(utils::cluster_node_config(1, &port_configs))
+            .await
+            .unwrap();
+        let cache2 = DistributedCache::new(utils::cluster_node_config(2, &port_configs))
+            .await
+            .unwrap();
+        let cache3 = DistributedCache::new(utils::cluster_node_config(3, &port_configs))
+            .await
+            .unwrap();
 
         // Wait for leader election
         let caches = [&cache1, &cache2, &cache3];
@@ -251,16 +257,14 @@ mod multi_node_tests {
         sleep(Duration::from_millis(500)).await;
 
         // Restart node 1 (recreate config since CacheConfig is not Clone)
-        let cache1_rejoined = DistributedCache::new(utils::cluster_node_config(1, &port_configs)).await.unwrap();
+        let cache1_rejoined = DistributedCache::new(utils::cluster_node_config(1, &port_configs))
+            .await
+            .unwrap();
 
         // Wait for node to catch up using the helper (more robust than fixed sleep)
         // Give it enough time for log reconciliation and replication
-        let caught_up = wait_for_node_catchup(
-            &cache1_rejoined,
-            target_applied,
-            Duration::from_secs(15),
-        )
-        .await;
+        let caught_up =
+            wait_for_node_catchup(&cache1_rejoined, target_applied, Duration::from_secs(15)).await;
 
         if !caught_up {
             // Log the current state for debugging
@@ -305,9 +309,15 @@ mod multi_node_tests {
     async fn tc18_stale_leader_replacement() {
         let port_configs = utils::allocate_os_ports(&[1, 2, 3]).await;
         // CacheConfig is not Clone, so create configs directly
-        let cache1 = DistributedCache::new(utils::cluster_node_config(1, &port_configs)).await.unwrap();
-        let cache2 = DistributedCache::new(utils::cluster_node_config(2, &port_configs)).await.unwrap();
-        let cache3 = DistributedCache::new(utils::cluster_node_config(3, &port_configs)).await.unwrap();
+        let cache1 = DistributedCache::new(utils::cluster_node_config(1, &port_configs))
+            .await
+            .unwrap();
+        let cache2 = DistributedCache::new(utils::cluster_node_config(2, &port_configs))
+            .await
+            .unwrap();
+        let cache3 = DistributedCache::new(utils::cluster_node_config(3, &port_configs))
+            .await
+            .unwrap();
         let caches = [&cache1, &cache2, &cache3];
 
         // 缩短等待时间，因为 tick 小了，选举会非常快

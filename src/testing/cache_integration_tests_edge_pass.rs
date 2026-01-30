@@ -1,7 +1,6 @@
 #[cfg(test)]
 pub(crate) mod multi_node_tests {
     use crate::cache::DistributedCache;
-    use crate::config::CacheConfig;
     use crate::testing::utils;
     use crate::testing::utils::allocate_os_ports;
     use crate::types::NodeId;
@@ -187,7 +186,8 @@ pub(crate) mod multi_node_tests {
         let caches = [&cache1, &cache2, &cache3];
 
         // Wait for leader election
-        let initial_leader_id = utils::wait_for_single_leader(&caches, Duration::from_secs(5)).await;
+        let initial_leader_id =
+            utils::wait_for_single_leader(&caches, Duration::from_secs(5)).await;
         assert!(initial_leader_id.is_some(), "Should elect a leader");
 
         // Identify one follower to shut down
@@ -239,7 +239,9 @@ pub(crate) mod multi_node_tests {
                 if let Some(leader) = remaining_caches.iter().find(|c| c.is_leader()) {
                     leader.put("test-key", "test-value").await
                 } else {
-                    Err(crate::error::Error::Raft(crate::error::RaftError::NotLeader { leader: None }))
+                    Err(crate::error::Error::Raft(
+                        crate::error::RaftError::NotLeader { leader: None },
+                    ))
                 }
             },
             |r| r.is_ok(),
@@ -274,7 +276,8 @@ pub(crate) mod multi_node_tests {
         let caches = [&cache1, &cache2, &cache3];
 
         // Wait for initial leader election
-        let initial_leader_id = utils::wait_for_single_leader(&caches, Duration::from_secs(5)).await;
+        let initial_leader_id =
+            utils::wait_for_single_leader(&caches, Duration::from_secs(5)).await;
         assert!(initial_leader_id.is_some(), "Should elect initial leader");
 
         let initial_term = cache1.cluster_status().term;
@@ -320,8 +323,7 @@ pub(crate) mod multi_node_tests {
         assert!(
             term_increased,
             "New leader should have higher term ({} > {})",
-            new_term,
-            initial_term
+            new_term, initial_term
         );
 
         // Verify cluster can accept writes - retry with timeout
@@ -330,7 +332,9 @@ pub(crate) mod multi_node_tests {
                 if let Some(leader) = remaining_caches.iter().find(|c| c.is_leader()) {
                     leader.put("failover-key", "failover-value").await
                 } else {
-                    Err(crate::error::Error::Raft(crate::error::RaftError::NotLeader { leader: None }))
+                    Err(crate::error::Error::Raft(
+                        crate::error::RaftError::NotLeader { leader: None },
+                    ))
                 }
             },
             |r| r.is_ok(),
@@ -353,11 +357,21 @@ pub(crate) mod multi_node_tests {
         let port_configs = allocate_os_ports(&[1, 2, 3, 4, 5]).await;
 
         // Start all 5 nodes (create configs directly - CacheConfig is not Clone)
-        let cache1 = DistributedCache::new(utils::cluster_node_config(1, &port_configs)).await.unwrap();
-        let cache2 = DistributedCache::new(utils::cluster_node_config(2, &port_configs)).await.unwrap();
-        let cache3 = DistributedCache::new(utils::cluster_node_config(3, &port_configs)).await.unwrap();
-        let cache4 = DistributedCache::new(utils::cluster_node_config(4, &port_configs)).await.unwrap();
-        let cache5 = DistributedCache::new(utils::cluster_node_config(5, &port_configs)).await.unwrap();
+        let cache1 = DistributedCache::new(utils::cluster_node_config(1, &port_configs))
+            .await
+            .unwrap();
+        let cache2 = DistributedCache::new(utils::cluster_node_config(2, &port_configs))
+            .await
+            .unwrap();
+        let cache3 = DistributedCache::new(utils::cluster_node_config(3, &port_configs))
+            .await
+            .unwrap();
+        let cache4 = DistributedCache::new(utils::cluster_node_config(4, &port_configs))
+            .await
+            .unwrap();
+        let cache5 = DistributedCache::new(utils::cluster_node_config(5, &port_configs))
+            .await
+            .unwrap();
 
         let all_caches = [&cache1, &cache2, &cache3, &cache4, &cache5];
 
@@ -410,7 +424,9 @@ pub(crate) mod multi_node_tests {
                 if let Some(leader) = majority.iter().find(|c| c.is_leader()) {
                     leader.put("majority-write", "success").await
                 } else {
-                    Err(crate::error::Error::Raft(crate::error::RaftError::NotLeader { leader: None }))
+                    Err(crate::error::Error::Raft(
+                        crate::error::RaftError::NotLeader { leader: None },
+                    ))
                 }
             },
             |r| r.is_ok(),
@@ -489,11 +505,21 @@ pub(crate) mod multi_node_tests {
 
         // Start all 5 nodes (create configs directly - CacheConfig is not Clone)
         let caches = vec![
-            DistributedCache::new(utils::cluster_node_config(1, &port_configs)).await.unwrap(),
-            DistributedCache::new(utils::cluster_node_config(2, &port_configs)).await.unwrap(),
-            DistributedCache::new(utils::cluster_node_config(3, &port_configs)).await.unwrap(),
-            DistributedCache::new(utils::cluster_node_config(4, &port_configs)).await.unwrap(),
-            DistributedCache::new(utils::cluster_node_config(5, &port_configs)).await.unwrap(),
+            DistributedCache::new(utils::cluster_node_config(1, &port_configs))
+                .await
+                .unwrap(),
+            DistributedCache::new(utils::cluster_node_config(2, &port_configs))
+                .await
+                .unwrap(),
+            DistributedCache::new(utils::cluster_node_config(3, &port_configs))
+                .await
+                .unwrap(),
+            DistributedCache::new(utils::cluster_node_config(4, &port_configs))
+                .await
+                .unwrap(),
+            DistributedCache::new(utils::cluster_node_config(5, &port_configs))
+                .await
+                .unwrap(),
         ];
 
         let cache_refs: Vec<&DistributedCache> = caches.iter().collect();
@@ -605,11 +631,21 @@ pub(crate) mod multi_node_tests {
 
         // Create configs directly - CacheConfig is not Clone
         let caches = vec![
-            DistributedCache::new(utils::cluster_node_config(1, &port_configs)).await.unwrap(),
-            DistributedCache::new(utils::cluster_node_config(2, &port_configs)).await.unwrap(),
-            DistributedCache::new(utils::cluster_node_config(3, &port_configs)).await.unwrap(),
-            DistributedCache::new(utils::cluster_node_config(4, &port_configs)).await.unwrap(),
-            DistributedCache::new(utils::cluster_node_config(5, &port_configs)).await.unwrap(),
+            DistributedCache::new(utils::cluster_node_config(1, &port_configs))
+                .await
+                .unwrap(),
+            DistributedCache::new(utils::cluster_node_config(2, &port_configs))
+                .await
+                .unwrap(),
+            DistributedCache::new(utils::cluster_node_config(3, &port_configs))
+                .await
+                .unwrap(),
+            DistributedCache::new(utils::cluster_node_config(4, &port_configs))
+                .await
+                .unwrap(),
+            DistributedCache::new(utils::cluster_node_config(5, &port_configs))
+                .await
+                .unwrap(),
         ];
 
         let cache_refs: Vec<&DistributedCache> = caches.iter().collect();
@@ -642,7 +678,9 @@ pub(crate) mod multi_node_tests {
                 if let Some(leader) = remaining.iter().find(|c| c.is_leader()) {
                     leader.put("quorum-test", "value").await
                 } else {
-                    Err(crate::error::Error::Raft(crate::error::RaftError::NotLeader { leader: None }))
+                    Err(crate::error::Error::Raft(
+                        crate::error::RaftError::NotLeader { leader: None },
+                    ))
                 }
             },
             |r| r.is_ok(),
@@ -712,27 +750,27 @@ pub(crate) mod multi_node_tests {
         let config1 = utils::cluster_node_config(1, &port_configs);
         let config2 = utils::cluster_node_config(2, &port_configs);
         let config3 = utils::cluster_node_config(3, &port_configs);
-    
+
         let cache1 = DistributedCache::new(config1).await.unwrap();
         let cache2 = DistributedCache::new(config2).await.unwrap();
         let cache3 = DistributedCache::new(config3).await.unwrap();
-    
+
         let caches = [&cache1, &cache2, &cache3];
-    
+
         // Wait for leader election
         utils::wait_for_single_leader(&caches, Duration::from_secs(5)).await;
-    
+
         let leader = caches.iter().find(|c| c.is_leader()).unwrap();
-    
+
         // Write and wait for confirmation
         leader
             .put("linearizable-key", "version-1")
             .await
             .expect("Write should succeed");
-    
+
         // Immediately after confirmation, all reads should see the new value
         sleep(Duration::from_millis(500)).await;
-    
+
         for (i, cache) in caches.iter().enumerate() {
             let value = cache.get(b"linearizable-key").await;
             assert_eq!(
@@ -742,15 +780,15 @@ pub(crate) mod multi_node_tests {
                 i + 1
             );
         }
-    
+
         // Update the value
         leader
             .put("linearizable-key", "version-2")
             .await
             .expect("Update should succeed");
-    
+
         sleep(Duration::from_millis(500)).await;
-    
+
         // All subsequent reads should see version-2, never version-1
         for _ in 0..10 {
             for cache in &caches {
@@ -763,7 +801,7 @@ pub(crate) mod multi_node_tests {
             }
             sleep(Duration::from_millis(50)).await;
         }
-    
+
         // Cleanup
         cache1.shutdown().await;
         cache2.shutdown().await;

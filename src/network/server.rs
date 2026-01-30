@@ -67,7 +67,7 @@ impl NetworkServer {
     pub async fn run(mut self) -> Result<()> {
         let listener = TcpListener::bind(self.bind_addr)
             .await
-            .map_err(|e| NetworkError::Io(e))?;
+            .map_err(NetworkError::Io)?;
 
         info!(addr = %self.bind_addr, "Network server listening");
 
@@ -140,7 +140,7 @@ impl NetworkServer {
     async fn handle_connection(
         mut stream: TcpStream,
         handler: Arc<dyn MessageHandler>,
-        _node_id: NodeId,
+        node_id: NodeId,
         cancel_token: CancellationToken,
     ) -> Result<()> {
         loop {
@@ -152,7 +152,7 @@ impl NetworkServer {
 
                 // Check for cancellation first (higher priority)
                 _ = cancel_token.cancelled() => {
-                    debug!("Connection handler cancelled during read");
+                    debug!(node_id, "Connection handler cancelled during read");
                     return Ok(());
                 }
 
@@ -176,9 +176,21 @@ impl NetworkServer {
             }
 
             let len = u32::from_be_bytes(len_buf) as usize;
-            if len > 16 * 1024 * 1024 {
-                // 16MB max message size
-                return Err(NetworkError::ReceiveFailed("message too large".to_string()).into());
+            // Maximum message size to prevent memory exhaustion attacks.
+            // 16MB is large enough for batch operations but limits DoS impact.
+            // For production, consider per-connection rate limiting.
+            const MAX_MESSAGE_SIZE: usize = 16 * 1024 * 1024;
+            if len > MAX_MESSAGE_SIZE {
+                tracing::warn!(
+                    message_len = len,
+                    max_size = MAX_MESSAGE_SIZE,
+                    "Rejecting oversized message"
+                );
+                return Err(NetworkError::ReceiveFailed(format!(
+                    "message too large: {} bytes (max {})",
+                    len, MAX_MESSAGE_SIZE
+                ))
+                .into());
             }
 
             // Read message data
@@ -186,7 +198,7 @@ impl NetworkServer {
             stream
                 .read_exact(&mut data)
                 .await
-                .map_err(|e| NetworkError::Io(e))?;
+                .map_err(NetworkError::Io)?;
 
             // Check cancellation before handling message
             if cancel_token.is_cancelled() {
@@ -206,12 +218,12 @@ impl NetworkServer {
                 stream
                     .write_all(&response_len.to_be_bytes())
                     .await
-                    .map_err(|e| NetworkError::Io(e))?;
+                    .map_err(NetworkError::Io)?;
 
                 stream
                     .write_all(&response_data)
                     .await
-                    .map_err(|e| NetworkError::Io(e))?;
+                    .map_err(NetworkError::Io)?;
             }
         }
     }

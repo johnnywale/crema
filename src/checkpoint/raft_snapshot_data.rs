@@ -81,8 +81,8 @@ pub enum SnapshotDataError {
 ///
 /// # Arguments
 /// * `entries` - Iterator of (key, value, expires_at_ms) tuples to serialize.
-///               expires_at_ms is the absolute expiration time in milliseconds since Unix epoch,
-///               or None for entries without TTL.
+///   expires_at_ms is the absolute expiration time in milliseconds since Unix epoch,
+///   or None for entries without TTL.
 ///
 /// # Returns
 /// Serialized bytes suitable for Raft Snapshot.data field
@@ -123,9 +123,10 @@ pub fn serialize_snapshot_data<'a>(
             let expires_at = expires_at_ms.unwrap_or(0);
             encoder.write_all(&expires_at.to_le_bytes())?;
 
-            // Track uncompressed size
-            data_size += (4 + key.len() + 4 + value.len() + 8) as u64;
-            entry_count += 1;
+            // Track uncompressed size (use saturating_add to prevent overflow)
+            let entry_size = (4 + key.len() + 4 + value.len() + 8) as u64;
+            data_size = data_size.saturating_add(entry_size);
+            entry_count = entry_count.saturating_add(1);
         }
 
         // Finish compression - writes frame footer
@@ -170,7 +171,7 @@ impl SnapshotEntry {
     pub fn is_expired(&self) -> bool {
         use std::time::{SystemTime, UNIX_EPOCH};
 
-        self.expires_at_ms.map_or(false, |expires_at| {
+        self.expires_at_ms.is_some_and(|expires_at| {
             let now_ms = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .unwrap_or_default()
@@ -205,7 +206,14 @@ pub fn deserialize_snapshot_data(data: &[u8]) -> Result<Vec<SnapshotEntry>, Snap
 
     // Verify CRC
     let crc_offset = data.len() - 4;
-    let stored_crc = u32::from_le_bytes(data[crc_offset..].try_into().unwrap());
+    let stored_crc = u32::from_le_bytes(
+        data.get(crc_offset..)
+            .and_then(|s| s.try_into().ok())
+            .ok_or_else(|| SnapshotDataError::TruncatedData {
+                expected: 4,
+                actual: data.len().saturating_sub(crc_offset),
+            })?,
+    );
 
     let mut digest = CRC32.digest();
     digest.update(&data[..crc_offset]);
@@ -218,15 +226,30 @@ pub fn deserialize_snapshot_data(data: &[u8]) -> Result<Vec<SnapshotEntry>, Snap
         });
     }
 
-    // Parse rest of header
-    let version = u32::from_le_bytes(data[4..8].try_into().unwrap());
+    // Parse rest of header - slices are safe after HEADER_SIZE check above
+    let version = u32::from_le_bytes(data.get(4..8).and_then(|s| s.try_into().ok()).ok_or(
+        SnapshotDataError::TruncatedData {
+            expected: 8,
+            actual: data.len(),
+        },
+    )?);
     // Support both version 1 (no expiration) and version 2 (with expiration)
     if version != 1 && version != VERSION {
         return Err(SnapshotDataError::UnsupportedVersion(version));
     }
 
-    let entry_count = u64::from_le_bytes(data[8..16].try_into().unwrap());
-    let _data_size = u64::from_le_bytes(data[16..24].try_into().unwrap());
+    let entry_count = u64::from_le_bytes(data.get(8..16).and_then(|s| s.try_into().ok()).ok_or(
+        SnapshotDataError::TruncatedData {
+            expected: 16,
+            actual: data.len(),
+        },
+    )?);
+    let _data_size = u64::from_le_bytes(data.get(16..24).and_then(|s| s.try_into().ok()).ok_or(
+        SnapshotDataError::TruncatedData {
+            expected: 24,
+            actual: data.len(),
+        },
+    )?);
 
     // Decompress entries using streaming decoder
     let compressed = &data[HEADER_SIZE..crc_offset];
@@ -299,14 +322,20 @@ pub fn is_valid_snapshot_data(data: &[u8]) -> bool {
     }
 
     // Check version (support both 1 and 2)
-    let version = u32::from_le_bytes(data[4..8].try_into().unwrap());
+    let version = match data.get(4..8).and_then(|s| s.try_into().ok()) {
+        Some(bytes) => u32::from_le_bytes(bytes),
+        None => return false,
+    };
     if version != 1 && version != VERSION {
         return false;
     }
 
     // Verify CRC
     let crc_offset = data.len() - 4;
-    let stored_crc = u32::from_le_bytes(data[crc_offset..].try_into().unwrap());
+    let stored_crc = match data.get(crc_offset..).and_then(|s| s.try_into().ok()) {
+        Some(bytes) => u32::from_le_bytes(bytes),
+        None => return false,
+    };
 
     let mut digest = CRC32.digest();
     digest.update(&data[..crc_offset]);
@@ -348,8 +377,16 @@ mod tests {
     fn test_roundtrip_multiple_entries() {
         let entries = vec![
             (b"key1".as_slice(), b"value1".as_slice(), None),
-            (b"key2".as_slice(), b"value2".as_slice(), Some(1234567890000u64)),
-            (b"key3".as_slice(), b"longer value with more data".as_slice(), None),
+            (
+                b"key2".as_slice(),
+                b"value2".as_slice(),
+                Some(1234567890000u64),
+            ),
+            (
+                b"key3".as_slice(),
+                b"longer value with more data".as_slice(),
+                None,
+            ),
         ];
         let data = serialize_snapshot_data(entries.into_iter()).unwrap();
 
@@ -434,7 +471,11 @@ mod tests {
 
         let entries = vec![
             (b"permanent".as_slice(), b"value1".as_slice(), None),
-            (b"future_ttl".as_slice(), b"value2".as_slice(), Some(future_ms)),
+            (
+                b"future_ttl".as_slice(),
+                b"value2".as_slice(),
+                Some(future_ms),
+            ),
             (b"expired".as_slice(), b"value3".as_slice(), Some(past_ms)),
         ];
         let data = serialize_snapshot_data(entries.into_iter()).unwrap();

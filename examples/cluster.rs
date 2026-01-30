@@ -20,10 +20,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Get node ID from command line
     let args: Vec<String> = env::args().collect();
-    let node_id: u64 = args
-        .get(1)
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(1);
+    let node_id: u64 = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(1);
 
     // Define cluster nodes
     let nodes = vec![

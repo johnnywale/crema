@@ -3,8 +3,9 @@
 //! When a request arrives at a node that doesn't host the target shard's leader,
 //! this module handles forwarding the request to the correct node.
 
+use crate::consensus::transport::RaftMessageSender;
 use crate::error::{Error, Result};
-use crate::network::rpc::{Message, ShardForwardedCommand, ShardForwardResponse, ShardId};
+use crate::network::rpc::{Message, ShardForwardResponse, ShardForwardedCommand, ShardId};
 use crate::types::{CacheCommand, NodeId};
 use bytes::Bytes;
 use dashmap::DashMap;
@@ -13,9 +14,7 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpStream;
+use std::time::{Duration, Instant};
 use tokio::sync::oneshot;
 
 /// Configuration for shard forwarding.
@@ -29,9 +28,6 @@ pub struct ShardForwardingConfig {
 
     /// Maximum number of pending forwards (backpressure).
     pub max_pending_forwards: usize,
-
-    /// Connection timeout for reaching other nodes.
-    pub connect_timeout: Duration,
 }
 
 impl Default for ShardForwardingConfig {
@@ -40,7 +36,6 @@ impl Default for ShardForwardingConfig {
             enabled: true,
             timeout: Duration::from_secs(5),
             max_pending_forwards: 5000,
-            connect_timeout: Duration::from_secs(2),
         }
     }
 }
@@ -84,7 +79,6 @@ pub struct ForwardResult {
 }
 
 /// Handles cross-shard request forwarding.
-#[derive(Debug)]
 pub struct ShardForwarder {
     /// This node's ID.
     node_id: NodeId,
@@ -96,10 +90,25 @@ pub struct ShardForwarder {
     node_addresses: Arc<RwLock<HashMap<NodeId, SocketAddr>>>,
 
     /// Pending forwarded requests awaiting response.
-    pending_forwards: Arc<DashMap<u64, oneshot::Sender<ForwardResult>>>,
+    /// Maps request_id -> (oneshot sender for the response, creation time for cleanup).
+    pending_forwards: Arc<DashMap<u64, (oneshot::Sender<ForwardResult>, Instant)>>,
 
     /// Counter for generating unique request IDs.
     next_request_id: AtomicU64,
+
+    /// Transport for sending messages (optional, set after initialization).
+    transport: RwLock<Option<Arc<dyn RaftMessageSender>>>,
+}
+
+impl std::fmt::Debug for ShardForwarder {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ShardForwarder")
+            .field("node_id", &self.node_id)
+            .field("config", &self.config)
+            .field("pending_count", &self.pending_forwards.len())
+            .field("transport_set", &self.transport.read().is_some())
+            .finish()
+    }
 }
 
 impl ShardForwarder {
@@ -111,12 +120,18 @@ impl ShardForwarder {
             node_addresses: Arc::new(RwLock::new(HashMap::new())),
             pending_forwards: Arc::new(DashMap::new()),
             next_request_id: AtomicU64::new(1),
+            transport: RwLock::new(None),
         }
     }
 
     /// Create with default config.
     pub fn with_defaults(node_id: NodeId) -> Self {
         Self::new(node_id, ShardForwardingConfig::default())
+    }
+
+    /// Set the transport for sending messages.
+    pub fn set_transport(&self, transport: Arc<dyn RaftMessageSender>) {
+        *self.transport.write() = Some(transport);
     }
 
     /// Check if forwarding is enabled.
@@ -166,15 +181,15 @@ impl ShardForwarder {
             });
         }
 
-        // Get target node address
-        let target_addr = self.get_node_address(target_node).ok_or_else(|| {
-            tracing::warn!(
+        // Get transport (required for sending)
+        let transport = self.transport.read().clone().ok_or_else(|| {
+            tracing::error!(
                 node_id = self.node_id,
                 target_node = target_node,
                 shard_id = shard_id,
-                "Forward failed: target node address unknown"
+                "Forward failed: transport not set"
             );
-            Error::ShardLeaderUnknown(shard_id)
+            Error::Internal("ShardForwarder transport not initialized".into())
         })?;
 
         // Generate request ID
@@ -182,7 +197,8 @@ impl ShardForwarder {
 
         // Create completion channel
         let (tx, rx) = oneshot::channel();
-        self.pending_forwards.insert(request_id, tx);
+        self.pending_forwards
+            .insert(request_id, (tx, Instant::now()));
 
         // Create the forwarded command
         let forward_cmd = ShardForwardedCommand::new(request_id, self.node_id, shard_id, command);
@@ -193,11 +209,12 @@ impl ShardForwarder {
             target_node = target_node,
             shard_id = shard_id,
             request_id = request_id,
-            "Forwarding shard request to target node"
+            "Forwarding shard request via transport"
         );
 
-        // Send the message
-        if let Err(e) = self.send_message(target_addr, &msg).await {
+        // Send the message via transport (response comes back asynchronously through
+        // NetworkServer -> CacheMessageHandler -> handle_response())
+        if let Err(e) = transport.send_message(target_node, msg).await {
             self.pending_forwards.remove(&request_id);
             return Err(Error::ForwardFailed(format!(
                 "Failed to send to node {}: {}",
@@ -225,13 +242,18 @@ impl ShardForwarder {
     ///
     /// This is called when we receive a response to a forwarded request.
     pub fn handle_response(&self, response: &ShardForwardResponse) {
-        if let Some((_, tx)) = self.pending_forwards.remove(&response.request_id) {
+        if let Some((_, (tx, _))) = self.pending_forwards.remove(&response.request_id) {
             let result = ForwardResult {
                 success: response.success,
                 value: response.value.clone().map(Bytes::from),
                 error: response.error.clone(),
             };
-            let _ = tx.send(result);
+            if tx.send(result).is_err() {
+                tracing::debug!(
+                    request_id = response.request_id,
+                    "Forward response receiver dropped (requester likely timed out)"
+                );
+            }
         } else {
             tracing::warn!(
                 request_id = response.request_id,
@@ -240,70 +262,34 @@ impl ShardForwarder {
         }
     }
 
-    /// Send a message to a node.
-    async fn send_message(&self, addr: SocketAddr, msg: &Message) -> Result<()> {
-        // Connect with timeout
-        let stream = tokio::time::timeout(self.config.connect_timeout, TcpStream::connect(addr))
-            .await
-            .map_err(|_| {
-                Error::ForwardFailed(format!("Connection timeout to {}", addr))
-            })?
-            .map_err(|e| Error::ForwardFailed(format!("Connection failed to {}: {}", addr, e)))?;
-
-        let (mut reader, mut writer) = stream.into_split();
-
-        // Serialize and frame the message
-        let data =
-            bincode::serialize(msg).map_err(|e| Error::ForwardFailed(format!("Serialize: {}", e)))?;
-
-        let len = data.len() as u32;
-        let mut framed = Vec::with_capacity(4 + data.len());
-        framed.extend_from_slice(&len.to_be_bytes());
-        framed.extend_from_slice(&data);
-
-        // Send
-        writer
-            .write_all(&framed)
-            .await
-            .map_err(|e| Error::ForwardFailed(format!("Write failed: {}", e)))?;
-        writer
-            .flush()
-            .await
-            .map_err(|e| Error::ForwardFailed(format!("Flush failed: {}", e)))?;
-
-        // Read response
-        let mut len_buf = [0u8; 4];
-        reader
-            .read_exact(&mut len_buf)
-            .await
-            .map_err(|e| Error::ForwardFailed(format!("Read length failed: {}", e)))?;
-
-        let resp_len = u32::from_be_bytes(len_buf) as usize;
-        if resp_len > 16 * 1024 * 1024 {
-            return Err(Error::ForwardFailed("Response too large".into()));
-        }
-
-        let mut resp_buf = vec![0u8; resp_len];
-        reader
-            .read_exact(&mut resp_buf)
-            .await
-            .map_err(|e| Error::ForwardFailed(format!("Read response failed: {}", e)))?;
-
-        // Deserialize response
-        let resp_msg: Message = bincode::deserialize(&resp_buf)
-            .map_err(|e| Error::ForwardFailed(format!("Deserialize response: {}", e)))?;
-
-        // Handle the response
-        if let Message::ShardForwardResponse(resp) = resp_msg {
-            self.handle_response(&resp);
-        }
-
-        Ok(())
+    /// Get the shared pending forwards map for external access.
+    pub fn pending_forwards(
+        &self,
+    ) -> &Arc<DashMap<u64, (oneshot::Sender<ForwardResult>, Instant)>> {
+        &self.pending_forwards
     }
 
-    /// Get the shared pending forwards map for external access.
-    pub fn pending_forwards(&self) -> &Arc<DashMap<u64, oneshot::Sender<ForwardResult>>> {
-        &self.pending_forwards
+    /// Clean up stale pending forward entries.
+    ///
+    /// This should be called periodically to prevent memory leaks from orphaned requests
+    /// (e.g., when a leader crashes or network partition occurs).
+    pub fn cleanup_stale_entries(&self) -> u64 {
+        let max_age = self.config.timeout + Duration::from_secs(5);
+        let now = Instant::now();
+        let mut removed = 0u64;
+        self.pending_forwards.retain(|_id, (_tx, created_at)| {
+            let is_stale = now.duration_since(*created_at) > max_age;
+            if is_stale {
+                removed = removed.saturating_add(1);
+            }
+            !is_stale
+        });
+        removed
+    }
+
+    /// Get the configured timeout for forwarded requests.
+    pub fn timeout(&self) -> Duration {
+        self.config.timeout
     }
 }
 

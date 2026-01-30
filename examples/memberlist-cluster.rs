@@ -15,7 +15,10 @@
 //! - Nodes can discover each other's addresses via gossip
 //! - Cluster membership events are available for monitoring
 
-use crema::{CacheConfig, DistributedCache, MemberlistConfig, MemberlistDiscovery, PeerManagementConfig, RaftConfig};
+use crema::{
+    CacheConfig, DistributedCache, MemberlistConfig, MemberlistDiscovery, PeerManagementConfig,
+    RaftConfig,
+};
 use std::env;
 use std::net::SocketAddr;
 use std::time::Duration;
@@ -133,11 +136,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         println!(
             "[{:2}s] Term: {:2}, Leader: {:?}, Voters: {:?}, Is Leader: {}",
-            i,
-            status.term,
-            status.leader_id,
-            voters,
-            status.is_leader
+            i, status.term, status.leader_id, voters, status.is_leader
         );
 
         if status.leader_id.is_some() && !leader_found {
@@ -178,11 +177,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         for i in 0..5 {
             let key = format!("memberlist-key-{}", i);
             match cache.get(key.as_bytes()).await {
-                Some(value) => println!(
-                    "  GET '{}' = '{}'",
-                    key,
-                    String::from_utf8_lossy(&value)
-                ),
+                Some(value) => println!("  GET '{}' = '{}'", key, String::from_utf8_lossy(&value)),
                 None => println!("  GET '{}' = (not found)", key),
             }
         }
@@ -199,11 +194,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         for i in 0..5 {
             let key = format!("memberlist-key-{}", i);
             match cache.get(key.as_bytes()).await {
-                Some(value) => println!(
-                    "  GET '{}' = '{}'",
-                    key,
-                    String::from_utf8_lossy(&value)
-                ),
+                Some(value) => println!("  GET '{}' = '{}'", key, String::from_utf8_lossy(&value)),
                 None => println!("  GET '{}' = (not found yet)", key),
             }
         }

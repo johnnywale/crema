@@ -198,7 +198,17 @@ impl ShardPlacement {
     /// Get the nodes that should host a shard.
     ///
     /// Returns nodes in preference order: first is primary, rest are backups.
+    /// Returns empty Vec if shard_id is out of bounds.
     pub fn get_shard_nodes(&self, shard_id: ShardId) -> Vec<NodeId> {
+        // Validate shard_id is within bounds
+        if shard_id >= self.num_shards {
+            tracing::warn!(
+                shard_id = shard_id,
+                num_shards = self.num_shards,
+                "get_shard_nodes called with out-of-bounds shard_id"
+            );
+            return Vec::new();
+        }
         let ring = self.ring.read();
         let key = shard_id.to_le_bytes();
         ring.get_replica_owners(&key)
@@ -463,7 +473,12 @@ mod tests {
 
             // All nodes should be unique
             let unique: HashSet<_> = nodes.iter().collect();
-            assert_eq!(unique.len(), 3, "Shard {} should have unique replicas", shard_id);
+            assert_eq!(
+                unique.len(),
+                3,
+                "Shard {} should have unique replicas",
+                shard_id
+            );
         }
     }
 

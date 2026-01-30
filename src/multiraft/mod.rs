@@ -166,9 +166,9 @@
 //! ```
 
 mod coordinator;
-mod migration_cleanup;
 pub mod memberlist_integration;
 mod migration;
+mod migration_cleanup;
 mod migration_metrics;
 mod migration_orchestrator;
 mod migration_routing;
@@ -179,13 +179,19 @@ mod router;
 mod shard;
 mod shard_forwarder;
 mod shard_placement;
+mod shard_raft_manager;
+mod shard_raft_node;
 mod shard_recovery;
 mod shard_registry;
 mod shard_storage;
+mod shard_transport;
+pub mod slot_control_plane;
+pub mod slot_migration;
+pub mod slot_table;
 
 pub use coordinator::{
-    CoordinatorState, MultiRaftBuilder, MultiRaftConfig, MultiRaftCoordinator, MultiRaftShardController,
-    MultiRaftStats,
+    CoordinatorState, MultiRaftBuilder, MultiRaftConfig, MultiRaftCoordinator,
+    MultiRaftShardController, MultiRaftStats, Redirect,
 };
 pub use memberlist_integration::{ShardLeaderBroadcaster, ShardLeaderTracker};
 pub use migration::{
@@ -193,22 +199,21 @@ pub use migration::{
     MigrationProgress, MigrationStateStore, MigrationStats, ShardMigration,
     ShardMigrationCoordinator, TransferBatch, TransferEntry,
 };
+pub use migration_cleanup::{
+    CleanupResource, CleanupResult, MigrationCleanupHandler, MigrationCleanupManager,
+    NoOpCleanupHandler,
+};
 pub use migration_metrics::{MigrationMetrics, MigrationMetricsSnapshot, MigrationTimer};
 pub use migration_orchestrator::{
     DataTransporter, MigrationCommand, MigrationOrchestrator, MigrationRaftProposer,
     NoOpDataTransporter, NoOpRaftProposer, OrchestrationState,
 };
-pub use migration_transport::{
-    RpcDataTransporter, RpcMigrationRaftProposer, ShardAccessor,
-};
-pub use migration_cleanup::{
-    CleanupResource, CleanupResult, MigrationCleanupHandler, MigrationCleanupManager,
-    NoOpCleanupHandler,
-};
 pub use migration_routing::{
     DualWriteResult, DualWriteTracker, FailedDualWrite, MigrationRouter, MigrationRoutingConfig,
-    MigrationRoutingStrategy, ReadTargets, RoutingDecision as MigrationRoutingDecision, WriteTarget,
+    MigrationRoutingStrategy, ReadTargets, RoutingDecision as MigrationRoutingDecision,
+    WriteTarget,
 };
+pub use migration_transport::{RpcDataTransporter, RpcMigrationRaftProposer, ShardAccessor};
 pub use persistent_migration_store::{
     FileMigrationStore, InMemoryRaftMigrationStore, MigrationCheckpointData,
     PersistentMigrationStore,
@@ -220,16 +225,33 @@ pub use raft_migration::{
 };
 pub use router::{BatchRouter, RouterConfig, RoutingDecision, ShardRouter};
 pub use shard::{Shard, ShardAssignment, ShardConfig, ShardId, ShardInfo, ShardRange, ShardState};
+pub use shard_forwarder::{
+    ForwardResult, ShardForwarder, ShardForwardingConfig, ShardForwardingStats,
+};
 pub use shard_placement::{MovementType, PlacementConfig, ShardMovement, ShardPlacement};
+pub use shard_raft_manager::{ShardRaftManager, ShardRaftManagerBuilder, ShardRaftManagerStats};
+pub use shard_raft_node::{ShardRaftNode, ShardRaftNodeBuilder};
 pub use shard_recovery::{
     RecoveredShard, RecoveryCoordinatorBuilder, RecoveryStats, ShardRecoveryCoordinator,
     ShardRecoveryDetail,
 };
 pub use shard_registry::{ShardLifecycleState, ShardMetadata, ShardRegistry};
-pub use shard_forwarder::{
-    ForwardResult, ShardForwarder, ShardForwardingConfig, ShardForwardingStats,
-};
 pub use shard_storage::{
     PersistedShardMetadata, PersistedShardRegistry, ShardLeaderHint, ShardSnapshotInfo,
     ShardStorageConfig, ShardStorageManager,
+};
+pub use shard_transport::{RaftShardMultiplexer, ShardRaftTransport, ShardTransportMultiplexer};
+
+// Slot-based routing exports
+pub use slot_control_plane::{
+    AddShardResult, ControlPlaneConfig, ControlPlaneSnapshot, RemoveShardResult, ShardControlInfo,
+    ShardState as SlotShardState, SlotControlPlane,
+};
+pub use slot_migration::{
+    MigrationDataAccessor, MigrationPhase as SlotMigrationPhase, MigrationStatus, NoOpDataAccessor,
+    SlotLogEntry, SlotLogOperation, SlotMigrationRecord, SlotMigrator, SlotMigratorConfig,
+};
+pub use slot_table::{
+    crc16, Epoch, EpochCheck, RouteResult, ShardSlotInfo, SlotAssignment, SlotId, SlotReassignment,
+    SlotState, SlotTable, SlotTableSnapshot, TOTAL_SLOTS,
 };

@@ -6,7 +6,7 @@ use bytes::Bytes;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use tracing::{debug, error, info};
+use tracing::{debug, error};
 
 /// The cache state machine that applies committed Raft entries.
 ///
@@ -94,10 +94,17 @@ impl CacheStateMachine {
 
                 if let Some(expires_at_ms) = expires_at_ms {
                     // Calculate remaining TTL from absolute expiration time
-                    let now_ms = SystemTime::now()
-                        .duration_since(UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_millis() as u64;
+                    let now_ms = match SystemTime::now().duration_since(UNIX_EPOCH) {
+                        Ok(d) => d.as_millis().min(u64::MAX as u128) as u64,
+                        Err(e) => {
+                            // System clock is before UNIX epoch - very unusual
+                            tracing::warn!(
+                                error = %e,
+                                "System clock appears to be before UNIX epoch, using 0 for timestamp"
+                            );
+                            0
+                        }
+                    };
 
                     if expires_at_ms > now_ms {
                         // Entry has not yet expired, calculate remaining TTL
@@ -120,10 +127,7 @@ impl CacheStateMachine {
                     }
                 } else {
                     self.storage.insert(key, value).await;
-                    debug!(
-                        raft_index = index,
-                        "STATE_MACHINE: PUT applied (no TTL)"
-                    );
+                    debug!(raft_index = index, "STATE_MACHINE: PUT applied (no TTL)");
                 }
             }
 

@@ -7,7 +7,7 @@ use async_trait::async_trait;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::sync::mpsc;
-use tracing::{info, warn};
+use tracing::info;
 
 use super::discovery::{
     ClusterDiscovery, ClusterDiscoveryError, ClusterEvent, NodeMetadata, NodeRegistry,
@@ -27,10 +27,8 @@ pub struct MemberlistDiscovery {
     cluster: MemberlistCluster,
     /// Generic node registry (synced from memberlist registry).
     registry: Arc<NodeRegistry>,
-    /// Channel for converted events.
+    /// Channel for converted events (receiver only, events come from memberlist).
     event_rx: mpsc::UnboundedReceiver<ClusterEvent>,
-    /// Channel sender for converted events.
-    event_tx: mpsc::UnboundedSender<ClusterEvent>,
     /// This node's ID.
     node_id: NodeId,
     /// Whether the cluster has been started.
@@ -79,7 +77,7 @@ impl MemberlistDiscovery {
 
         let cluster = MemberlistCluster::new(ml_config);
         let registry = Arc::new(NodeRegistry::new());
-        let (event_tx, event_rx) = mpsc::unbounded_channel();
+        let (_event_tx, event_rx) = mpsc::unbounded_channel();
 
         // Register self in the generic registry
         let self_metadata = NodeMetadata::new(node_id, raft_addr);
@@ -89,7 +87,6 @@ impl MemberlistDiscovery {
             cluster,
             registry,
             event_rx,
-            event_tx,
             node_id,
             initialized: false,
         }
@@ -158,10 +155,7 @@ impl MemberlistDiscovery {
 #[async_trait]
 impl ClusterDiscovery for MemberlistDiscovery {
     async fn start(&mut self) -> Result<(), ClusterDiscoveryError> {
-        info!(
-            node_id = self.node_id,
-            "Starting memberlist discovery"
-        );
+        info!(node_id = self.node_id, "Starting memberlist discovery");
 
         self.cluster
             .start()
@@ -173,10 +167,7 @@ impl ClusterDiscovery for MemberlistDiscovery {
         // Sync registry after start
         self.sync_registry();
 
-        info!(
-            node_id = self.node_id,
-            "Memberlist discovery started"
-        );
+        info!(node_id = self.node_id, "Memberlist discovery started");
 
         Ok(())
     }
@@ -322,8 +313,8 @@ mod tests {
 
     #[test]
     fn test_convert_metadata() {
-        let raft_meta = RaftNodeMetadata::new(1, "127.0.0.1:9000".parse().unwrap())
-            .with_tag("role", "leader");
+        let raft_meta =
+            RaftNodeMetadata::new(1, "127.0.0.1:9000".parse().unwrap()).with_tag("role", "leader");
 
         let generic_meta = MemberlistDiscovery::convert_metadata(&raft_meta);
 
@@ -344,7 +335,9 @@ mod tests {
         let cluster_event = MemberlistDiscovery::convert_event(ml_event);
 
         match cluster_event {
-            ClusterEvent::NodeJoin { node_id, raft_addr, .. } => {
+            ClusterEvent::NodeJoin {
+                node_id, raft_addr, ..
+            } => {
                 assert_eq!(node_id, 2);
                 assert_eq!(raft_addr, "127.0.0.1:9001".parse().unwrap());
             }

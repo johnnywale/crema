@@ -221,33 +221,42 @@ impl ShardRouter {
     }
 
     /// Put a value in the appropriate shard.
+    ///
+    /// Propagates errors from the shard, including NotLeader in Phase 2.
     pub async fn put(&self, key: Bytes, value: Bytes) -> Result<ShardId> {
         let shard = self
             .get_shard_for_key(&key)
             .ok_or_else(|| Error::ShardNotFound(self.shard_for_key(&key)))?;
 
-        shard.put(key, value).await;
-        Ok(shard.id())
+        let shard_id = shard.id();
+        shard.put(key, value).await?;
+        Ok(shard_id)
     }
 
     /// Put a value with TTL in the appropriate shard.
+    ///
+    /// Propagates errors from the shard, including NotLeader in Phase 2.
     pub async fn put_with_ttl(&self, key: Bytes, value: Bytes, ttl: Duration) -> Result<ShardId> {
         let shard = self
             .get_shard_for_key(&key)
             .ok_or_else(|| Error::ShardNotFound(self.shard_for_key(&key)))?;
 
-        shard.put_with_ttl(key, value, ttl).await;
-        Ok(shard.id())
+        let shard_id = shard.id();
+        shard.put_with_ttl(key, value, ttl).await?;
+        Ok(shard_id)
     }
 
     /// Delete a key from the appropriate shard.
+    ///
+    /// Propagates errors from the shard, including NotLeader in Phase 2.
     pub async fn delete(&self, key: &[u8]) -> Result<ShardId> {
         let shard = self
             .get_shard_for_key(key)
             .ok_or_else(|| Error::ShardNotFound(self.shard_for_key(key)))?;
 
-        shard.delete(key).await;
-        Ok(shard.id())
+        let shard_id = shard.id();
+        shard.delete(key).await?;
+        Ok(shard_id)
     }
 
     /// Get info about all shards.
@@ -327,7 +336,11 @@ impl BatchRouter {
     }
 
     /// Get routing decisions for multiple keys.
-    pub fn get_routing_decisions(&self, keys: &[&[u8]], local_node: NodeId) -> Vec<RoutingDecision> {
+    pub fn get_routing_decisions(
+        &self,
+        keys: &[&[u8]],
+        local_node: NodeId,
+    ) -> Vec<RoutingDecision> {
         keys.iter()
             .map(|key| {
                 let hash = self.router.hash_key(key);

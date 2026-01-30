@@ -224,7 +224,8 @@ impl CheckpointManager {
         let queued = self.entries_since_snapshot.fetch_add(1, Ordering::Relaxed) + 1;
 
         // Apply backpressure if snapshot is in progress and queue is too large
-        if self.snapshot_in_progress.load(Ordering::Relaxed) {
+        // Use Acquire ordering to properly synchronize with SeqCst/Release stores
+        if self.snapshot_in_progress.load(Ordering::Acquire) {
             let threshold = self.config.log_threshold * self.config.backpressure_multiplier;
             if queued > threshold {
                 return Err(FormatError::Backpressure { queued });
@@ -242,7 +243,7 @@ impl CheckpointManager {
 
     /// Check if there's enough disk space for a snapshot.
     fn check_disk_space(&self) -> Result<(), FormatError> {
-        let entry_count = self.storage.entry_count() as u64;
+        let entry_count = self.storage.entry_count();
         let estimated_size = entry_count * self.config.avg_entry_size;
 
         // Use 2x safety margin
@@ -257,7 +258,10 @@ impl CheckpointManager {
                         required_mb = required / (1024 * 1024),
                         "Insufficient disk space for snapshot"
                     );
-                    return Err(FormatError::InsufficientDiskSpace { available, required });
+                    return Err(FormatError::InsufficientDiskSpace {
+                        available,
+                        required,
+                    });
                 }
                 debug!(
                     available_mb = available / (1024 * 1024),
@@ -277,14 +281,26 @@ impl CheckpointManager {
     /// Get available disk space for a path.
     #[cfg(unix)]
     fn get_available_space(path: &Path) -> Result<u64, std::io::Error> {
-        use std::os::unix::fs::MetadataExt;
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
 
-        // Use statvfs via nix or fallback
-        // For simplicity, we'll try to get the metadata of the directory
-        let metadata = fs::metadata(path)?;
-        // This doesn't give us free space, so we need a platform-specific approach
-        // For now, return a large value to not block on unsupported platforms
-        Ok(u64::MAX)
+        // Convert path to CString for statvfs
+        let path_bytes = path.as_os_str().as_bytes();
+        let c_path = CString::new(path_bytes).map_err(|_| {
+            std::io::Error::new(std::io::ErrorKind::InvalidInput, "path contains null byte")
+        })?;
+
+        // Use libc::statvfs to get filesystem statistics
+        let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
+        let result = unsafe { libc::statvfs(c_path.as_ptr(), &mut stat) };
+
+        if result == 0 {
+            // Available space = f_bavail (blocks available to non-root) * f_frsize (fragment size)
+            let available = (stat.f_bavail as u64).saturating_mul(stat.f_frsize as u64);
+            Ok(available)
+        } else {
+            Err(std::io::Error::last_os_error())
+        }
     }
 
     /// Get available disk space for a path.
@@ -337,7 +353,8 @@ impl CheckpointManager {
             return false;
         }
 
-        if self.snapshot_in_progress.load(Ordering::Relaxed) {
+        // Use Acquire ordering to properly synchronize with SeqCst/Release stores
+        if self.snapshot_in_progress.load(Ordering::Acquire) {
             return false;
         }
 
@@ -372,8 +389,7 @@ impl CheckpointManager {
         raft_term: u64,
     ) -> Result<SnapshotMetadata, FormatError> {
         if !self.config.enabled {
-            return Err(FormatError::Io(std::io::Error::new(
-                std::io::ErrorKind::Other,
+            return Err(FormatError::Io(std::io::Error::other(
                 "checkpointing disabled",
             )));
         }
@@ -396,18 +412,25 @@ impl CheckpointManager {
 
         // Collect entries from cache with expiration times (this is relatively fast)
         // We collect before spawn_blocking to avoid Send issues with Moka iterator
-        let entries: Vec<(Bytes, Bytes, Option<u64>)> = self.storage.collect_entries_with_expiration();
+        let entries: Vec<(Bytes, Bytes, Option<u64>)> =
+            self.storage.collect_entries_with_expiration();
         let config = self.config.clone();
 
         // Run heavy IO work on blocking thread pool
         let result = tokio::task::spawn_blocking(move || {
             Self::create_snapshot_sync(&config, entries, raft_index, raft_term)
         })
-        .await
-        .map_err(|e| FormatError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
+        .await;
 
-        // Clear in-progress flag
+        // CRITICAL: Always clear in-progress flag, even on panic/JoinError
+        // This prevents the flag from being stuck forever
         self.snapshot_in_progress.store(false, Ordering::SeqCst);
+
+        // Now handle the result
+        let result = result.map_err(|e| {
+            tracing::error!(error = %e, "Snapshot task panicked or was cancelled");
+            FormatError::Io(std::io::Error::other(e))
+        })?;
 
         match &result {
             Ok(metadata) => {
@@ -482,7 +505,8 @@ impl CheckpointManager {
         // Note: CacheStorage stores expiration in milliseconds, checkpoint format uses nanoseconds
         for (key, value, expires_at_ms) in &entries {
             // Convert milliseconds to nanoseconds for checkpoint format
-            let expires_at_ns = expires_at_ms.map(|ms| ms * 1_000_000);
+            // Use checked_mul to prevent overflow, cap at u64::MAX if overflow
+            let expires_at_ns = expires_at_ms.map(|ms| ms.saturating_mul(1_000_000));
             writer.write_raw_entry(key, value, expires_at_ns)?;
         }
 
@@ -539,7 +563,17 @@ impl CheckpointManager {
                 continue;
             }
 
-            let filename = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            let filename = match path.file_name().and_then(|n| n.to_str()) {
+                Some(name) => name,
+                None => {
+                    // Non-UTF8 filename - log and skip
+                    tracing::warn!(
+                        path = ?path,
+                        "Skipping file with non-UTF8 filename in checkpoint directory"
+                    );
+                    continue;
+                }
+            };
             if !filename.starts_with("snapshot-") {
                 continue;
             }
@@ -584,7 +618,9 @@ impl CheckpointManager {
         let mut loaded = 0u64;
         let mut skipped_expired = 0u64;
         while let Some(entry) = reader.read_entry()? {
-            let key_preview = String::from_utf8_lossy(&entry.key[..std::cmp::min(entry.key.len(), 32)]).to_string();
+            let key_preview =
+                String::from_utf8_lossy(&entry.key[..std::cmp::min(entry.key.len(), 32)])
+                    .to_string();
 
             // Skip expired entries
             if entry.is_expired() {
@@ -608,9 +644,7 @@ impl CheckpointManager {
                     remaining_ttl_ms = ttl.as_millis() as u64,
                     "CHECKPOINT: Loading entry with TTL"
                 );
-                self.storage
-                    .insert_with_ttl(key, value, ttl)
-                    .await;
+                self.storage.insert_with_ttl(key, value, ttl).await;
             } else {
                 debug!(
                     key = %key_preview,
@@ -633,11 +667,7 @@ impl CheckpointManager {
 
         info!(
             raft_index,
-            raft_term,
-            entry_count,
-            loaded,
-            skipped_expired,
-            "CHECKPOINT: Snapshot loaded"
+            raft_term, entry_count, loaded, skipped_expired, "CHECKPOINT: Snapshot loaded"
         );
 
         Ok(raft_index)

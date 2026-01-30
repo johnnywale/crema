@@ -72,17 +72,21 @@ mod cache_integration_tests_basic;
 mod cache_integration_tests_discovery;
 mod cache_integration_tests_edge_failed;
 mod cache_integration_tests_edge_pass;
+mod dashboard_e2e_tests;
 #[cfg(feature = "memberlist")]
 mod memberlist_cache_integration_tests;
 #[cfg(feature = "memberlist")]
 mod memberlist_cluster_tests;
 mod multiraft_forwarding_tests;
 mod multiraft_integration_tests;
+#[cfg(feature = "memberlist")]
+mod multiraft_per_shard_replication_tests;
 mod raft;
 #[cfg(feature = "memberlist")]
 mod rebalance_e2e_tests;
 #[cfg(feature = "memberlist")]
 mod recovery_e2e_tests;
+mod slot_integration_tests;
 mod utils;
 
 pub use chaos::{
@@ -94,6 +98,66 @@ use crate::types::NodeId;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+
+/// Async helper to wait for a condition to become true.
+///
+/// This is the recommended way to handle timing-sensitive assertions in async tests.
+/// It repeatedly checks the condition until it returns true or the timeout is reached.
+///
+/// # Example
+///
+/// ```rust,ignore
+/// use std::time::Duration;
+/// use crema::testing::eventually;
+///
+/// // Wait for leader election
+/// eventually(Duration::from_secs(5), || async {
+///     cache.leader_id().is_some()
+/// }).await.expect("leader should be elected");
+///
+/// // Wait for value to replicate
+/// eventually(Duration::from_secs(3), || async {
+///     cache.get(b"key").await.is_ok()
+/// }).await.expect("value should replicate");
+/// ```
+pub async fn eventually<F, Fut>(timeout: Duration, mut f: F) -> Result<(), &'static str>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = bool>,
+{
+    let start = tokio::time::Instant::now();
+    loop {
+        if f().await {
+            return Ok(());
+        }
+        if start.elapsed() > timeout {
+            return Err("timeout");
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+/// Async helper with custom error message.
+pub async fn eventually_with_msg<F, Fut>(
+    timeout: Duration,
+    msg: &str,
+    mut f: F,
+) -> Result<(), String>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = bool>,
+{
+    let start = tokio::time::Instant::now();
+    loop {
+        if f().await {
+            return Ok(());
+        }
+        if start.elapsed() > timeout {
+            return Err(format!("timeout after {:?}: {}", timeout, msg));
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
 
 /// A test cluster for integration testing.
 #[derive(Debug)]

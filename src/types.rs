@@ -45,16 +45,16 @@ impl CacheCommand {
     ///
     /// The TTL is converted to an absolute expiration time to ensure
     /// correct behavior across crash recovery and Raft log replay.
-    pub fn put_with_ttl(
-        key: impl Into<Vec<u8>>,
-        value: impl Into<Vec<u8>>,
-        ttl: Duration,
-    ) -> Self {
+    pub fn put_with_ttl(key: impl Into<Vec<u8>>, value: impl Into<Vec<u8>>, ttl: Duration) -> Self {
+        // Safely convert to u64, clamping to avoid truncation
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
-            .as_millis() as u64;
-        let expires_at = now + ttl.as_millis() as u64;
+            .as_millis()
+            .min(u64::MAX as u128) as u64;
+        // Use saturating_add to prevent overflow - caps at u64::MAX
+        let ttl_ms = ttl.as_millis().min(u128::from(u64::MAX)) as u64;
+        let expires_at = now.saturating_add(ttl_ms);
         Self::Put {
             key: key.into(),
             value: value.into(),
@@ -176,11 +176,8 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_millis() as u64;
-        let cmd = CacheCommand::put_with_ttl(
-            b"key".to_vec(),
-            b"value".to_vec(),
-            Duration::from_secs(60),
-        );
+        let cmd =
+            CacheCommand::put_with_ttl(b"key".to_vec(), b"value".to_vec(), Duration::from_secs(60));
         let after = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
@@ -189,10 +186,7 @@ mod tests {
             // expires_at_ms should be between now+60s before and now+60s after
             let expected_min = before + 60_000;
             let expected_max = after + 60_000 + 1; // +1 for rounding
-            assert!(
-                expires_at_ms.is_some(),
-                "Expected expires_at_ms to be set"
-            );
+            assert!(expires_at_ms.is_some(), "Expected expires_at_ms to be set");
             let expires = expires_at_ms.unwrap();
             assert!(
                 expires >= expected_min && expires <= expected_max,

@@ -92,6 +92,8 @@ pub mod checkpoint;
 pub mod cluster;
 pub mod config;
 pub mod consensus;
+#[cfg(feature = "dashboard")]
+pub mod dashboard;
 pub mod error;
 pub mod metrics;
 pub mod multiraft;
@@ -104,7 +106,7 @@ pub mod types;
 pub use cache::DistributedCache;
 pub use config::{
     CacheConfig, MemberlistConfig, MembershipConfig, MembershipMode, MultiRaftCacheConfig,
-    PeerManagementConfig, RaftConfig, RaftStorageType,
+    PeerManagementConfig, RaftConfig, RaftStorageType, ShardRaftConfig, ShardReadMode,
 };
 
 #[cfg(feature = "rocksdb-storage")]
@@ -117,8 +119,8 @@ pub use cluster::{ClusterMembership, MemberEvent};
 
 // Re-export cluster discovery trait and types (always available)
 pub use cluster::{
-    ClusterDiscovery, ClusterDiscoveryError, ClusterEvent, NodeMetadata, NodeRegistry,
-    NoOpClusterDiscovery, ShardLeaderMetadata, StaticClusterDiscovery, StaticDiscoveryConfig,
+    ClusterDiscovery, ClusterDiscoveryError, ClusterEvent, NoOpClusterDiscovery, NodeMetadata,
+    NodeRegistry, ShardLeaderMetadata, StaticClusterDiscovery, StaticDiscoveryConfig,
 };
 
 // Re-export checkpoint types
@@ -145,16 +147,45 @@ pub use testing::{
 
 // Re-export Multi-Raft types
 pub use multiraft::{
-    BatchRouter, CoordinatorState, MultiRaftBuilder, MultiRaftConfig, MultiRaftCoordinator,
-    MultiRaftStats, RouterConfig, RoutingDecision, Shard, ShardAssignment, ShardConfig, ShardId,
-    ShardInfo, ShardLeaderBroadcaster, ShardLeaderTracker, ShardRange, ShardRouter, ShardState,
-    // Shard placement and registry
-    MovementType, PlacementConfig, ShardMovement, ShardPlacement,
-    ShardLifecycleState, ShardMetadata, ShardRegistry,
+    BatchRouter,
+    CoordinatorState,
     // Migration types for shard rebalancing
-    InMemoryMigrationStore, MigrationCheckpoint, MigrationConfig, MigrationPhase,
-    MigrationProgress, MigrationStateStore, MigrationStats, ShardMigration,
-    ShardMigrationCoordinator, MigrationMetrics, MigrationMetricsSnapshot, MigrationTimer,
+    InMemoryMigrationStore,
+    MigrationCheckpoint,
+    MigrationConfig,
+    MigrationMetrics,
+    MigrationMetricsSnapshot,
+    MigrationPhase,
+    MigrationProgress,
+    MigrationStateStore,
+    MigrationStats,
+    MigrationTimer,
+    // Shard placement and registry
+    MovementType,
+    MultiRaftBuilder,
+    MultiRaftConfig,
+    MultiRaftCoordinator,
+    MultiRaftStats,
+    PlacementConfig,
+    RouterConfig,
+    RoutingDecision,
+    Shard,
+    ShardAssignment,
+    ShardConfig,
+    ShardId,
+    ShardInfo,
+    ShardLeaderBroadcaster,
+    ShardLeaderTracker,
+    ShardLifecycleState,
+    ShardMetadata,
+    ShardMigration,
+    ShardMigrationCoordinator,
+    ShardMovement,
+    ShardPlacement,
+    ShardRange,
+    ShardRegistry,
+    ShardRouter,
+    ShardState,
 };
 
 // Re-export migration transfer types (from multiraft, not rebalancing)
@@ -164,8 +195,7 @@ pub use multiraft::TransferEntry as MigrationTransferEntry;
 // Re-export memberlist types for Multi-Raft integration (when feature enabled)
 #[cfg(feature = "memberlist")]
 pub use cluster::memberlist_cluster::{
-    MemberlistCluster, MemberlistClusterConfig, MemberlistError, MemberlistEvent,
-    RaftNodeMetadata,
+    MemberlistCluster, MemberlistClusterConfig, MemberlistError, MemberlistEvent, RaftNodeMetadata,
 };
 
 // Re-export MemberlistDiscovery (ClusterDiscovery implementation using memberlist)

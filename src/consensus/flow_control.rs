@@ -79,7 +79,9 @@ impl FlowControl {
             PressureLevel::Critical | PressureLevel::High => {
                 // Strategy 1: Mark peer as unreachable in Raft
                 self.unreachable_peers.write().insert(peer_id);
-                self.unreachable_since.write().insert(peer_id, Instant::now());
+                self.unreachable_since
+                    .write()
+                    .insert(peer_id, Instant::now());
 
                 // Strategy 2: Reduce inflight messages for this peer by 50%
                 let mut inflight = self.max_inflight.write();
@@ -100,8 +102,7 @@ impl FlowControl {
 
                 warn!(
                     peer_id,
-                    new_limit,
-                    "Applied backpressure: reduced inflight, throttled propose rate"
+                    new_limit, "Applied backpressure: reduced inflight, throttled propose rate"
                 );
             }
             PressureLevel::Normal => {
@@ -216,7 +217,10 @@ impl std::fmt::Debug for FlowControl {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("FlowControl")
             .field("default_max_inflight", &self.default_max_inflight)
-            .field("unreachable_peers_count", &self.unreachable_peers.read().len())
+            .field(
+                "unreachable_peers_count",
+                &self.unreachable_peers.read().len(),
+            )
             .field("current_propose_rate", &self.current_propose_rate())
             .finish()
     }
@@ -257,7 +261,12 @@ impl RateLimiter {
             if available > 0 {
                 if self
                     .available_permits
-                    .compare_exchange(available, available - 1, Ordering::AcqRel, Ordering::Acquire)
+                    .compare_exchange(
+                        available,
+                        available - 1,
+                        Ordering::AcqRel,
+                        Ordering::Acquire,
+                    )
                     .is_ok()
                 {
                     return true;
@@ -268,6 +277,11 @@ impl RateLimiter {
                 self.refill();
             }
         }
+        // Log warning when rate limit is bypassed to prevent deadlock
+        tracing::warn!(
+            "Rate limiter bypassed after {} retries - system may be overloaded",
+            1000
+        );
         true // Eventually allow to prevent deadlock
     }
 
@@ -280,7 +294,12 @@ impl RateLimiter {
             if available > 0 {
                 if self
                     .available_permits
-                    .compare_exchange(available, available - 1, Ordering::AcqRel, Ordering::Acquire)
+                    .compare_exchange(
+                        available,
+                        available - 1,
+                        Ordering::AcqRel,
+                        Ordering::Acquire,
+                    )
                     .is_ok()
                 {
                     return true;
@@ -306,7 +325,8 @@ impl RateLimiter {
             if to_add > 0 {
                 let current = self.available_permits.load(Ordering::Relaxed);
                 let new_available = current.saturating_add(to_add).min(rate);
-                self.available_permits.store(new_available, Ordering::Release);
+                self.available_permits
+                    .store(new_available, Ordering::Release);
                 *last_refill = now;
             }
         }
@@ -346,8 +366,14 @@ impl RateLimiter {
 impl std::fmt::Debug for RateLimiter {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("RateLimiter")
-            .field("permits_per_second", &self.permits_per_second.load(Ordering::Relaxed))
-            .field("available_permits", &self.available_permits.load(Ordering::Relaxed))
+            .field(
+                "permits_per_second",
+                &self.permits_per_second.load(Ordering::Relaxed),
+            )
+            .field(
+                "available_permits",
+                &self.available_permits.load(Ordering::Relaxed),
+            )
             .field("initial_rate", &self.initial_rate)
             .finish()
     }

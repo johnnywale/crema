@@ -54,10 +54,17 @@ pub mod memberlist_discovery;
 
 // Re-export the discovery trait and types (always available)
 pub use discovery::{
-    ClusterDiscovery, ClusterDiscoveryError, ClusterEvent, NodeMetadata, NodeRegistry,
-    NoOpClusterDiscovery, ShardLeaderInfo, ShardLeaderMetadata,
+    ClusterDiscovery,
+    ClusterDiscoveryError,
+    ClusterEvent,
+    NoOpClusterDiscovery,
+    NodeMetadata,
+    NodeRegistry,
+    ShardLeaderInfo,
+    ShardLeaderMetadata,
     // Static discovery (always available)
-    StaticClusterDiscovery, StaticDiscoveryConfig,
+    StaticClusterDiscovery,
+    StaticDiscoveryConfig,
 };
 pub use events::{MemberEvent, MemberEventListener};
 pub use membership::ClusterMembership;
@@ -72,7 +79,6 @@ pub use memberlist_cluster::{
 #[cfg(feature = "memberlist")]
 pub use memberlist_discovery::MemberlistDiscovery;
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -86,16 +92,20 @@ mod tests {
 
     #[test]
     fn test_static_discovery_config_builder() {
-        let config = StaticDiscoveryConfig::new(vec![
-            (1, "127.0.0.1:9000".parse().unwrap()),
-        ])
-        .with_peer(2, "127.0.0.1:9001".parse().unwrap())
-        .with_health_check_interval(std::time::Duration::from_secs(10))
-        .with_health_check_timeout(std::time::Duration::from_secs(5));
+        let config = StaticDiscoveryConfig::new(vec![(1, "127.0.0.1:9000".parse().unwrap())])
+            .with_peer(2, "127.0.0.1:9001".parse().unwrap())
+            .with_health_check_interval(std::time::Duration::from_secs(10))
+            .with_health_check_timeout(std::time::Duration::from_secs(5));
 
         assert_eq!(config.peers.len(), 2);
-        assert_eq!(config.health_check_interval, std::time::Duration::from_secs(10));
-        assert_eq!(config.health_check_timeout, std::time::Duration::from_secs(5));
+        assert_eq!(
+            config.health_check_interval,
+            std::time::Duration::from_secs(10)
+        );
+        assert_eq!(
+            config.health_check_timeout,
+            std::time::Duration::from_secs(5)
+        );
         assert!(config.health_check_enabled);
     }
 
@@ -138,10 +148,16 @@ mod tests {
 
         // Should have received join events for peers 2 and 3
         let event1 = discovery.try_recv_event();
-        assert!(matches!(event1, Some(ClusterEvent::NodeJoin { node_id: 2, .. })));
+        assert!(matches!(
+            event1,
+            Some(ClusterEvent::NodeJoin { node_id: 2, .. })
+        ));
 
         let event2 = discovery.try_recv_event();
-        assert!(matches!(event2, Some(ClusterEvent::NodeJoin { node_id: 3, .. })));
+        assert!(matches!(
+            event2,
+            Some(ClusterEvent::NodeJoin { node_id: 3, .. })
+        ));
 
         discovery.shutdown().await.unwrap();
         assert!(!discovery.is_initialized());
@@ -149,10 +165,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_static_discovery_add_remove_peer() {
-        let config = StaticDiscoveryConfig::new(vec![
-            (1, "127.0.0.1:9000".parse().unwrap()),
-        ])
-        .without_health_checks();
+        let config = StaticDiscoveryConfig::new(vec![(1, "127.0.0.1:9000".parse().unwrap())])
+            .without_health_checks();
 
         let mut discovery =
             StaticClusterDiscovery::new(1, "127.0.0.1:9000".parse().unwrap(), config);
@@ -165,14 +179,20 @@ mod tests {
         assert_eq!(discovery.members().len(), 2);
 
         let event = discovery.try_recv_event();
-        assert!(matches!(event, Some(ClusterEvent::NodeJoin { node_id: 2, .. })));
+        assert!(matches!(
+            event,
+            Some(ClusterEvent::NodeJoin { node_id: 2, .. })
+        ));
 
         // Remove the peer
         discovery.remove_peer(2);
         assert_eq!(discovery.members().len(), 1);
 
         let event = discovery.try_recv_event();
-        assert!(matches!(event, Some(ClusterEvent::NodeLeave { node_id: 2 })));
+        assert!(matches!(
+            event,
+            Some(ClusterEvent::NodeLeave { node_id: 2 })
+        ));
     }
 
     #[tokio::test]

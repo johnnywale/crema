@@ -18,7 +18,10 @@ pub use health::{HealthCheckConfig, HealthChecker, HealthReport, HealthStatus};
 pub use node::RaftNode;
 pub use state_machine::CacheStateMachine;
 pub use storage::{MemStorage, RaftStorage};
-pub use transport::{BackpressureCallback, BackpressureEvent, RaftTransport};
+pub use transport::{
+    BackpressureCallback, BackpressureEvent, RaftMessageSender, RaftTransport, TransportConfig,
+    TransportMetricsSnapshot,
+};
 
 #[cfg(feature = "rocksdb-storage")]
 pub use rocksdb_storage::{RocksDbStorage, RocksDbStorageConfig};

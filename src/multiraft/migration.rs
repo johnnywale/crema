@@ -68,9 +68,7 @@ impl MigrationPhase {
     pub fn is_resumable(&self) -> bool {
         matches!(
             self,
-            MigrationPhase::Planned
-                | MigrationPhase::Streaming
-                | MigrationPhase::CatchingUp
+            MigrationPhase::Planned | MigrationPhase::Streaming | MigrationPhase::CatchingUp
         )
     }
 }
@@ -316,6 +314,7 @@ impl TokenBucketRateLimiter {
     }
 
     /// Create a rate limiter from migration config.
+    #[allow(dead_code)]
     pub fn from_config(config: &MigrationConfig) -> Self {
         // Allow burst of up to 2x the per-second rate
         Self::new(config.max_bytes_per_sec, Some(config.max_bytes_per_sec * 2))
@@ -369,10 +368,8 @@ impl TokenBucketRateLimiter {
             self.refill();
 
             let current = self.tokens.load(Ordering::Acquire);
-            if current >= bytes {
-                if self.try_acquire(bytes) {
-                    break;
-                }
+            if current >= bytes && self.try_acquire(bytes) {
+                break;
             }
 
             // Calculate wait time
@@ -389,7 +386,12 @@ impl TokenBucketRateLimiter {
     /// Acquire tokens with a timeout.
     ///
     /// Returns `Ok(wait_duration)` if tokens were acquired, `Err(())` if timeout.
-    pub async fn acquire_timeout(&self, bytes: u64, timeout: Duration) -> std::result::Result<Duration, ()> {
+    #[allow(dead_code)]
+    pub async fn acquire_timeout(
+        &self,
+        bytes: u64,
+        timeout: Duration,
+    ) -> std::result::Result<Duration, ()> {
         let start = Instant::now();
         let deadline = start + timeout;
 
@@ -407,10 +409,8 @@ impl TokenBucketRateLimiter {
             self.refill();
 
             let current = self.tokens.load(Ordering::Acquire);
-            if current >= bytes {
-                if self.try_acquire(bytes) {
-                    return Ok(start.elapsed());
-                }
+            if current >= bytes && self.try_acquire(bytes) {
+                return Ok(start.elapsed());
             }
 
             // Calculate wait time, capped by remaining timeout
@@ -446,22 +446,26 @@ impl TokenBucketRateLimiter {
     }
 
     /// Get current token count.
+    #[allow(dead_code)]
     pub fn available(&self) -> u64 {
         self.refill();
         self.tokens.load(Ordering::Acquire)
     }
 
     /// Get the configured rate in bytes per second.
+    #[allow(dead_code)]
     pub fn rate(&self) -> u64 {
         self.refill_rate
     }
 
     /// Get the bucket capacity.
+    #[allow(dead_code)]
     pub fn capacity(&self) -> u64 {
         self.capacity
     }
 
     /// Reset the bucket to full capacity.
+    #[allow(dead_code)]
     pub fn reset(&self) {
         self.tokens.store(self.capacity, Ordering::Release);
         *self.last_refill.lock() = Instant::now();
@@ -515,15 +519,14 @@ impl SharedRateLimiter {
         let per_migration = self.for_migration(migration_id);
 
         // Acquire from both limiters (the slower one determines the rate)
-        let (global_wait, per_wait) = tokio::join!(
-            self.global.acquire(bytes),
-            per_migration.acquire(bytes)
-        );
+        let (global_wait, per_wait) =
+            tokio::join!(self.global.acquire(bytes), per_migration.acquire(bytes));
 
         global_wait.max(per_wait)
     }
 
     /// Get total available bandwidth.
+    #[allow(dead_code)]
     pub fn global_available(&self) -> u64 {
         self.global.available()
     }
@@ -616,7 +619,12 @@ pub struct TransferBatch {
 
 impl TransferBatch {
     /// Create a new batch.
-    pub fn new(migration_id: Uuid, sequence: u64, entries: Vec<TransferEntry>, is_final: bool) -> Self {
+    pub fn new(
+        migration_id: Uuid,
+        sequence: u64,
+        entries: Vec<TransferEntry>,
+        is_final: bool,
+    ) -> Self {
         Self {
             migration_id,
             sequence,
@@ -707,6 +715,7 @@ pub trait ClusterStateChecker: Send + Sync + std::fmt::Debug {
 }
 
 /// No-op cluster state checker for testing or when cluster state is unavailable.
+#[allow(dead_code)]
 #[derive(Debug, Default)]
 pub struct NoOpClusterStateChecker;
 
@@ -762,12 +771,16 @@ impl InMemoryMigrationStore {
 #[async_trait::async_trait]
 impl MigrationStateStore for InMemoryMigrationStore {
     async fn save_migration(&self, migration: &ShardMigration) -> Result<()> {
-        self.migrations.lock().insert(migration.id, migration.clone());
+        self.migrations
+            .lock()
+            .insert(migration.id, migration.clone());
         Ok(())
     }
 
     async fn save_checkpoint(&self, checkpoint: &MigrationCheckpoint) -> Result<()> {
-        self.checkpoints.lock().insert(checkpoint.migration_id, checkpoint.clone());
+        self.checkpoints
+            .lock()
+            .insert(checkpoint.migration_id, checkpoint.clone());
         Ok(())
     }
 
@@ -797,6 +810,7 @@ pub struct ShardMigrationCoordinator {
     /// Configuration.
     config: MigrationConfig,
     /// This node's ID.
+    #[allow(dead_code)]
     node_id: NodeId,
     /// Active migrations.
     active_migrations: RwLock<HashMap<ShardId, ShardMigration>>,
@@ -940,7 +954,12 @@ impl ShardMigrationCoordinator {
     ///
     /// Persists to disk FIRST, then updates in-memory state. This ensures
     /// crash-consistency: if we crash between operations, disk has the new state.
-    pub async fn start_streaming(&self, shard_id: ShardId, total_entries: u64, total_bytes: u64) -> Result<()> {
+    pub async fn start_streaming(
+        &self,
+        shard_id: ShardId,
+        total_entries: u64,
+        total_bytes: u64,
+    ) -> Result<()> {
         // Create updated migration for persistence (validate and clone under read lock)
         let migration_for_persist = {
             let migrations = self.active_migrations.read();
@@ -959,7 +978,9 @@ impl ShardMigrationCoordinator {
         };
 
         // CRITICAL: Persist to disk FIRST - if crash happens after this, recovery sees new state
-        self.state_store.save_migration(&migration_for_persist).await?;
+        self.state_store
+            .save_migration(&migration_for_persist)
+            .await?;
 
         // Now update in-memory state (safe - disk is already consistent)
         {
@@ -982,6 +1003,7 @@ impl ShardMigrationCoordinator {
     }
 
     /// Update streaming progress.
+    #[allow(clippy::await_holding_lock)]
     pub async fn update_progress(
         &self,
         shard_id: ShardId,
@@ -999,9 +1021,8 @@ impl ShardMigrationCoordinator {
         migration.last_key = last_key;
 
         // Checkpoint periodically
-        let should_checkpoint = migration.progress.transferred_entries
-            % self.config.checkpoint_interval
-            == 0;
+        let should_checkpoint =
+            migration.progress.transferred_entries % self.config.checkpoint_interval == 0;
 
         let checkpoint = if should_checkpoint {
             let cp = migration.checkpoint();
@@ -1037,7 +1058,9 @@ impl ShardMigrationCoordinator {
         };
 
         // CRITICAL: Persist to disk FIRST
-        self.state_store.save_migration(&migration_for_persist).await?;
+        self.state_store
+            .save_migration(&migration_for_persist)
+            .await?;
 
         // Now update in-memory state
         {
@@ -1084,7 +1107,9 @@ impl ShardMigrationCoordinator {
         let migration_id = migration_for_persist.id;
 
         // CRITICAL: Persist to disk FIRST
-        self.state_store.save_migration(&migration_for_persist).await?;
+        self.state_store
+            .save_migration(&migration_for_persist)
+            .await?;
 
         // Now update in-memory state
         {
@@ -1122,7 +1147,9 @@ impl ShardMigrationCoordinator {
         };
 
         // CRITICAL: Persist to disk FIRST - recovery will see completed state
-        self.state_store.save_migration(&migration_for_persist).await?;
+        self.state_store
+            .save_migration(&migration_for_persist)
+            .await?;
 
         // Now safe to remove from active migrations and add to history
         // (we only need the side effect of removal; the updated state is in migration_for_persist)
@@ -1171,7 +1198,9 @@ impl ShardMigrationCoordinator {
         };
 
         // CRITICAL: Persist to disk FIRST - recovery will see failed state
-        self.state_store.save_migration(&migration_for_persist).await?;
+        self.state_store
+            .save_migration(&migration_for_persist)
+            .await?;
 
         // Now safe to remove from active migrations
         {
@@ -1219,7 +1248,9 @@ impl ShardMigrationCoordinator {
         };
 
         // CRITICAL: Persist to disk FIRST
-        self.state_store.save_migration(&migration_for_persist).await?;
+        self.state_store
+            .save_migration(&migration_for_persist)
+            .await?;
 
         // Now safe to remove from active migrations
         {
@@ -1284,10 +1315,7 @@ impl ShardMigrationCoordinator {
                 }
                 RecoveryAction::Resume => {
                     // Load checkpoint if available
-                    if let Some(checkpoint) = self
-                        .state_store
-                        .load_checkpoint(migration.id)
-                        .await?
+                    if let Some(checkpoint) = self.state_store.load_checkpoint(migration.id).await?
                     {
                         migration.last_key = checkpoint.last_key;
                         migration.progress = checkpoint.progress;
@@ -1383,10 +1411,7 @@ impl ShardMigrationCoordinator {
                 // Terminal states - nothing to do
                 RecoveryAction::MarkComplete
             }
-            _ => RecoveryAction::ManualIntervention(format!(
-                "Unknown phase: {}",
-                migration.phase
-            )),
+            _ => RecoveryAction::ManualIntervention(format!("Unknown phase: {}", migration.phase)),
         }
     }
 
@@ -1399,7 +1424,8 @@ impl ShardMigrationCoordinator {
         let Some(checker) = cluster_checker else {
             // No cluster checker available - cannot verify, require manual intervention
             return RecoveryAction::ManualIntervention(
-                "Interrupted during commit phase - cluster state verification unavailable".to_string()
+                "Interrupted during commit phase - cluster state verification unavailable"
+                    .to_string(),
             );
         };
 
@@ -1423,15 +1449,13 @@ impl ShardMigrationCoordinator {
                     Ok(_) => {
                         // Unexpected owner - manual check needed
                         RecoveryAction::ManualIntervention(
-                            "Commit phase: unexpected shard owner".to_string()
+                            "Commit phase: unexpected shard owner".to_string(),
                         )
                     }
-                    Err(e) => {
-                        RecoveryAction::ManualIntervention(format!(
-                            "Commit phase: failed to get shard owner: {}",
-                            e
-                        ))
-                    }
+                    Err(e) => RecoveryAction::ManualIntervention(format!(
+                        "Commit phase: failed to get shard owner: {}",
+                        e
+                    )),
                 }
             }
             Ok(ClusterMembershipState::TargetIsLearner) => {
@@ -1447,11 +1471,10 @@ impl ShardMigrationCoordinator {
             Ok(ClusterMembershipState::SourceNotInGroup) => {
                 // Source removed - migration might have completed or failed
                 match checker.get_shard_owner(migration.shard_id).await {
-                    Ok(Some(owner)) if owner == migration.to_node => {
-                        RecoveryAction::MarkComplete
-                    }
+                    Ok(Some(owner)) if owner == migration.to_node => RecoveryAction::MarkComplete,
                     _ => RecoveryAction::ManualIntervention(
-                        "Commit phase: source removed but target not confirmed as owner".to_string()
+                        "Commit phase: source removed but target not confirmed as owner"
+                            .to_string(),
                     ),
                 }
             }
@@ -1459,11 +1482,9 @@ impl ShardMigrationCoordinator {
                 // Both are voters - in middle of transfer, can complete
                 RecoveryAction::Resume
             }
-            Ok(ClusterMembershipState::Unknown) | Err(_) => {
-                RecoveryAction::ManualIntervention(
-                    "Commit phase: unable to determine cluster membership state".to_string()
-                )
-            }
+            Ok(ClusterMembershipState::Unknown) | Err(_) => RecoveryAction::ManualIntervention(
+                "Commit phase: unable to determine cluster membership state".to_string(),
+            ),
         }
     }
 
@@ -1494,13 +1515,13 @@ impl ShardMigrationCoordinator {
             Ok(Some(_other)) => {
                 // Someone else owns it - unexpected state
                 RecoveryAction::MarkFailed(
-                    "Shard ownership changed unexpectedly during migration".to_string()
+                    "Shard ownership changed unexpectedly during migration".to_string(),
                 )
             }
             Ok(None) => {
                 // No owner - shard might be unassigned
                 RecoveryAction::ManualIntervention(
-                    "Shard has no owner - cannot determine if migration is valid".to_string()
+                    "Shard has no owner - cannot determine if migration is valid".to_string(),
                 )
             }
             Err(_) => {
@@ -1611,7 +1632,12 @@ mod tests {
     async fn test_migration_coordinator_plan() {
         let coordinator = ShardMigrationCoordinator::with_defaults(1);
 
-        let movement = ShardMovement::new(0, 1, 2, super::super::shard_placement::MovementType::AddReplica);
+        let movement = ShardMovement::new(
+            0,
+            1,
+            2,
+            super::super::shard_placement::MovementType::AddReplica,
+        );
         let migration = coordinator.plan_migration(movement).await.unwrap();
 
         assert_eq!(migration.shard_id, 0);
@@ -1633,7 +1659,12 @@ mod tests {
         assert!(coordinator.is_paused());
 
         // Should fail when paused
-        let movement = ShardMovement::new(0, 1, 2, super::super::shard_placement::MovementType::AddReplica);
+        let movement = ShardMovement::new(
+            0,
+            1,
+            2,
+            super::super::shard_placement::MovementType::AddReplica,
+        );
         let result = coordinator.plan_migration(movement).await;
         assert!(result.is_err());
 
@@ -1646,7 +1677,12 @@ mod tests {
         let coordinator = ShardMigrationCoordinator::with_defaults(1);
 
         // Plan
-        let movement = ShardMovement::new(0, 1, 2, super::super::shard_placement::MovementType::AddReplica);
+        let movement = ShardMovement::new(
+            0,
+            1,
+            2,
+            super::super::shard_placement::MovementType::AddReplica,
+        );
         coordinator.plan_migration(movement).await.unwrap();
 
         // Start streaming
@@ -1657,7 +1693,10 @@ mod tests {
         );
 
         // Update progress
-        coordinator.update_progress(0, 500, 5000, 1000.0, Some(b"key500".to_vec())).await.unwrap();
+        coordinator
+            .update_progress(0, 500, 5000, 1000.0, Some(b"key500".to_vec()))
+            .await
+            .unwrap();
 
         // Start catch-up
         coordinator.start_catchup(0).await.unwrap();

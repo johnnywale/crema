@@ -127,7 +127,10 @@ fn main() {
     println!("    Total:      {}", snapshot.put_total);
     println!("    Success:    {}", snapshot.put_success);
     println!("    Failures:   {}", snapshot.put_failures);
-    println!("    Success Rate: {:.1}%", snapshot.put_success_rate() * 100.0);
+    println!(
+        "    Success Rate: {:.1}%",
+        snapshot.put_success_rate() * 100.0
+    );
     println!();
     println!("  DELETE Operations:");
     println!("    Total:      {}", snapshot.delete_total);
@@ -205,7 +208,11 @@ fn main() {
 
     // Create a custom histogram with custom buckets
     let custom_buckets = vec![0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1.0];
-    let custom_histogram = Histogram::with_buckets("custom_operation", "Custom operation latency", custom_buckets);
+    let custom_histogram = Histogram::with_buckets(
+        "custom_operation",
+        "Custom operation latency",
+        custom_buckets,
+    );
 
     // Record some values
     custom_histogram.observe(0.003);

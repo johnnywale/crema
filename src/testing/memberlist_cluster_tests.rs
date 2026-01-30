@@ -6,15 +6,14 @@
 //! All tests start actual memberlist services that communicate over the network.
 
 use crate::cluster::memberlist_cluster::{
-    MemberlistCluster, MemberlistClusterConfig, MemberlistError, MemberlistEvent, NodeRegistry,
-    RaftNodeMetadata,
+    MemberlistCluster, MemberlistClusterConfig, MemberlistEvent,
 };
 use std::net::SocketAddr;
-use std::time::Duration;
 use std::net::UdpSocket;
 use tokio::net::TcpListener;
 
 /// Port configuration for a node (bind port for memberlist and raft port)
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 struct NodePorts {
     bind_port: u16,
@@ -26,6 +25,7 @@ struct NodePorts {
 ///
 /// Note: memberlist uses BOTH UDP AND TCP on the same bind port (SWIM protocol).
 /// We must ensure both are available on the allocated port.
+#[allow(dead_code)]
 async fn allocate_node_ports(count: usize) -> Vec<NodePorts> {
     let mut result = Vec::with_capacity(count);
     for _ in 0..count {
@@ -66,12 +66,16 @@ async fn allocate_node_ports(count: usize) -> Vec<NodePorts> {
         let raft_port = raft_listener.local_addr().unwrap().port();
         drop(raft_listener);
 
-        result.push(NodePorts { bind_port, raft_port });
+        result.push(NodePorts {
+            bind_port,
+            raft_port,
+        });
     }
     result
 }
 
 /// Create a memberlist cluster config with given ports
+#[allow(dead_code)]
 fn create_config(node_id: u64, ports: &NodePorts, seed_ports: &[u16]) -> MemberlistClusterConfig {
     let seed_addrs: Vec<SocketAddr> = seed_ports
         .iter()
@@ -88,6 +92,7 @@ fn create_config(node_id: u64, ports: &NodePorts, seed_ports: &[u16]) -> Memberl
 }
 
 /// Helper to drain all pending events
+#[allow(dead_code)]
 fn drain_events(cluster: &mut MemberlistCluster) -> Vec<MemberlistEvent> {
     let mut events = Vec::new();
     while let Some(event) = cluster.try_recv_event() {
@@ -99,6 +104,8 @@ fn drain_events(cluster: &mut MemberlistCluster) -> Vec<MemberlistEvent> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cluster::memberlist_cluster::{MemberlistError, NodeRegistry, RaftNodeMetadata};
+    use std::time::Duration;
 
     // ==================== Unit Tests for NodeRegistry ====================
 
@@ -233,15 +240,15 @@ mod tests {
 
         // Check if Node 1 received join event from Node 2
         let events1 = drain_events(&mut cluster1);
-        let node2_joined_node1 = events1.iter().any(|e| {
-            matches!(e, MemberlistEvent::NodeJoin { raft_id, .. } if *raft_id == 2)
-        });
+        let node2_joined_node1 = events1
+            .iter()
+            .any(|e| matches!(e, MemberlistEvent::NodeJoin { raft_id, .. } if *raft_id == 2));
 
         // Check if Node 2 received join event from Node 1
         let events2 = drain_events(&mut cluster2);
-        let node1_joined_node2 = events2.iter().any(|e| {
-            matches!(e, MemberlistEvent::NodeJoin { raft_id, .. } if *raft_id == 1)
-        });
+        let node1_joined_node2 = events2
+            .iter()
+            .any(|e| matches!(e, MemberlistEvent::NodeJoin { raft_id, .. } if *raft_id == 1));
 
         // At least one direction should have discovered the other
         // (gossip is eventually consistent, but should work in both directions)
@@ -376,9 +383,9 @@ mod tests {
 
         // Check if Node 1 received leave event
         let events1 = drain_events(&mut cluster1);
-        let node2_left = events1.iter().any(|e| {
-            matches!(e, MemberlistEvent::NodeLeave { raft_id } if *raft_id == 2)
-        });
+        let node2_left = events1
+            .iter()
+            .any(|e| matches!(e, MemberlistEvent::NodeLeave { raft_id } if *raft_id == 2));
 
         assert!(
             node2_left,
@@ -609,7 +616,9 @@ mod tests {
             format!("127.0.0.1:{}", ports[2].raft_port).parse().unwrap(),
         )
         .with_node_name("test-node-2-rejoined".to_string())
-        .with_seed_nodes(vec![format!("127.0.0.1:{}", ports[0].bind_port).parse().unwrap()]);
+        .with_seed_nodes(vec![format!("127.0.0.1:{}", ports[0].bind_port)
+            .parse()
+            .unwrap()]);
 
         let mut cluster2_new = MemberlistCluster::new(config2_new);
         cluster2_new
@@ -663,9 +672,9 @@ mod tests {
         let events1 = drain_events(&mut cluster1);
 
         // Find the join event for Node 2 and verify metadata
-        let node2_join_event = events1.iter().find(|e| {
-            matches!(e, MemberlistEvent::NodeJoin { raft_id, .. } if *raft_id == 2)
-        });
+        let node2_join_event = events1
+            .iter()
+            .find(|e| matches!(e, MemberlistEvent::NodeJoin { raft_id, .. } if *raft_id == 2));
 
         assert!(
             node2_join_event.is_some(),
@@ -673,7 +682,10 @@ mod tests {
         );
 
         if let Some(MemberlistEvent::NodeJoin { metadata, .. }) = node2_join_event {
-            assert_eq!(metadata.raft_id, 2, "Metadata should contain correct raft_id");
+            assert_eq!(
+                metadata.raft_id, 2,
+                "Metadata should contain correct raft_id"
+            );
             assert!(
                 !metadata.version.is_empty(),
                 "Metadata should contain version string"

@@ -229,7 +229,12 @@ impl ShardRegistry {
             meta.leader_epoch += 1;
             meta.version += 1;
             *self.version.write() += 1;
-            tracing::debug!(shard_id, ?primary, epoch = meta.leader_epoch, "Shard primary updated");
+            tracing::debug!(
+                shard_id,
+                ?primary,
+                epoch = meta.leader_epoch,
+                "Shard primary updated"
+            );
             Some(meta.leader_epoch)
         } else {
             None
@@ -239,12 +244,7 @@ impl ShardRegistry {
     /// Update the primary node for a shard only if the epoch is newer.
     ///
     /// Returns true if the update was applied, false if rejected due to stale epoch.
-    pub fn set_primary_if_newer(
-        &self,
-        shard_id: ShardId,
-        primary: NodeId,
-        epoch: u64,
-    ) -> bool {
+    pub fn set_primary_if_newer(&self, shard_id: ShardId, primary: NodeId, epoch: u64) -> bool {
         let mut shards = self.shards.write();
         if let Some(meta) = shards.get_mut(&shard_id) {
             if epoch > meta.leader_epoch {

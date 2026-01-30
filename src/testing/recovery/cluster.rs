@@ -151,6 +151,7 @@ pub struct RecoveryTestCluster {
     initialized: AtomicBool,
 
     /// Next proposal ID (for tracking writes).
+    #[allow(dead_code)]
     next_proposal_id: AtomicU64,
 }
 
@@ -216,7 +217,10 @@ impl RecoveryTestCluster {
         }
 
         self.initialized.store(true, Ordering::SeqCst);
-        info!(node_count = self.config.node_count, "Recovery test cluster initialized");
+        info!(
+            node_count = self.config.node_count,
+            "Recovery test cluster initialized"
+        );
 
         Ok(())
     }
@@ -227,8 +231,8 @@ impl RecoveryTestCluster {
         node_id: NodeId,
         raft_port: u16,
         memberlist_port: u16,
-        data_dir: &PathBuf,
-        checkpoint_dir: &PathBuf,
+        data_dir: &std::path::Path,
+        checkpoint_dir: &std::path::Path,
         port_configs: &[(NodeId, u16, u16)], // (node_id, raft_port, memberlist_port)
     ) -> CacheConfig {
         let raft_addr: SocketAddr = format!("127.0.0.1:{}", raft_port).parse().unwrap();
@@ -260,9 +264,12 @@ impl RecoveryTestCluster {
         // Configure storage type based on persistent flag and feature availability
         #[cfg(feature = "rocksdb-storage")]
         let storage_type = if self.config.persistent {
-            RaftStorageType::RocksDb(crate::config::RocksDbConfig::new(
-                data_dir.join("raft").to_string_lossy().to_string(),
-            ).with_sync_writes(true))
+            RaftStorageType::RocksDb(
+                crate::config::RocksDbConfig::new(
+                    data_dir.join("raft").to_string_lossy().to_string(),
+                )
+                .with_sync_writes(true),
+            )
         } else {
             RaftStorageType::Memory
         };
@@ -285,7 +292,7 @@ impl RecoveryTestCluster {
         };
 
         // Checkpoint configuration
-        let checkpoint_config = CheckpointConfig::new(checkpoint_dir.clone())
+        let checkpoint_config = CheckpointConfig::new(checkpoint_dir.to_path_buf())
             .with_log_threshold(self.config.checkpoint_log_threshold)
             .with_max_snapshots(self.config.checkpoint_max_snapshots)
             .with_compression(true);
@@ -338,7 +345,7 @@ impl RecoveryTestCluster {
     /// Start a specific node.
     pub async fn start_node(&self, node_id: NodeId) -> Result<()> {
         // Get node state and directories
-        let (data_dir, checkpoint_dir, current_state) = {
+        let (data_dir, checkpoint_dir, _current_state) = {
             let nodes = self.nodes.read();
             let node = nodes
                 .get(&node_id)
@@ -348,20 +355,28 @@ impl RecoveryTestCluster {
                 return Ok(());
             }
 
-            (node.data_dir.clone(), node.checkpoint_dir.clone(), node.state)
+            (
+                node.data_dir.clone(),
+                node.checkpoint_dir.clone(),
+                node.state,
+            )
         };
 
         // Build port configs from stored allocations
         let port_configs: Vec<(NodeId, u16, u16)> = {
             let allocs = self.port_allocations.read();
-            allocs.iter().map(|(id, (raft, ml))| (*id, *raft, *ml)).collect()
+            allocs
+                .iter()
+                .map(|(id, (raft, ml))| (*id, *raft, *ml))
+                .collect()
         };
 
         // Get this node's ports
         let (raft_port, memberlist_port) = {
             let allocs = self.port_allocations.read();
-            *allocs.get(&node_id)
-                .ok_or_else(|| Error::Internal(format!("Port allocation for node {} not found", node_id)))?
+            *allocs.get(&node_id).ok_or_else(|| {
+                Error::Internal(format!("Port allocation for node {} not found", node_id))
+            })?
         };
 
         // Rebuild the config (config is not Clone, so we rebuild it)
@@ -590,12 +605,14 @@ impl RecoveryTestCluster {
     }
 
     /// Verify consistency across all running nodes.
+    #[allow(clippy::await_holding_lock)]
     pub async fn verify_consistency(&self) -> Result<()> {
         let checker = self.checker.read();
         checker.verify_all_nodes(self).await
     }
 
     /// Verify a specific node's data matches expected state.
+    #[allow(clippy::await_holding_lock)]
     pub async fn verify_node(&self, node_id: NodeId) -> Result<()> {
         let checker = self.checker.read();
         checker.verify_node(self, node_id).await
@@ -623,7 +640,10 @@ impl RecoveryTestCluster {
 
     /// Get the cache instance for a node (if running).
     pub fn get_cache(&self, node_id: NodeId) -> Option<Arc<DistributedCache>> {
-        self.nodes.read().get(&node_id).and_then(|n| n.cache.clone())
+        self.nodes
+            .read()
+            .get(&node_id)
+            .and_then(|n| n.cache.clone())
     }
 
     /// Force a snapshot on a specific node.
@@ -641,7 +661,11 @@ impl RecoveryTestCluster {
     }
 
     /// Wait for all nodes to reach a minimum applied index.
-    pub async fn wait_for_replication(&self, min_index: u64, timeout_duration: Duration) -> Result<()> {
+    pub async fn wait_for_replication(
+        &self,
+        min_index: u64,
+        timeout_duration: Duration,
+    ) -> Result<()> {
         let start = std::time::Instant::now();
 
         while start.elapsed() < timeout_duration {
@@ -689,7 +713,10 @@ impl RecoveryTestCluster {
 
     /// Get the checkpoint directory for a node.
     pub fn checkpoint_dir(&self, node_id: NodeId) -> Option<PathBuf> {
-        self.nodes.read().get(&node_id).map(|n| n.checkpoint_dir.clone())
+        self.nodes
+            .read()
+            .get(&node_id)
+            .map(|n| n.checkpoint_dir.clone())
     }
 
     /// Get the data directory for a node.

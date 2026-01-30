@@ -130,7 +130,9 @@ impl InMemoryRaftMigrationStore {
 #[async_trait]
 impl PersistentMigrationStore for InMemoryRaftMigrationStore {
     async fn save_migration(&self, migration: &RaftShardMigration) -> Result<()> {
-        self.migrations.write().insert(migration.change.shard_id, migration.clone());
+        self.migrations
+            .write()
+            .insert(migration.change.shard_id, migration.clone());
         Ok(())
     }
 
@@ -154,7 +156,9 @@ impl PersistentMigrationStore for InMemoryRaftMigrationStore {
 
     async fn save_checkpoint(&self, migration: &RaftShardMigration) -> Result<()> {
         let checkpoint = MigrationCheckpointData::from_migration(migration, 0);
-        self.checkpoints.write().insert(migration.change.shard_id, checkpoint);
+        self.checkpoints
+            .write()
+            .insert(migration.change.shard_id, checkpoint);
         Ok(())
     }
 
@@ -190,11 +194,14 @@ impl FileMigrationStore {
         let base_dir = base_dir.as_ref().to_path_buf();
 
         // Create directory structure using async I/O
-        fs::create_dir_all(base_dir.join("active")).await
+        fs::create_dir_all(base_dir.join("active"))
+            .await
             .map_err(|e| Error::Internal(format!("Failed to create active dir: {}", e)))?;
-        fs::create_dir_all(base_dir.join("completed")).await
+        fs::create_dir_all(base_dir.join("completed"))
+            .await
             .map_err(|e| Error::Internal(format!("Failed to create completed dir: {}", e)))?;
-        fs::create_dir_all(base_dir.join("checkpoints")).await
+        fs::create_dir_all(base_dir.join("checkpoints"))
+            .await
             .map_err(|e| Error::Internal(format!("Failed to create checkpoints dir: {}", e)))?;
 
         Ok(Self {
@@ -205,17 +212,23 @@ impl FileMigrationStore {
 
     /// Get path for active migration file.
     fn active_path(&self, shard_id: ShardId) -> PathBuf {
-        self.base_dir.join("active").join(format!("shard_{:03}.bin", shard_id))
+        self.base_dir
+            .join("active")
+            .join(format!("shard_{:03}.bin", shard_id))
     }
 
     /// Get path for checkpoint file.
     fn checkpoint_path(&self, shard_id: ShardId) -> PathBuf {
-        self.base_dir.join("checkpoints").join(format!("shard_{:03}_checkpoint.bin", shard_id))
+        self.base_dir
+            .join("checkpoints")
+            .join(format!("shard_{:03}_checkpoint.bin", shard_id))
     }
 
     /// Get path for archived migration.
     fn archive_path(&self, migration_id: Uuid) -> PathBuf {
-        self.base_dir.join("completed").join(format!("migration_{}.bin", migration_id))
+        self.base_dir
+            .join("completed")
+            .join(format!("migration_{}.bin", migration_id))
     }
 
     /// Atomically write a file (write to temp, then rename).
@@ -224,17 +237,21 @@ impl FileMigrationStore {
         let temp_path = path.with_extension("tmp");
 
         // Write to temp file using async I/O
-        let mut file = fs::File::create(&temp_path).await
+        let mut file = fs::File::create(&temp_path)
+            .await
             .map_err(|e| Error::Internal(format!("Failed to create temp file: {}", e)))?;
 
-        file.write_all(content).await
+        file.write_all(content)
+            .await
             .map_err(|e| Error::Internal(format!("Failed to write temp file: {}", e)))?;
 
-        file.sync_all().await
+        file.sync_all()
+            .await
             .map_err(|e| Error::Internal(format!("Failed to sync temp file: {}", e)))?;
 
         // Rename to final path (atomic on most filesystems)
-        fs::rename(&temp_path, path).await
+        fs::rename(&temp_path, path)
+            .await
             .map_err(|e| Error::Internal(format!("Failed to rename file: {}", e)))?;
 
         Ok(())
@@ -273,8 +290,10 @@ impl PersistentMigrationStore for FileMigrationStore {
 
         match self.read_file(&path).await {
             Ok(content) => {
-                let migration: RaftShardMigration = bincode::deserialize(&content)
-                    .map_err(|e| Error::Internal(format!("Failed to deserialize migration: {}", e)))?;
+                let migration: RaftShardMigration =
+                    bincode::deserialize(&content).map_err(|e| {
+                        Error::Internal(format!("Failed to deserialize migration: {}", e))
+                    })?;
                 Ok(Some(migration))
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
@@ -286,28 +305,29 @@ impl PersistentMigrationStore for FileMigrationStore {
         let active_dir = self.base_dir.join("active");
         let mut migrations = Vec::new();
 
-        let mut entries = fs::read_dir(&active_dir).await
+        let mut entries = fs::read_dir(&active_dir)
+            .await
             .map_err(|e| Error::Internal(format!("Failed to read active dir: {}", e)))?;
 
-        while let Some(entry) = entries.next_entry().await
+        while let Some(entry) = entries
+            .next_entry()
+            .await
             .map_err(|e| Error::Internal(format!("Failed to read dir entry: {}", e)))?
         {
             let path = entry.path();
 
             if path.extension().map(|e| e == "bin").unwrap_or(false) {
                 match self.read_file(&path).await {
-                    Ok(content) => {
-                        match bincode::deserialize::<RaftShardMigration>(&content) {
-                            Ok(migration) => migrations.push(migration),
-                            Err(e) => {
-                                tracing::warn!(
-                                    path = ?path,
-                                    error = %e,
-                                    "Failed to deserialize migration file, skipping"
-                                );
-                            }
+                    Ok(content) => match bincode::deserialize::<RaftShardMigration>(&content) {
+                        Ok(migration) => migrations.push(migration),
+                        Err(e) => {
+                            tracing::warn!(
+                                path = ?path,
+                                error = %e,
+                                "Failed to deserialize migration file, skipping"
+                            );
                         }
-                    }
+                    },
                     Err(e) => {
                         tracing::warn!(
                             path = ?path,
@@ -333,7 +353,10 @@ impl PersistentMigrationStore for FileMigrationStore {
         match fs::remove_file(&path).await {
             Ok(()) => Ok(()),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(e) => Err(Error::Internal(format!("Failed to remove migration: {}", e))),
+            Err(e) => Err(Error::Internal(format!(
+                "Failed to remove migration: {}",
+                e
+            ))),
         }
     }
 
@@ -354,7 +377,9 @@ impl PersistentMigrationStore for FileMigrationStore {
     }
 
     async fn save_checkpoint(&self, migration: &RaftShardMigration) -> Result<()> {
-        let seq = self.sequence.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let seq = self
+            .sequence
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let checkpoint = MigrationCheckpointData::from_migration(migration, seq);
 
         let path = self.checkpoint_path(migration.change.shard_id);
@@ -378,8 +403,10 @@ impl PersistentMigrationStore for FileMigrationStore {
 
         match self.read_file(&path).await {
             Ok(content) => {
-                let checkpoint: MigrationCheckpointData = bincode::deserialize(&content)
-                    .map_err(|e| Error::Internal(format!("Failed to deserialize checkpoint: {}", e)))?;
+                let checkpoint: MigrationCheckpointData =
+                    bincode::deserialize(&content).map_err(|e| {
+                        Error::Internal(format!("Failed to deserialize checkpoint: {}", e))
+                    })?;
                 Ok(Some(checkpoint))
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
@@ -393,7 +420,10 @@ impl PersistentMigrationStore for FileMigrationStore {
         match fs::remove_file(&path).await {
             Ok(()) => Ok(()),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(e) => Err(Error::Internal(format!("Failed to remove checkpoint: {}", e))),
+            Err(e) => Err(Error::Internal(format!(
+                "Failed to remove checkpoint: {}",
+                e
+            ))),
         }
     }
 }
@@ -526,7 +556,8 @@ mod tests {
         store.archive_migration(&migration).await.unwrap();
 
         // Verify file exists
-        let archive_path = temp_dir.path()
+        let archive_path = temp_dir
+            .path()
             .join("completed")
             .join(format!("migration_{}.bin", migration.id));
         assert!(archive_path.exists());

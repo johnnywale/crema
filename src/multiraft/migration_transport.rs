@@ -7,12 +7,14 @@
 use crate::consensus::transport::RaftTransport;
 use crate::error::{Error, Result};
 use crate::multiraft::migration::{TransferBatch, TransferEntry};
-use crate::multiraft::migration_orchestrator::{DataTransporter, MigrationRaftProposer, MigrationCommand};
+use crate::multiraft::migration_orchestrator::{
+    DataTransporter, MigrationCommand, MigrationRaftProposer,
+};
 use crate::multiraft::shard::ShardId;
 use crate::network::rpc::{
-    Message, MigrationApplyRequest, MigrationApplyResponse, MigrationEntry,
-    MigrationFetchRequest, MigrationFetchResponse, MigrationShardStatsRequest,
-    MigrationShardStatsResponse, MigrationProposalForward, MigrationProposalForwardResponse,
+    Message, MigrationApplyRequest, MigrationApplyResponse, MigrationEntry, MigrationFetchRequest,
+    MigrationFetchResponse, MigrationProposalForward, MigrationProposalForwardResponse,
+    MigrationShardStatsRequest, MigrationShardStatsResponse,
 };
 use crate::types::NodeId;
 
@@ -105,23 +107,17 @@ impl RpcDataTransporter {
     /// Handle an incoming migration message (called by message handler).
     pub async fn handle_message(&self, msg: Message) -> Option<Message> {
         match msg {
-            Message::MigrationFetchRequest(req) => {
-                Some(self.handle_fetch_request(req).await)
-            }
+            Message::MigrationFetchRequest(req) => Some(self.handle_fetch_request(req).await),
             Message::MigrationFetchResponse(resp) => {
                 self.handle_fetch_response(resp);
                 None
             }
-            Message::MigrationApplyRequest(req) => {
-                Some(self.handle_apply_request(req).await)
-            }
+            Message::MigrationApplyRequest(req) => Some(self.handle_apply_request(req).await),
             Message::MigrationApplyResponse(resp) => {
                 self.handle_apply_response(resp);
                 None
             }
-            Message::MigrationShardStatsRequest(req) => {
-                Some(self.handle_stats_request(req).await)
-            }
+            Message::MigrationShardStatsRequest(req) => Some(self.handle_stats_request(req).await),
             Message::MigrationShardStatsResponse(resp) => {
                 self.handle_stats_response(resp);
                 None
@@ -434,7 +430,8 @@ pub struct RpcMigrationRaftProposer {
     /// Current leader hint.
     leader_hint: RwLock<Option<NodeId>>,
     /// Pending forwarded proposals awaiting responses.
-    pending_forwards: RwLock<HashMap<u64, oneshot::Sender<Result<MigrationProposalForwardResponse>>>>,
+    pending_forwards:
+        RwLock<HashMap<u64, oneshot::Sender<Result<MigrationProposalForwardResponse>>>>,
     /// Request ID counter for forwarding.
     next_request_id: AtomicU64,
 }
@@ -496,7 +493,7 @@ impl MigrationRaftProposer for RpcMigrationRaftProposer {
         }
 
         // Forward to leader if we have transport and leader hint
-        let leader = self.leader_hint.read().clone();
+        let leader = *self.leader_hint.read();
         if let (Some(transport), Some(leader_id)) = (&self.transport, leader) {
             if leader_id == self.node_id {
                 return Err(Error::Internal(
@@ -523,17 +520,14 @@ impl RpcMigrationRaftProposer {
         command: MigrationCommand,
     ) -> Result<()> {
         // Serialize the command
-        let command_bytes = bincode::serialize(&command)
-            .map_err(|e| Error::Internal(format!("Failed to serialize migration command: {}", e)))?;
+        let command_bytes = bincode::serialize(&command).map_err(|e| {
+            Error::Internal(format!("Failed to serialize migration command: {}", e))
+        })?;
 
         let request_id = self.next_request_id.fetch_add(1, Ordering::Relaxed);
 
         // Create forward request
-        let forward_req = MigrationProposalForward::new(
-            request_id,
-            self.node_id,
-            command_bytes,
-        );
+        let forward_req = MigrationProposalForward::new(request_id, self.node_id, command_bytes);
 
         // Setup response channel
         let (tx, rx) = oneshot::channel();
@@ -543,7 +537,10 @@ impl RpcMigrationRaftProposer {
         let msg = Message::MigrationProposalForward(forward_req);
         if let Err(e) = transport.send_message(leader_id, msg).await {
             self.pending_forwards.write().remove(&request_id);
-            return Err(Error::Internal(format!("Failed to forward to leader: {}", e)));
+            return Err(Error::Internal(format!(
+                "Failed to forward to leader: {}",
+                e
+            )));
         }
 
         tracing::debug!(
@@ -567,7 +564,9 @@ impl RpcMigrationRaftProposer {
                     }))
                 } else {
                     Err(Error::Internal(
-                        response.error.unwrap_or_else(|| "Unknown forwarding error".to_string()),
+                        response
+                            .error
+                            .unwrap_or_else(|| "Unknown forwarding error".to_string()),
                     ))
                 }
             }
@@ -577,7 +576,9 @@ impl RpcMigrationRaftProposer {
             }
             Ok(Err(_)) => {
                 // Channel closed - leader probably crashed
-                Err(Error::Internal("Forward response channel closed".to_string()))
+                Err(Error::Internal(
+                    "Forward response channel closed".to_string(),
+                ))
             }
             Err(_) => {
                 // Timeout
@@ -620,7 +621,7 @@ impl RpcMigrationRaftProposer {
             }
         } else {
             // No local proposer - we're not the leader
-            let leader = self.leader_hint.read().clone();
+            let leader = *self.leader_hint.read();
             MigrationProposalForwardResponse::not_leader(request.request_id, leader)
         }
     }

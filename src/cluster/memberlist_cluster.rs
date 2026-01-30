@@ -58,12 +58,8 @@ use crate::cluster::discovery::{
 use crate::types::NodeId;
 
 /// Type alias for the transport layer
-type Transport = NetTransport<
-    SmolStr,
-    SocketAddrResolver<TokioRuntime>,
-    Tcp<TokioRuntime>,
-    TokioRuntime,
->;
+type Transport =
+    NetTransport<SmolStr, SocketAddrResolver<TokioRuntime>, Tcp<TokioRuntime>, TokioRuntime>;
 
 /// Type alias for the delegate
 /// CompositeDelegate<I, Address, A, C, E, M, N, P>:
@@ -78,9 +74,9 @@ type MemberlistDelegate = CompositeDelegate<
     SocketAddr,
     memberlist::delegate::VoidDelegate<SmolStr, SocketAddr>, // A: Main delegate
     memberlist::delegate::VoidDelegate<SmolStr, SocketAddr>, // C: Conflict delegate
-    MemberlistEventDelegate,                                  // E: Event delegate
+    MemberlistEventDelegate,                                 // E: Event delegate
     memberlist::delegate::VoidDelegate<SmolStr, SocketAddr>, // M: Merge delegate
-    MemberlistNodeDelegate,                                   // N: Node delegate
+    MemberlistNodeDelegate,                                  // N: Node delegate
     memberlist::delegate::VoidDelegate<SmolStr, SocketAddr>, // P: Ping delegate
 >;
 
@@ -132,7 +128,13 @@ impl RaftNodeMetadata {
 
     /// Serialize metadata to bytes for memberlist
     pub fn to_bytes(&self) -> Vec<u8> {
-        bincode::serialize(self).unwrap_or_default()
+        match bincode::serialize(self) {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                tracing::error!(error = %e, "Failed to serialize RaftNodeMetadata, returning empty");
+                Vec::new()
+            }
+        }
     }
 
     /// Deserialize metadata from bytes
@@ -155,7 +157,8 @@ impl RaftNodeMetadata {
             .map(|(shard_id, info)| format!("{}:{}:{}", shard_id, info.leader_id, info.epoch))
             .collect::<Vec<_>>()
             .join(",");
-        self.tags.insert("multiraft.shard_leaders".to_string(), encoded);
+        self.tags
+            .insert("multiraft.shard_leaders".to_string(), encoded);
     }
 
     /// Get shard leaders from metadata.
@@ -239,19 +242,16 @@ pub enum MemberlistEvent {
 struct TrackedNode {
     metadata: RaftNodeMetadata,
     memberlist_id: SmolStr,
-    first_seen: Instant,
     last_seen: Instant,
     is_healthy: bool,
 }
 
 impl TrackedNode {
     fn new(metadata: RaftNodeMetadata, memberlist_id: SmolStr) -> Self {
-        let now = Instant::now();
         Self {
             metadata,
             memberlist_id,
-            first_seen: now,
-            last_seen: now,
+            last_seen: Instant::now(),
             is_healthy: true,
         }
     }
@@ -278,21 +278,24 @@ impl NodeRegistry {
         let mut nodes = self.nodes.write();
         let mut ml_to_raft = self.memberlist_to_raft.write();
 
-        if nodes.contains_key(&raft_id) {
-            // Update existing node
-            if let Some(node) = nodes.get_mut(&raft_id) {
+        use std::collections::hash_map::Entry;
+        match nodes.entry(raft_id) {
+            Entry::Occupied(mut entry) => {
+                // Update existing node
+                let node = entry.get_mut();
                 node.metadata = metadata;
                 node.last_seen = Instant::now();
                 node.is_healthy = true;
                 node.memberlist_id = memberlist_id.clone();
+                ml_to_raft.insert(memberlist_id, raft_id);
+                false // Not a new node
             }
-            ml_to_raft.insert(memberlist_id, raft_id);
-            false // Not a new node
-        } else {
-            // New node
-            ml_to_raft.insert(memberlist_id.clone(), raft_id);
-            nodes.insert(raft_id, TrackedNode::new(metadata, memberlist_id));
-            true // Is a new node
+            Entry::Vacant(entry) => {
+                // New node
+                ml_to_raft.insert(memberlist_id.clone(), raft_id);
+                entry.insert(TrackedNode::new(metadata, memberlist_id));
+                true // Is a new node
+            }
         }
     }
 
@@ -339,7 +342,10 @@ impl NodeRegistry {
 
     /// Get the Raft address for a node
     pub fn get_addr(&self, raft_id: NodeId) -> Option<SocketAddr> {
-        self.nodes.read().get(&raft_id).map(|n| n.metadata.raft_addr)
+        self.nodes
+            .read()
+            .get(&raft_id)
+            .map(|n| n.metadata.raft_addr)
     }
 
     /// Get full metadata for a node
@@ -483,6 +489,12 @@ impl MemberlistEventDelegate {
                     metadata,
                 });
             }
+        } else {
+            tracing::warn!(
+                memberlist_id = %node_id,
+                meta_len = meta.len(),
+                "Failed to parse node metadata on join - ignoring node"
+            );
         }
     }
 
@@ -560,12 +572,20 @@ impl MemberlistNodeDelegate {
     fn new(metadata: RaftNodeMetadata) -> Self {
         let bytes = metadata.to_bytes();
         // Meta has a max size of 512 bytes, our metadata should fit
-        let meta = Meta::try_from(bytes).unwrap_or_else(|_| Meta::empty());
+        let meta = Meta::try_from(bytes).unwrap_or_else(|e| {
+            tracing::error!(
+                error = %e,
+                raft_id = metadata.raft_id,
+                "Failed to create memberlist Meta from RaftNodeMetadata, using empty"
+            );
+            Meta::empty()
+        });
         Self { local_meta: meta }
     }
 }
 
 // Implement the NodeDelegate trait to provide node metadata
+#[allow(clippy::manual_async_fn)]
 impl NodeDelegate for MemberlistNodeDelegate {
     fn node_meta(&self, _limit: usize) -> impl Future<Output = Meta> + Send {
         let meta = self.local_meta.clone();
@@ -681,10 +701,10 @@ impl MemberlistCluster {
             SocketAddrResolver<TokioRuntime>,
             Tcp<TokioRuntime>,
         >::new(node_name);
-        transport_opts.add_bind_address(self.config.bind_addr.into());
+        transport_opts.add_bind_address(self.config.bind_addr);
 
         if let Some(advertise_addr) = self.config.advertise_addr {
-            transport_opts = transport_opts.with_advertise_address(advertise_addr.into());
+            transport_opts = transport_opts.with_advertise_address(advertise_addr);
         }
 
         // Configure memberlist options
@@ -795,35 +815,33 @@ impl MemberlistCluster {
     /// Convert a MemberlistEvent to a ClusterEvent
     fn to_cluster_event(event: MemberlistEvent) -> ClusterEvent {
         match event {
-            MemberlistEvent::NodeJoin { raft_id, raft_addr, metadata } => {
-                ClusterEvent::NodeJoin {
-                    node_id: raft_id,
-                    raft_addr,
-                    metadata: GenericNodeMetadata {
-                        node_id: metadata.raft_id,
-                        raft_addr: metadata.raft_addr,
-                        version: metadata.version,
-                        tags: metadata.tags,
-                    },
-                }
-            }
-            MemberlistEvent::NodeLeave { raft_id } => {
-                ClusterEvent::NodeLeave { node_id: raft_id }
-            }
+            MemberlistEvent::NodeJoin {
+                raft_id,
+                raft_addr,
+                metadata,
+            } => ClusterEvent::NodeJoin {
+                node_id: raft_id,
+                raft_addr,
+                metadata: GenericNodeMetadata {
+                    node_id: metadata.raft_id,
+                    raft_addr: metadata.raft_addr,
+                    version: metadata.version,
+                    tags: metadata.tags,
+                },
+            },
+            MemberlistEvent::NodeLeave { raft_id } => ClusterEvent::NodeLeave { node_id: raft_id },
             MemberlistEvent::NodeFailed { raft_id } => {
                 ClusterEvent::NodeFailed { node_id: raft_id }
             }
-            MemberlistEvent::NodeUpdate { raft_id, metadata } => {
-                ClusterEvent::NodeUpdate {
-                    node_id: raft_id,
-                    metadata: GenericNodeMetadata {
-                        node_id: metadata.raft_id,
-                        raft_addr: metadata.raft_addr,
-                        version: metadata.version,
-                        tags: metadata.tags,
-                    },
-                }
-            }
+            MemberlistEvent::NodeUpdate { raft_id, metadata } => ClusterEvent::NodeUpdate {
+                node_id: raft_id,
+                metadata: GenericNodeMetadata {
+                    node_id: metadata.raft_id,
+                    raft_addr: metadata.raft_addr,
+                    version: metadata.version,
+                    tags: metadata.tags,
+                },
+            },
         }
     }
 }
@@ -901,7 +919,10 @@ impl ClusterDiscovery for MemberlistCluster {
         MemberlistCluster::get_node_addr(self, node_id)
     }
 
-    async fn update_local_metadata(&self, _metadata: GenericNodeMetadata) -> Result<(), ClusterDiscoveryError> {
+    async fn update_local_metadata(
+        &self,
+        _metadata: GenericNodeMetadata,
+    ) -> Result<(), ClusterDiscoveryError> {
         // Memberlist doesn't support dynamic metadata updates after start
         // The metadata is set at initialization time
         Ok(())
@@ -1144,12 +1165,12 @@ mod tests {
     fn test_shard_leader_parse_malformed_entries() {
         // Test that malformed entries are gracefully skipped
         let malformed_inputs = [
-            "",                           // Empty
-            "0:1",                         // Missing epoch
-            "0:1:a",                       // Non-numeric epoch
-            "a:1:10",                      // Non-numeric shard_id
-            "0:b:10",                      // Non-numeric leader_id
-            "0:1:10,invalid,1:2:20",       // One valid, one invalid, one valid
+            "",                      // Empty
+            "0:1",                   // Missing epoch
+            "0:1:a",                 // Non-numeric epoch
+            "a:1:10",                // Non-numeric shard_id
+            "0:b:10",                // Non-numeric leader_id
+            "0:1:10,invalid,1:2:20", // One valid, one invalid, one valid
         ];
 
         for input in &malformed_inputs {

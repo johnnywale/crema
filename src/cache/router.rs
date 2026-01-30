@@ -4,6 +4,7 @@
 //! and Multi-Raft modes, allowing the `DistributedCache` to use a unified
 //! interface regardless of the underlying routing strategy.
 
+use super::storage::CacheStorage;
 use crate::consensus::RaftNode;
 use crate::error::Result;
 use crate::multiraft::MultiRaftCoordinator;
@@ -11,7 +12,6 @@ use crate::types::CacheCommand;
 use bytes::Bytes;
 use std::sync::Arc;
 use std::time::Duration;
-use super::storage::CacheStorage;
 
 /// Internal routing abstraction for cache operations.
 ///
@@ -106,9 +106,7 @@ impl CacheRouter {
                 raft.propose(command).await?;
                 Ok(())
             }
-            CacheRouter::Multi { coordinator } => {
-                coordinator.put(key, value).await
-            }
+            CacheRouter::Multi { coordinator } => coordinator.put(key, value).await,
         }
     }
 
@@ -120,9 +118,7 @@ impl CacheRouter {
                 raft.propose(command).await?;
                 Ok(())
             }
-            CacheRouter::Multi { coordinator } => {
-                coordinator.put_with_ttl(key, value, ttl).await
-            }
+            CacheRouter::Multi { coordinator } => coordinator.put_with_ttl(key, value, ttl).await,
         }
     }
 
@@ -134,9 +130,7 @@ impl CacheRouter {
                 raft.propose(command).await?;
                 Ok(())
             }
-            CacheRouter::Multi { coordinator } => {
-                coordinator.delete(key).await
-            }
+            CacheRouter::Multi { coordinator } => coordinator.delete(key).await,
         }
     }
 
@@ -149,14 +143,24 @@ impl CacheRouter {
                 Ok(())
             }
             CacheRouter::Multi { coordinator } => {
-                // Clear is not directly supported in Multi-Raft Phase 1
-                // We'd need to clear each shard individually
-                tracing::warn!("Clear operation not fully supported in Multi-Raft Phase 1");
-                // For now, just try to clear all shards
+                // Clear each shard through Raft consensus (or directly in Phase 1)
+                let mut errors = Vec::new();
                 for shard in coordinator.router().all_shards() {
-                    shard.storage().invalidate_all();
+                    if let Err(e) = shard.propose_clear().await {
+                        tracing::warn!(
+                            shard_id = shard.id(),
+                            error = %e,
+                            "Failed to clear shard"
+                        );
+                        errors.push(e);
+                    }
                 }
-                Ok(())
+                if errors.is_empty() {
+                    Ok(())
+                } else {
+                    // Return first error if any failed
+                    Err(errors.into_iter().next().unwrap())
+                }
             }
         }
     }
@@ -260,7 +264,8 @@ mod tests {
             config.raft.clone(),
             state_machine,
             config.raft_addr.to_string(),
-        ).unwrap();
+        )
+        .unwrap();
 
         let router = CacheRouter::single(storage.clone(), raft);
 
@@ -281,7 +286,8 @@ mod tests {
             config.raft.clone(),
             state_machine,
             config.raft_addr.to_string(),
-        ).unwrap();
+        )
+        .unwrap();
 
         let router = CacheRouter::single(storage.clone(), raft);
 

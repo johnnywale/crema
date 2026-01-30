@@ -87,7 +87,10 @@ impl ShardLeaderTracker {
 
     /// Get the current leader for a shard.
     pub fn get_leader(&self, shard_id: ShardId) -> Option<NodeId> {
-        self.leaders.lock().get(&shard_id).map(|info| info.leader_id)
+        self.leaders
+            .lock()
+            .get(&shard_id)
+            .map(|info| info.leader_id)
     }
 
     /// Get the current epoch for a shard.
@@ -201,8 +204,7 @@ impl ShardLeaderBroadcaster {
 
     /// Check if it's time to broadcast (debounce interval elapsed).
     pub fn should_broadcast(&self) -> bool {
-        self.last_broadcast.lock().elapsed() >= self.debounce_interval
-            && self.has_pending_updates()
+        self.last_broadcast.lock().elapsed() >= self.debounce_interval && self.has_pending_updates()
     }
 
     /// Take all pending updates for broadcasting.

@@ -126,13 +126,13 @@ pub struct HealthCheckConfig {
 impl Default for HealthCheckConfig {
     fn default() -> Self {
         Self {
-            drop_rate_warning: 0.01,    // 1%
-            drop_rate_degraded: 0.05,   // 5%
-            drop_rate_critical: 0.10,   // 10%
+            drop_rate_warning: 0.01,  // 1%
+            drop_rate_degraded: 0.05, // 5%
+            drop_rate_critical: 0.10, // 10%
             backpressure_warning: 100,
             backpressure_degraded: 1000,
-            queue_usage_warning: 0.7,   // 70%
-            queue_usage_degraded: 0.9,  // 90%
+            queue_usage_warning: 0.7,  // 70%
+            queue_usage_degraded: 0.9, // 90%
             commit_lag_warning: 1000,
             commit_lag_degraded: 10000,
             queue_capacity: 1000,
@@ -250,6 +250,7 @@ impl HealthChecker {
     }
 
     /// Generate a full health report.
+    #[allow(clippy::too_many_arguments)]
     pub fn generate_report(
         &self,
         node_id: NodeId,

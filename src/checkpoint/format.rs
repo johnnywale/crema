@@ -173,14 +173,24 @@ impl SnapshotHeader {
             return Err(FormatError::InvalidMagic);
         }
 
+        // Helper to safely extract fixed-size arrays from slices
+        fn slice_to_array<const N: usize>(
+            buf: &[u8],
+            start: usize,
+        ) -> Result<[u8; N], FormatError> {
+            buf.get(start..start + N)
+                .and_then(|s| s.try_into().ok())
+                .ok_or(FormatError::UnexpectedEof)
+        }
+
         // Parse fields
-        let version = u32::from_le_bytes(buf[4..8].try_into().unwrap());
+        let version = u32::from_le_bytes(slice_to_array::<4>(buf, 4)?);
         if version != VERSION {
             return Err(FormatError::UnsupportedVersion(version));
         }
 
         // Verify header CRC before trusting any other fields
-        let stored_crc = u32::from_le_bytes(buf[52..56].try_into().unwrap());
+        let stored_crc = u32::from_le_bytes(slice_to_array::<4>(buf, 52)?);
         let mut digest = CRC32.digest();
         digest.update(&buf[0..52]);
         let computed_crc = digest.finalize();
@@ -192,12 +202,12 @@ impl SnapshotHeader {
             });
         }
 
-        let flags = u32::from_le_bytes(buf[8..12].try_into().unwrap());
-        let raft_index = u64::from_le_bytes(buf[12..20].try_into().unwrap());
-        let raft_term = u64::from_le_bytes(buf[20..28].try_into().unwrap());
-        let timestamp = u64::from_le_bytes(buf[28..36].try_into().unwrap());
-        let entry_count = u64::from_le_bytes(buf[36..44].try_into().unwrap());
-        let data_size = u64::from_le_bytes(buf[44..52].try_into().unwrap());
+        let flags = u32::from_le_bytes(slice_to_array::<4>(buf, 8)?);
+        let raft_index = u64::from_le_bytes(slice_to_array::<8>(buf, 12)?);
+        let raft_term = u64::from_le_bytes(slice_to_array::<8>(buf, 20)?);
+        let timestamp = u64::from_le_bytes(slice_to_array::<8>(buf, 28)?);
+        let entry_count = u64::from_le_bytes(slice_to_array::<8>(buf, 36)?);
+        let data_size = u64::from_le_bytes(slice_to_array::<8>(buf, 44)?);
 
         Ok(Self {
             version,
@@ -266,7 +276,7 @@ impl SnapshotEntry {
 
     /// Check if the entry has expired
     pub fn is_expired(&self) -> bool {
-        self.expires_at.map_or(false, |expires_nanos| {
+        self.expires_at.is_some_and(|expires_nanos| {
             let now_nanos = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .unwrap_or_default()
@@ -321,43 +331,46 @@ impl SnapshotEntry {
         let mut pos = 0;
 
         // Key length + key
-        if buf.len() < pos + 4 {
-            return Err(FormatError::UnexpectedEof);
-        }
-        let key_len = u32::from_le_bytes(buf[pos..pos + 4].try_into().unwrap()) as usize;
+        let key_len_bytes: [u8; 4] = buf
+            .get(pos..pos + 4)
+            .ok_or(FormatError::UnexpectedEof)?
+            .try_into()
+            .map_err(|_| FormatError::UnexpectedEof)?;
+        let key_len = u32::from_le_bytes(key_len_bytes) as usize;
         pos += 4;
 
-        if buf.len() < pos + key_len {
-            return Err(FormatError::UnexpectedEof);
-        }
-        let key = buf[pos..pos + key_len].to_vec();
+        let key = buf
+            .get(pos..pos + key_len)
+            .ok_or(FormatError::UnexpectedEof)?
+            .to_vec();
         pos += key_len;
 
         // Value length + value
-        if buf.len() < pos + 4 {
-            return Err(FormatError::UnexpectedEof);
-        }
-        let value_len = u32::from_le_bytes(buf[pos..pos + 4].try_into().unwrap()) as usize;
+        let value_len_bytes: [u8; 4] = buf
+            .get(pos..pos + 4)
+            .ok_or(FormatError::UnexpectedEof)?
+            .try_into()
+            .map_err(|_| FormatError::UnexpectedEof)?;
+        let value_len = u32::from_le_bytes(value_len_bytes) as usize;
         pos += 4;
 
-        if buf.len() < pos + value_len {
-            return Err(FormatError::UnexpectedEof);
-        }
-        let value = buf[pos..pos + value_len].to_vec();
+        let value = buf
+            .get(pos..pos + value_len)
+            .ok_or(FormatError::UnexpectedEof)?
+            .to_vec();
         pos += value_len;
 
         // Expiration flag
-        if buf.len() < pos + 1 {
-            return Err(FormatError::UnexpectedEof);
-        }
-        let has_expiration = buf[pos] != 0;
+        let has_expiration = *buf.get(pos).ok_or(FormatError::UnexpectedEof)? != 0;
         pos += 1;
 
         let expires_at = if has_expiration {
-            if buf.len() < pos + 8 {
-                return Err(FormatError::UnexpectedEof);
-            }
-            let expires = u64::from_le_bytes(buf[pos..pos + 8].try_into().unwrap());
+            let expires_bytes: [u8; 8] = buf
+                .get(pos..pos + 8)
+                .ok_or(FormatError::UnexpectedEof)?
+                .try_into()
+                .map_err(|_| FormatError::UnexpectedEof)?;
+            let expires = u64::from_le_bytes(expires_bytes);
             pos += 8;
             Some(expires)
         } else {
@@ -365,10 +378,12 @@ impl SnapshotEntry {
         };
 
         // Verify entry CRC
-        if buf.len() < pos + 4 {
-            return Err(FormatError::UnexpectedEof);
-        }
-        let stored_crc = u32::from_le_bytes(buf[pos..pos + 4].try_into().unwrap());
+        let crc_bytes: [u8; 4] = buf
+            .get(pos..pos + 4)
+            .ok_or(FormatError::UnexpectedEof)?
+            .try_into()
+            .map_err(|_| FormatError::UnexpectedEof)?;
+        let stored_crc = u32::from_le_bytes(crc_bytes);
         pos += 4;
 
         let mut digest = CRC32.digest();

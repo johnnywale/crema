@@ -72,9 +72,11 @@ impl MemStorage {
 
     /// Create storage with initial voters.
     pub fn new_with_conf_state(voters: Vec<u64>) -> Self {
-        let mut core = MemStorageCore::default();
-        core.conf_state = ConfState {
-            voters,
+        let core = MemStorageCore {
+            conf_state: ConfState {
+                voters,
+                ..Default::default()
+            },
             ..Default::default()
         };
         Self {
@@ -132,7 +134,7 @@ impl MemStorage {
                 last_index,
                 first_new,
             }
-                .into());
+            .into());
         }
 
         // 3. Verify internal continuity of new entries
@@ -142,7 +144,7 @@ impl MemStorage {
                     prev_index: entries[i - 1].index,
                     curr_index: entries[i].index,
                 }
-                    .into());
+                .into());
             }
         }
 
@@ -195,13 +197,12 @@ impl MemStorage {
         // Reset entries with new dummy at snapshot index
         // This is the single source of truth for compaction boundary
         core.entries.clear();
-        let mut dummy = Entry::default();
-        dummy.index = index;
-        dummy.term = term;
-        dummy.entry_type = EntryType::EntryNormal;
-        // Ensure dummy has no data to avoid memory waste
-        dummy.data.clear();
-        dummy.context.clear();
+        let dummy = Entry {
+            index,
+            term,
+            entry_type: EntryType::EntryNormal,
+            ..Default::default()
+        };
         core.entries.push(dummy);
 
         // Store snapshot
@@ -305,19 +306,14 @@ impl MemStorageCore {
     /// Get the compacted index from entries[0] (single source of truth).
     #[inline]
     fn compacted_index_internal(&self) -> u64 {
-        self.entries
-            .first()
-            .map(|e| e.index)
-            .unwrap_or(0)
+        self.entries.first().map(|e| e.index).unwrap_or(0)
     }
 
     /// Get the compacted term from entries[0] (single source of truth).
     #[inline]
+    #[allow(dead_code)]
     fn compacted_term_internal(&self) -> u64 {
-        self.entries
-            .first()
-            .map(|e| e.term)
-            .unwrap_or(0)
+        self.entries.first().map(|e| e.term).unwrap_or(0)
     }
 
     /// Get the first available index (internal, lock-free).
@@ -411,7 +407,7 @@ impl Storage for MemStorage {
         let core = self.inner.read();
 
         let compacted_index = core.compacted_index_internal();
-        let first_index = core.first_index_internal();
+        let _first_index = core.first_index_internal();
 
         // Check bounds
         if idx < compacted_index {
@@ -481,10 +477,10 @@ impl RaftStorage {
 
     /// Create RocksDB storage with the given configuration.
     #[cfg(feature = "rocksdb-storage")]
-    pub fn new_rocksdb(
-        config: super::rocksdb_storage::RocksDbStorageConfig,
-    ) -> Result<Self> {
-        Ok(Self::RocksDb(super::rocksdb_storage::RocksDbStorage::new(config)?))
+    pub fn new_rocksdb(config: super::rocksdb_storage::RocksDbStorageConfig) -> Result<Self> {
+        Ok(Self::RocksDb(super::rocksdb_storage::RocksDbStorage::new(
+            config,
+        )?))
     }
 
     /// Create RocksDB storage with initial voters.
@@ -680,21 +676,20 @@ impl Storage for RaftStorage {
 impl std::fmt::Debug for RaftStorage {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Memory(s) => f.debug_tuple("RaftStorage::Memory")
+            Self::Memory(s) => f
+                .debug_tuple("RaftStorage::Memory")
                 .field(&format!("entries={}", s.entry_count()))
                 .finish(),
             #[cfg(feature = "rocksdb-storage")]
-            Self::RocksDb(s) => f.debug_tuple("RaftStorage::RocksDb")
-                .field(s)
-                .finish(),
+            Self::RocksDb(s) => f.debug_tuple("RaftStorage::RocksDb").field(s).finish(),
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use bytes::Bytes;
     use super::*;
+    use bytes::Bytes;
 
     #[test]
     fn test_initial_state() {
@@ -785,9 +780,9 @@ mod tests {
         // Verify the error type
         match result {
             Err(crate::error::Error::Storage(StorageError::LogGap {
-                                                 last_index,
-                                                 first_new
-                                             })) => {
+                last_index,
+                first_new,
+            })) => {
                 assert_eq!(last_index, 5);
                 assert_eq!(first_new, 10);
             }
@@ -814,9 +809,9 @@ mod tests {
 
         match result {
             Err(crate::error::Error::Storage(StorageError::NonContiguous {
-                                                 prev_index,
-                                                 curr_index
-                                             })) => {
+                prev_index,
+                curr_index,
+            })) => {
                 assert_eq!(prev_index, 2);
                 assert_eq!(curr_index, 4);
             }
@@ -975,7 +970,7 @@ mod tests {
         // Verify hard state was updated
         let state = storage.initial_state().unwrap();
         assert_eq!(state.hard_state.commit, 7); // Updated to snapshot index
-        assert_eq!(state.hard_state.term, 2);   // Updated to snapshot term
+        assert_eq!(state.hard_state.term, 2); // Updated to snapshot term
     }
 
     #[test]

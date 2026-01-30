@@ -37,10 +37,14 @@ impl HashRing {
     }
 
     /// Create a new hash ring with custom vnode count.
+    ///
+    /// Parameters are clamped to safe ranges:
+    /// - num_replicas: at least 1
+    /// - vnodes_per_node: between 1 and 1000
     pub fn with_vnodes(num_replicas: usize, vnodes_per_node: usize) -> Self {
         Self {
             vnodes: BTreeMap::new(),
-            vnodes_per_node,
+            vnodes_per_node: vnodes_per_node.clamp(1, 1000),
             num_replicas: num_replicas.max(1),
             nodes: Vec::new(),
         }
@@ -119,12 +123,15 @@ impl HashRing {
 
         let hash = Self::hash_key(key);
         let mut owners = Vec::with_capacity(count.min(self.nodes.len()));
+        let mut seen = std::collections::HashSet::with_capacity(count.min(self.nodes.len()));
 
-        // Find the first vnode >= hash
-        let iter = self.vnodes.range(hash..).chain(self.vnodes.iter().map(|(k, v)| (k, v)));
+        // Find the first vnode >= hash, then wrap around to beginning
+        // Use range(..hash) for wrap-around to avoid iterating same vnodes twice
+        let iter = self.vnodes.range(hash..).chain(self.vnodes.range(..hash));
 
         for (_, &node_id) in iter {
-            if !owners.contains(&node_id) {
+            // Use HashSet for O(1) duplicate check instead of O(n) Vec::contains
+            if seen.insert(node_id) {
                 owners.push(node_id);
                 if owners.len() >= count || owners.len() >= self.nodes.len() {
                     break;
@@ -356,9 +363,7 @@ mod tests {
         let owners_after = ring.get_replica_owners(key);
 
         // Either same owners or at least one owner is preserved
-        let preserved = owners_before
-            .iter()
-            .any(|o| owners_after.contains(o));
+        let preserved = owners_before.iter().any(|o| owners_after.contains(o));
         // Note: this test is probabilistic but should almost always pass
         assert!(preserved || owners_after.contains(&4));
     }
@@ -376,7 +381,12 @@ mod tests {
         for &node in ring.nodes() {
             let count = distribution.get(&node).copied().unwrap_or(0);
             // Allow 20% variance from expected (3333)
-            assert!(count > 2500 && count < 4500, "Node {} has {} keys", node, count);
+            assert!(
+                count > 2500 && count < 4500,
+                "Node {} has {} keys",
+                node,
+                count
+            );
         }
     }
 

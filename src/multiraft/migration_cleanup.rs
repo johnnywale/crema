@@ -8,7 +8,7 @@
 //! This module provides cleanup handlers to ensure these resources are properly
 //! cleaned up when a migration fails or is cancelled.
 
-use crate::error::{Result};
+use crate::error::Result;
 use crate::types::NodeId;
 use parking_lot::Mutex;
 use std::collections::HashSet;
@@ -27,19 +27,14 @@ pub enum CleanupResource {
         target_node: NodeId,
     },
     /// Checkpoint file that should be deleted.
-    CheckpointFile {
-        migration_id: Uuid,
-        path: PathBuf,
-    },
+    CheckpointFile { migration_id: Uuid, path: PathBuf },
     /// Raft learner that should be removed from the group.
     RaftLearner {
         shard_id: ShardId,
         learner_node: NodeId,
     },
     /// Temporary files created during migration.
-    TempFile {
-        path: PathBuf,
-    },
+    TempFile { path: PathBuf },
 }
 
 /// Result of a cleanup operation.
@@ -119,11 +114,7 @@ pub trait MigrationCleanupHandler: Send + Sync + std::fmt::Debug {
     ///
     /// This should be called when a migration fails after the learner
     /// was added but before it was promoted to voter.
-    async fn remove_raft_learner(
-        &self,
-        shard_id: ShardId,
-        learner_node: NodeId,
-    ) -> Result<()>;
+    async fn remove_raft_learner(&self, shard_id: ShardId, learner_node: NodeId) -> Result<()>;
 
     /// Clean up any temporary files associated with a migration.
     async fn cleanup_temp_files(&self, migration_id: Uuid) -> Result<Vec<PathBuf>>;
@@ -148,11 +139,7 @@ impl MigrationCleanupHandler for NoOpCleanupHandler {
         Ok(Vec::new())
     }
 
-    async fn remove_raft_learner(
-        &self,
-        _shard_id: ShardId,
-        _learner_node: NodeId,
-    ) -> Result<()> {
+    async fn remove_raft_learner(&self, _shard_id: ShardId, _learner_node: NodeId) -> Result<()> {
         Ok(())
     }
 
@@ -292,10 +279,7 @@ impl MigrationCleanupManager {
         match self.handler.cleanup_checkpoint_files(migration_id).await {
             Ok(paths) => {
                 for path in paths {
-                    result.record_success(CleanupResource::CheckpointFile {
-                        migration_id,
-                        path,
-                    });
+                    result.record_success(CleanupResource::CheckpointFile { migration_id, path });
                 }
             }
             Err(e) => {
@@ -310,7 +294,11 @@ impl MigrationCleanupManager {
         }
 
         // 3. Remove Raft learner
-        match self.handler.remove_raft_learner(shard_id, target_node).await {
+        match self
+            .handler
+            .remove_raft_learner(shard_id, target_node)
+            .await
+        {
             Ok(()) => {
                 result.record_success(CleanupResource::RaftLearner {
                     shard_id,
@@ -388,9 +376,7 @@ mod tests {
     #[tokio::test]
     async fn test_noop_cleanup_manager() {
         let manager = MigrationCleanupManager::noop();
-        let result = manager
-            .execute_cleanup(Uuid::new_v4(), 0, 1)
-            .await;
+        let result = manager.execute_cleanup(Uuid::new_v4(), 0, 1).await;
 
         // No-op handler should succeed for everything
         assert!(result.is_success());

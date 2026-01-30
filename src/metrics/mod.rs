@@ -43,7 +43,9 @@ mod histograms;
 
 pub use counters::{Counter, LabeledCounter};
 pub use gauges::{FloatGauge, Gauge, LabeledGauge};
-pub use histograms::{Histogram, HistogramSnapshot, HistogramTimer, LabeledHistogram, DEFAULT_BUCKETS};
+pub use histograms::{
+    Histogram, HistogramSnapshot, HistogramTimer, LabeledHistogram, DEFAULT_BUCKETS,
+};
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
@@ -376,7 +378,13 @@ impl CacheMetrics {
     }
 
     /// Record a successful snapshot creation.
-    pub fn record_snapshot(&self, duration: Duration, size: u64, entries: u64, compression_ratio: f64) {
+    pub fn record_snapshot(
+        &self,
+        duration: Duration,
+        size: u64,
+        entries: u64,
+        compression_ratio: f64,
+    ) {
         self.snapshots_created.inc();
         self.snapshot_duration.observe_duration(duration);
         self.last_snapshot_size.set(size as i64);
@@ -529,13 +537,18 @@ impl CacheMetrics {
     pub fn to_prometheus(&self) -> String {
         let mut output = String::new();
 
+        // Helper to escape Prometheus help text (backslash and newline)
+        fn escape_help(s: &str) -> String {
+            s.replace('\\', "\\\\").replace('\n', "\\n")
+        }
+
         // Helper to add a metric
         macro_rules! add_counter {
             ($out:expr, $metric:expr) => {
                 output.push_str(&format!(
                     "# HELP {} {}\n# TYPE {} counter\n{} {}\n",
                     $metric.name(),
-                    $metric.help(),
+                    escape_help($metric.help()),
                     $metric.name(),
                     $metric.name(),
                     $metric.get()
@@ -548,7 +561,7 @@ impl CacheMetrics {
                 output.push_str(&format!(
                     "# HELP {} {}\n# TYPE {} gauge\n{} {}\n",
                     $metric.name(),
-                    $metric.help(),
+                    escape_help($metric.help()),
                     $metric.name(),
                     $metric.name(),
                     $metric.get()

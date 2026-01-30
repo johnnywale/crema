@@ -1,10 +1,18 @@
 //! Shard management for Multi-Raft.
 //!
 //! A shard is a single Raft group managing a subset of the keyspace.
+//!
+//! # Phase 1 vs Phase 2
+//!
+//! - **Phase 1**: Each shard is a local Moka cache with metadata tracking.
+//!   No actual Raft consensus - writes go directly to local storage.
+//!
+//! - **Phase 2**: Each shard becomes an independent Raft group with real
+//!   replication across nodes. Writes are proposed to Raft and committed
+//!   before being applied to local storage.
 
 use crate::cache::storage::CacheStorage;
 use crate::config::CacheConfig;
-use crate::consensus::state_machine::CacheStateMachine;
 use crate::error::Result;
 use crate::types::{CacheCommand, NodeId};
 use bytes::Bytes;
@@ -13,6 +21,8 @@ use std::collections::HashSet;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+use super::shard_raft_node::ShardRaftNode;
 
 /// Unique identifier for a shard.
 pub type ShardId = u32;
@@ -138,9 +148,6 @@ pub struct Shard {
     /// Local cache storage for this shard.
     storage: Arc<CacheStorage>,
 
-    /// State machine for applying commands.
-    state_machine: Arc<CacheStateMachine>,
-
     /// Current leader node ID.
     leader: RwLock<Option<NodeId>>,
 
@@ -158,30 +165,52 @@ pub struct Shard {
 
     /// Whether this node is the leader for this shard.
     is_local_leader: RwLock<bool>,
+
+    /// Per-shard RaftNode for Phase 2 replication (optional).
+    /// When Some, writes are proposed through Raft consensus.
+    /// When None, writes go directly to local storage (Phase 1 behavior).
+    raft_node: RwLock<Option<Arc<ShardRaftNode>>>,
 }
 
 impl Shard {
     /// Create a new shard.
     pub async fn new(config: ShardConfig) -> Result<Self> {
-        // Create cache storage for this shard
-        let cache_config = CacheConfig::new(0, "127.0.0.1:0".parse().unwrap())
-            .with_max_capacity(config.max_capacity);
+        use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+        // Create cache storage for this shard (placeholder address, not used for Raft)
+        let placeholder_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
+        let cache_config =
+            CacheConfig::new(0, placeholder_addr).with_max_capacity(config.max_capacity);
 
         let storage = Arc::new(CacheStorage::new(&cache_config));
-        let state_machine = Arc::new(CacheStateMachine::new(storage.clone()));
 
         Ok(Self {
             config,
             state: RwLock::new(ShardState::Initializing),
             storage,
-            state_machine,
             leader: RwLock::new(None),
             members: RwLock::new(HashSet::new()),
             term: AtomicU64::new(0),
             commit_index: AtomicU64::new(0),
             applied_index: AtomicU64::new(0),
             is_local_leader: RwLock::new(false),
+            raft_node: RwLock::new(None),
         })
+    }
+
+    /// Create a new shard with an existing storage.
+    pub fn new_with_storage(config: ShardConfig, storage: Arc<CacheStorage>) -> Self {
+        Self {
+            config,
+            state: RwLock::new(ShardState::Initializing),
+            storage,
+            leader: RwLock::new(None),
+            members: RwLock::new(HashSet::new()),
+            term: AtomicU64::new(0),
+            commit_index: AtomicU64::new(0),
+            applied_index: AtomicU64::new(0),
+            is_local_leader: RwLock::new(false),
+            raft_node: RwLock::new(None),
+        }
     }
 
     /// Get the shard ID.
@@ -223,19 +252,63 @@ impl Shard {
         self.storage.get(key).await
     }
 
-    /// Put a value in this shard (local only, for leader).
-    pub async fn put(&self, key: Bytes, value: Bytes) {
-        self.storage.insert(key, value).await;
+    /// Put a value in this shard.
+    ///
+    /// In Phase 2 (per-shard Raft enabled), this proposes via Raft.
+    /// In Phase 1, this writes directly to local storage.
+    ///
+    /// Returns `NotLeader` error if this node isn't the shard leader in Phase 2.
+    pub async fn put(&self, key: Bytes, value: Bytes) -> crate::error::Result<()> {
+        // Check if per-shard Raft is enabled
+        if self.is_raft_enabled() {
+            // Use Raft for replication - propagate errors (including NotLeader)
+            self.propose_put(key, value, None).await
+        } else {
+            // Direct local write (Phase 1)
+            self.storage.insert(key, value).await;
+            Ok(())
+        }
     }
 
     /// Put a value with TTL.
-    pub async fn put_with_ttl(&self, key: Bytes, value: Bytes, ttl: Duration) {
-        self.storage.insert_with_ttl(key, value, ttl).await;
+    ///
+    /// In Phase 2 (per-shard Raft enabled), this proposes via Raft.
+    /// In Phase 1, this writes directly to local storage.
+    ///
+    /// Returns `NotLeader` error if this node isn't the shard leader in Phase 2.
+    pub async fn put_with_ttl(
+        &self,
+        key: Bytes,
+        value: Bytes,
+        ttl: Duration,
+    ) -> crate::error::Result<()> {
+        // Check if per-shard Raft is enabled
+        if self.is_raft_enabled() {
+            // Use Raft for replication - propagate errors (including NotLeader)
+            self.propose_put(key, value, Some(ttl)).await
+        } else {
+            // Direct local write (Phase 1)
+            self.storage.insert_with_ttl(key, value, ttl).await;
+            Ok(())
+        }
     }
 
     /// Delete a key from this shard.
-    pub async fn delete(&self, key: &[u8]) {
-        self.storage.invalidate(key).await;
+    ///
+    /// In Phase 2 (per-shard Raft enabled), this proposes via Raft.
+    /// In Phase 1, this deletes directly from local storage.
+    ///
+    /// Returns `NotLeader` error if this node isn't the shard leader in Phase 2.
+    pub async fn delete(&self, key: &[u8]) -> crate::error::Result<()> {
+        // Check if per-shard Raft is enabled
+        if self.is_raft_enabled() {
+            // Use Raft for replication - propagate errors (including NotLeader)
+            self.propose_delete(key).await
+        } else {
+            // Direct local delete (Phase 1)
+            self.storage.invalidate(key).await;
+            Ok(())
+        }
     }
 
     /// Clear all entries in this shard.
@@ -294,12 +367,19 @@ impl Shard {
         *self.leader.write() = leader;
     }
 
-    /// Check if this node is the leader for this shard.
+    /// Check if this node is the leader for this shard (cached value).
+    ///
+    /// **Note**: This returns a cached value that may be stale. For accurate
+    /// leadership status when per-shard Raft is enabled, use `is_raft_leader()`
+    /// which queries the actual RaftNode state.
     pub fn is_leader(&self) -> bool {
         *self.is_local_leader.read()
     }
 
-    /// Set whether this node is the leader.
+    /// Set whether this node is the leader (cached value).
+    ///
+    /// This updates the cached leadership status. In Phase 2 (per-shard Raft),
+    /// prefer checking `is_raft_leader()` for accurate real-time status.
     pub fn set_is_leader(&self, is_leader: bool) {
         *self.is_local_leader.write() = is_leader;
     }
@@ -363,6 +443,162 @@ impl Shard {
         ShardRange {
             shard_id: self.config.shard_id,
             total_shards: self.config.total_shards,
+        }
+    }
+
+    // ==================== Per-Shard Raft Methods (Phase 2) ====================
+
+    /// Check if per-shard Raft is enabled for this shard.
+    pub fn is_raft_enabled(&self) -> bool {
+        self.raft_node.read().is_some()
+    }
+
+    /// Get the ShardRaftNode if enabled.
+    pub fn raft_node(&self) -> Option<Arc<ShardRaftNode>> {
+        self.raft_node.read().clone()
+    }
+
+    /// Set the ShardRaftNode for this shard.
+    ///
+    /// This enables per-shard Raft replication (Phase 2).
+    pub fn set_raft_node(&self, raft_node: Arc<ShardRaftNode>) {
+        *self.raft_node.write() = Some(raft_node);
+        tracing::info!(shard_id = self.config.shard_id, "Per-shard Raft enabled");
+    }
+
+    /// Clear the ShardRaftNode, reverting to Phase 1 behavior.
+    pub fn clear_raft_node(&self) {
+        *self.raft_node.write() = None;
+        tracing::info!(shard_id = self.config.shard_id, "Per-shard Raft disabled");
+    }
+
+    /// Propose a Put command through Raft (Phase 2).
+    ///
+    /// If Raft is enabled, proposes the command and waits for commit.
+    /// If Raft is not enabled, writes directly to local storage (Phase 1).
+    pub async fn propose_put(&self, key: Bytes, value: Bytes, ttl: Option<Duration>) -> Result<()> {
+        // Clone the raft_node reference while holding the lock briefly
+        let maybe_raft_node = self.raft_node.read().clone();
+
+        if let Some(raft_node) = maybe_raft_node {
+            // Phase 2: Propose through Raft
+            let expires_at_ms = ttl.map(|d| {
+                let now_ms = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis()
+                    .min(u128::from(u64::MAX)) as u64;
+                let ttl_ms = d.as_millis().min(u128::from(u64::MAX)) as u64;
+                now_ms.saturating_add(ttl_ms)
+            });
+
+            let cmd = CacheCommand::Put {
+                key: key.to_vec(),
+                value: value.to_vec(),
+                expires_at_ms,
+            };
+
+            raft_node.propose(cmd).await?;
+            Ok(())
+        } else {
+            // Phase 1: Direct local write
+            if let Some(ttl) = ttl {
+                self.storage.insert_with_ttl(key, value, ttl).await;
+            } else {
+                self.storage.insert(key, value).await;
+            }
+            self.applied_index.fetch_add(1, Ordering::Relaxed);
+            Ok(())
+        }
+    }
+
+    /// Propose a Delete command through Raft (Phase 2).
+    ///
+    /// If Raft is enabled, proposes the command and waits for commit.
+    /// If Raft is not enabled, deletes directly from local storage (Phase 1).
+    pub async fn propose_delete(&self, key: &[u8]) -> Result<()> {
+        // Clone the raft_node reference while holding the lock briefly
+        let maybe_raft_node = self.raft_node.read().clone();
+
+        if let Some(raft_node) = maybe_raft_node {
+            // Phase 2: Propose through Raft
+            let cmd = CacheCommand::Delete { key: key.to_vec() };
+            raft_node.propose(cmd).await?;
+            Ok(())
+        } else {
+            // Phase 1: Direct local delete
+            self.storage.invalidate(key).await;
+            self.applied_index.fetch_add(1, Ordering::Relaxed);
+            Ok(())
+        }
+    }
+
+    /// Clear all entries from this shard.
+    ///
+    /// If Raft is enabled, proposes the command and waits for commit.
+    /// If Raft is not enabled, clears directly from local storage (Phase 1).
+    pub async fn propose_clear(&self) -> Result<()> {
+        // Clone the raft_node reference while holding the lock briefly
+        let maybe_raft_node = self.raft_node.read().clone();
+
+        if let Some(raft_node) = maybe_raft_node {
+            // Phase 2: Propose through Raft
+            let cmd = CacheCommand::Clear;
+            raft_node.propose(cmd).await?;
+            Ok(())
+        } else {
+            // Phase 1: Direct local clear
+            self.storage.invalidate_all();
+            self.applied_index.fetch_add(1, Ordering::Relaxed);
+            Ok(())
+        }
+    }
+
+    /// Get the Raft leader for this shard.
+    ///
+    /// Returns the leader from the ShardRaftNode if enabled,
+    /// otherwise falls back to the locally tracked leader.
+    pub fn raft_leader(&self) -> Option<NodeId> {
+        if let Some(ref raft_node) = *self.raft_node.read() {
+            raft_node.leader_id()
+        } else {
+            self.leader()
+        }
+    }
+
+    /// Check if this node is the Raft leader for this shard.
+    pub fn is_raft_leader(&self) -> bool {
+        if let Some(ref raft_node) = *self.raft_node.read() {
+            raft_node.is_leader()
+        } else {
+            self.is_leader()
+        }
+    }
+
+    /// Get the current Raft term for this shard.
+    pub fn raft_term(&self) -> u64 {
+        if let Some(ref raft_node) = *self.raft_node.read() {
+            raft_node.term()
+        } else {
+            self.term()
+        }
+    }
+
+    /// Get the commit index from the ShardRaftNode if enabled.
+    pub fn raft_commit_index(&self) -> u64 {
+        if let Some(ref raft_node) = *self.raft_node.read() {
+            raft_node.commit_index()
+        } else {
+            self.commit_index()
+        }
+    }
+
+    /// Get the applied index from the ShardRaftNode if enabled.
+    pub fn raft_applied_index(&self) -> u64 {
+        if let Some(ref raft_node) = *self.raft_node.read() {
+            raft_node.applied_index()
+        } else {
+            self.applied_index()
         }
     }
 }

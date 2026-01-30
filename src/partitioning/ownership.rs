@@ -64,13 +64,6 @@ pub struct OwnershipTracker {
 
     /// This node's ID.
     local_node_id: NodeId,
-
-    /// Cache of recent ownership lookups.
-    /// Key is the first 8 bytes of the key hash.
-    ownership_cache: RwLock<HashMap<u64, KeyOwnership>>,
-
-    /// Maximum cache size.
-    max_cache_size: usize,
 }
 
 impl OwnershipTracker {
@@ -79,8 +72,6 @@ impl OwnershipTracker {
         Self {
             ring: RwLock::new(HashRing::new(num_replicas)),
             local_node_id,
-            ownership_cache: RwLock::new(HashMap::new()),
-            max_cache_size: 10_000,
         }
     }
 
@@ -89,8 +80,6 @@ impl OwnershipTracker {
         Self {
             ring: RwLock::new(ring),
             local_node_id,
-            ownership_cache: RwLock::new(HashMap::new()),
-            max_cache_size: 10_000,
         }
     }
 
@@ -107,13 +96,11 @@ impl OwnershipTracker {
     /// Add a node to the ring.
     pub fn add_node(&self, node_id: NodeId) {
         self.ring.write().add_node(node_id);
-        self.invalidate_cache();
     }
 
     /// Remove a node from the ring.
     pub fn remove_node(&self, node_id: NodeId) {
         self.ring.write().remove_node(node_id);
-        self.invalidate_cache();
     }
 
     /// Get the number of nodes in the ring.
@@ -124,11 +111,6 @@ impl OwnershipTracker {
     /// Get all nodes in the ring.
     pub fn nodes(&self) -> Vec<NodeId> {
         self.ring.read().nodes().to_vec()
-    }
-
-    /// Invalidate the ownership cache.
-    fn invalidate_cache(&self) {
-        self.ownership_cache.write().clear();
     }
 
     /// Get ownership information for a key.
@@ -200,7 +182,9 @@ impl OwnershipTracker {
 
         let mut transfers: HashMap<(NodeId, NodeId), usize> = HashMap::new();
         for change in changes {
-            *transfers.entry((change.from_node, change.to_node)).or_insert(0) += 1;
+            *transfers
+                .entry((change.from_node, change.to_node))
+                .or_insert(0) += 1;
         }
 
         transfers
@@ -209,35 +193,48 @@ impl OwnershipTracker {
     /// Calculate which keys need to be transferred when a node is removed.
     ///
     /// Returns a map of (from_node, to_node) -> estimated key count.
-    pub fn calculate_transfer_on_remove(&self, removed_node: NodeId) -> HashMap<(NodeId, NodeId), usize> {
+    pub fn calculate_transfer_on_remove(
+        &self,
+        removed_node: NodeId,
+    ) -> HashMap<(NodeId, NodeId), usize> {
         let ring = self.ring.read();
         let changes = ring.calculate_remove_changes(removed_node);
 
         let mut transfers: HashMap<(NodeId, NodeId), usize> = HashMap::new();
         for change in changes {
-            *transfers.entry((change.from_node, change.to_node)).or_insert(0) += 1;
+            *transfers
+                .entry((change.from_node, change.to_node))
+                .or_insert(0) += 1;
         }
 
         transfers
     }
 
     /// Get keys from a collection that this node should own.
+    ///
+    /// Holds the ring lock for the entire operation to ensure consistent
+    /// ownership evaluation across all keys (avoids TOCTOU race).
     pub fn filter_owned_keys<'a, I>(&self, keys: I) -> Vec<&'a [u8]>
     where
         I: IntoIterator<Item = &'a [u8]>,
     {
+        let ring = self.ring.read();
         keys.into_iter()
-            .filter(|key| self.should_own(key))
+            .filter(|key| ring.is_owner(key, self.local_node_id))
             .collect()
     }
 
     /// Get keys from a collection that this node is the primary owner for.
+    ///
+    /// Holds the ring lock for the entire operation to ensure consistent
+    /// ownership evaluation across all keys (avoids TOCTOU race).
     pub fn filter_primary_keys<'a, I>(&self, keys: I) -> Vec<&'a [u8]>
     where
         I: IntoIterator<Item = &'a [u8]>,
     {
+        let ring = self.ring.read();
         keys.into_iter()
-            .filter(|key| self.is_primary(key))
+            .filter(|key| ring.is_primary(key, self.local_node_id))
             .collect()
     }
 
@@ -271,6 +268,11 @@ pub struct PendingTransfers {
     incoming: RwLock<HashSet<Vec<u8>>>,
 }
 
+/// Maximum number of pending transfers before we start warning.
+const MAX_PENDING_TRANSFERS_WARN: usize = 10_000;
+/// Maximum number of pending transfers before we stop accepting new ones.
+const MAX_PENDING_TRANSFERS_HARD: usize = 100_000;
+
 impl PendingTransfers {
     /// Create a new pending transfers tracker.
     pub fn new() -> Self {
@@ -281,13 +283,47 @@ impl PendingTransfers {
     }
 
     /// Mark a key as pending outgoing transfer.
-    pub fn mark_outgoing(&self, key: Vec<u8>) {
-        self.outgoing.write().insert(key);
+    ///
+    /// Returns false if the maximum pending transfers limit is reached.
+    pub fn mark_outgoing(&self, key: Vec<u8>) -> bool {
+        let mut outgoing = self.outgoing.write();
+        if outgoing.len() >= MAX_PENDING_TRANSFERS_HARD {
+            tracing::error!(
+                count = outgoing.len(),
+                "Outgoing transfer tracking at limit - possible leak"
+            );
+            return false;
+        }
+        if outgoing.len() >= MAX_PENDING_TRANSFERS_WARN && outgoing.len() % 1000 == 0 {
+            tracing::warn!(
+                count = outgoing.len(),
+                "High number of pending outgoing transfers"
+            );
+        }
+        outgoing.insert(key);
+        true
     }
 
     /// Mark a key as pending incoming transfer.
-    pub fn mark_incoming(&self, key: Vec<u8>) {
-        self.incoming.write().insert(key);
+    ///
+    /// Returns false if the maximum pending transfers limit is reached.
+    pub fn mark_incoming(&self, key: Vec<u8>) -> bool {
+        let mut incoming = self.incoming.write();
+        if incoming.len() >= MAX_PENDING_TRANSFERS_HARD {
+            tracing::error!(
+                count = incoming.len(),
+                "Incoming transfer tracking at limit - possible leak"
+            );
+            return false;
+        }
+        if incoming.len() >= MAX_PENDING_TRANSFERS_WARN && incoming.len() % 1000 == 0 {
+            tracing::warn!(
+                count = incoming.len(),
+                "High number of pending incoming transfers"
+            );
+        }
+        incoming.insert(key);
+        true
     }
 
     /// Complete an outgoing transfer.
@@ -370,7 +406,10 @@ mod tests {
 
         let role = tracker.local_role(b"test_key");
         // Should be either Primary or Backup
-        assert!(matches!(role, OwnershipRole::Primary | OwnershipRole::Backup));
+        assert!(matches!(
+            role,
+            OwnershipRole::Primary | OwnershipRole::Backup
+        ));
     }
 
     #[test]

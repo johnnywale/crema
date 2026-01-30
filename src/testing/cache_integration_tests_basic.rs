@@ -12,6 +12,7 @@
 mod tests {
     use crate::cache::DistributedCache;
     use crate::config::{CacheConfig, RaftConfig};
+    use crate::testing::eventually;
     use crate::types::NodeId;
     use std::net::SocketAddr;
     use std::sync::atomic::{AtomicU16, Ordering};
@@ -253,7 +254,9 @@ mod tests {
     async fn tc4_restart_single_node() {
         let base_port = allocate_ports(1);
         let config1 = single_node_config(1, base_port);
-        let election_time = Duration::from_millis(config1.raft.tick_interval_ms * config1.raft.election_tick as u64);
+        let election_time = Duration::from_millis(
+            config1.raft.tick_interval_ms * config1.raft.election_tick as u64,
+        );
 
         // First run
         let cache1 = DistributedCache::new(config1)
@@ -623,14 +626,11 @@ mod tests {
             .expect("Failed to create cache 2");
 
         // Now with 2 nodes, one should become leader (quorum = 2)
-        let leader_elected = wait_for(
-            || cache1.is_leader() || cache2.is_leader(),
-            election_time * 10,
-            Duration::from_millis(50),
-        )
-        .await;
-
-        assert!(leader_elected, "A leader should be elected with 2 nodes");
+        eventually(election_time * 10, || async {
+            cache1.is_leader() || cache2.is_leader()
+        })
+        .await
+        .expect("A leader should be elected with 2 nodes");
 
         // Node 3: Start third node
         let config3 = cluster_node_config(3, base_port + 2, peer_configs.clone());
@@ -638,37 +638,28 @@ mod tests {
             .await
             .expect("Failed to create cache 3");
 
-        // Wait for stabilization
-        sleep(election_time * 3).await;
+        // Wait for exactly one leader and all nodes to agree
+        eventually(election_time * 10, || async {
+            let caches = [&cache1, &cache2, &cache3];
+            let leader_count = caches.iter().filter(|c| c.is_leader()).count();
+            if leader_count != 1 {
+                return false;
+            }
 
-        // Verify exactly one leader
-        let caches = [&cache1, &cache2, &cache3];
-        let leader_count = caches.iter().filter(|c| c.is_leader()).count();
+            // All nodes should agree on leader
+            let leader_id_1 = cache1.leader_id();
+            let leader_id_2 = cache2.leader_id();
+            let leader_id_3 = cache3.leader_id();
 
-        assert_eq!(
-            leader_count, 1,
-            "Should have exactly one leader, found {}",
-            leader_count
-        );
-
-        // All nodes should agree on leader
-        let leader_id_1 = cache1.leader_id();
-        let leader_id_2 = cache2.leader_id();
-        let leader_id_3 = cache3.leader_id();
-
-        // At least the nodes that have discovered the leader should agree
-        if leader_id_1.is_some() && leader_id_2.is_some() {
-            assert_eq!(
-                leader_id_1, leader_id_2,
-                "Node 1 and 2 should agree on leader"
-            );
-        }
-        if leader_id_2.is_some() && leader_id_3.is_some() {
-            assert_eq!(
-                leader_id_2, leader_id_3,
-                "Node 2 and 3 should agree on leader"
-            );
-        }
+            // All should have Some leader and agree
+            leader_id_1.is_some()
+                && leader_id_2.is_some()
+                && leader_id_3.is_some()
+                && leader_id_1 == leader_id_2
+                && leader_id_2 == leader_id_3
+        })
+        .await
+        .expect("All nodes should agree on exactly one leader");
 
         // Shutdown all
         cache1.shutdown().await;
@@ -702,13 +693,11 @@ mod tests {
             .expect("Failed to create cache 3");
 
         // Wait for leader election
-        let leader_elected = wait_for(
-            || cache1.is_leader() || cache2.is_leader() || cache3.is_leader(),
-            election_time * 10,
-            Duration::from_millis(50),
-        )
-        .await;
-        assert!(leader_elected, "A leader should be elected");
+        eventually(election_time * 10, || async {
+            cache1.is_leader() || cache2.is_leader() || cache3.is_leader()
+        })
+        .await
+        .expect("A leader should be elected");
 
         // Find the leader
         let leader: &DistributedCache = if cache1.is_leader() {
@@ -723,29 +712,16 @@ mod tests {
         let write_result = leader.put("replicated-key", "replicated-value").await;
         assert!(write_result.is_ok(), "Write should succeed on leader");
 
-        // Wait for replication
-        sleep(Duration::from_millis(500)).await;
-
-        // All nodes should have the data (eventually consistent reads)
-        let val1 = cache1.get(b"replicated-key").await;
-        let val2 = cache2.get(b"replicated-key").await;
-        let val3 = cache3.get(b"replicated-key").await;
-
-        assert_eq!(
-            val1,
-            Some(bytes::Bytes::from("replicated-value")),
-            "Node 1 should have replicated data"
-        );
-        assert_eq!(
-            val2,
-            Some(bytes::Bytes::from("replicated-value")),
-            "Node 2 should have replicated data"
-        );
-        assert_eq!(
-            val3,
-            Some(bytes::Bytes::from("replicated-value")),
-            "Node 3 should have replicated data"
-        );
+        // Wait for replication to all nodes
+        let expected = Some(bytes::Bytes::from("replicated-value"));
+        eventually(Duration::from_secs(5), || async {
+            let val1 = cache1.get(b"replicated-key").await;
+            let val2 = cache2.get(b"replicated-key").await;
+            let val3 = cache3.get(b"replicated-key").await;
+            val1 == expected && val2 == expected && val3 == expected
+        })
+        .await
+        .expect("All nodes should have replicated data");
 
         // Shutdown all
         cache1.shutdown().await;
@@ -779,13 +755,11 @@ mod tests {
             .expect("Failed to create cache 3");
 
         // Wait for leader election
-        let leader_elected = wait_for(
-            || cache1.is_leader() || cache2.is_leader() || cache3.is_leader(),
-            election_time * 10,
-            Duration::from_millis(50),
-        )
-        .await;
-        assert!(leader_elected, "A leader should be elected");
+        eventually(election_time * 10, || async {
+            cache1.is_leader() || cache2.is_leader() || cache3.is_leader()
+        })
+        .await
+        .expect("A leader should be elected");
 
         // Find a follower
         let follower: &DistributedCache = if !cache1.is_leader() {

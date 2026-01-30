@@ -28,7 +28,9 @@ impl Histogram {
 
     /// Create a new histogram with custom buckets.
     pub fn with_buckets(name: &'static str, help: &'static str, mut buckets: Vec<f64>) -> Self {
-        buckets.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        // Filter out NaN/Inf values and sort safely
+        buckets.retain(|v| v.is_finite());
+        buckets.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
 
         let bucket_counts = buckets.iter().map(|_| AtomicU64::new(0)).collect();
 
@@ -224,6 +226,7 @@ impl HistogramSnapshot {
 pub struct LabeledHistogram<const N: usize> {
     name: &'static str,
     help: &'static str,
+    #[allow(dead_code)]
     label_names: [&'static str; N],
     buckets: Vec<f64>,
     histograms: RwLock<std::collections::HashMap<[String; N], Histogram>>,
@@ -274,9 +277,9 @@ impl<const N: usize> LabeledHistogram<N> {
         }
 
         let mut histograms = self.histograms.write();
-        let histogram = histograms.entry(key).or_insert_with(|| {
-            Histogram::with_buckets(self.name, self.help, self.buckets.clone())
-        });
+        let histogram = histograms
+            .entry(key)
+            .or_insert_with(|| Histogram::with_buckets(self.name, self.help, self.buckets.clone()));
         histogram.observe(value);
     }
 

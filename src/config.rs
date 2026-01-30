@@ -62,9 +62,11 @@ pub struct CacheConfig {
 
 impl Default for CacheConfig {
     fn default() -> Self {
+        use std::net::{IpAddr, Ipv4Addr};
         Self {
             node_id: 1,
-            raft_addr: "127.0.0.1:9000".parse().unwrap(),
+            // Construct SocketAddr directly to avoid parse().unwrap()
+            raft_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 9000),
             seed_nodes: Vec::new(),
             max_capacity: 100_000,
             default_ttl: Some(Duration::from_secs(3600)), // 1 hour
@@ -95,7 +97,6 @@ impl std::fmt::Debug for CacheConfig {
             .finish()
     }
 }
-
 
 impl CacheConfig {
     /// Create a new configuration with the given node ID and address.
@@ -168,7 +169,10 @@ impl CacheConfig {
     }
 
     /// Set the cluster discovery from a boxed trait object.
-    pub fn with_cluster_discovery_boxed(mut self, discovery: Box<dyn ClusterDiscovery + Send>) -> Self {
+    pub fn with_cluster_discovery_boxed(
+        mut self,
+        discovery: Box<dyn ClusterDiscovery + Send>,
+    ) -> Self {
         self.cluster_discovery = Some(discovery);
         self
     }
@@ -230,8 +234,34 @@ impl CacheConfig {
     /// Validate the configuration and return an error if invalid.
     ///
     /// Checks:
+    /// - node_id is non-zero
+    /// - max_capacity is within reasonable limits
+    /// - raft_addr port is valid
     /// - Multi-Raft shard count is within limits
     pub fn validate(&self) -> Result<(), String> {
+        // Validate node_id
+        if self.node_id == 0 {
+            return Err("node_id must be non-zero".to_string());
+        }
+
+        // Validate max_capacity - must be at least 1 and not excessively large
+        if self.max_capacity == 0 {
+            return Err("max_capacity must be at least 1".to_string());
+        }
+        // Warn about very large capacities (> 100M entries)
+        if self.max_capacity > 100_000_000 {
+            // This is just a warning in the validation context - we log it but don't fail
+            tracing::warn!(
+                max_capacity = self.max_capacity,
+                "Very large max_capacity may impact memory usage significantly"
+            );
+        }
+
+        // Validate raft_addr - port 0 is typically for dynamic allocation, warn about it
+        if self.raft_addr.port() == 0 {
+            return Err("raft_addr port must be specified (non-zero)".to_string());
+        }
+
         // Validate Multi-Raft config
         if let Some(err) = self.multiraft.validate() {
             return Err(err);
@@ -284,9 +314,9 @@ pub struct RaftConfig {
 impl Default for RaftConfig {
     fn default() -> Self {
         Self {
-            election_tick: 10,      // 10 ticks = 1 second with 100ms tick
-            heartbeat_tick: 3,      // 3 ticks = 300ms
-            tick_interval_ms: 100,  // 100ms per tick
+            election_tick: 10,             // 10 ticks = 1 second with 100ms tick
+            heartbeat_tick: 3,             // 3 ticks = 300ms
+            tick_interval_ms: 100,         // 100ms per tick
             max_size_per_msg: 1024 * 1024, // 1MB
             max_inflight_msgs: 256,
             pre_vote: true,
@@ -315,9 +345,9 @@ impl RaftConfig {
     /// Uses shorter tick intervals and election timeouts to speed up test execution.
     pub fn fast_for_tests() -> Self {
         Self {
-            tick_interval_ms: 20,   // 20ms per tick (5x faster than default)
-            election_tick: 5,       // 5 ticks = 100ms election timeout
-            heartbeat_tick: 1,      // 1 tick = 20ms heartbeat
+            tick_interval_ms: 20, // 20ms per tick (5x faster than default)
+            election_tick: 5,     // 5 ticks = 100ms election timeout
+            heartbeat_tick: 1,    // 1 tick = 20ms heartbeat
             ..Default::default()
         }
     }
@@ -464,8 +494,8 @@ impl Default for PeerManagementConfig {
     fn default() -> Self {
         Self {
             auto_add_peers: true,
-            auto_remove_peers: false, // Conservative default
-            auto_add_voters: false,   // Conservative default - requires explicit opt-in
+            auto_remove_peers: false,  // Conservative default
+            auto_add_voters: false,    // Conservative default - requires explicit opt-in
             auto_remove_voters: false, // Conservative default
         }
     }
@@ -498,7 +528,7 @@ impl PeerManagementConfig {
 }
 
 /// Memberlist gossip configuration.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct MemberlistConfig {
     /// Whether memberlist is enabled.
     pub enabled: bool,
@@ -520,19 +550,6 @@ pub struct MemberlistConfig {
 
     /// Peer management configuration.
     pub peer_management: PeerManagementConfig,
-}
-
-impl Default for MemberlistConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false, // Disabled by default for backwards compatibility
-            bind_addr: None,
-            advertise_addr: None,
-            seed_addrs: Vec::new(),
-            node_name: None,
-            peer_management: PeerManagementConfig::default(),
-        }
-    }
 }
 
 impl MemberlistConfig {
@@ -602,9 +619,11 @@ impl MemberlistConfig {
     }
 
     /// Get the bind address, defaulting to raft_addr port + 1000.
+    /// If port + 1000 would overflow, uses port 65535.
     pub fn get_bind_addr(&self, raft_addr: SocketAddr) -> SocketAddr {
         self.bind_addr.unwrap_or_else(|| {
-            SocketAddr::new(raft_addr.ip(), raft_addr.port() + 1000)
+            let default_port = raft_addr.port().saturating_add(1000);
+            SocketAddr::new(raft_addr.ip(), default_port)
         })
     }
 
@@ -634,6 +653,7 @@ impl MemberlistConfig {
 ///
 /// When enabled, the cache uses multiple Raft groups (shards) for horizontal scaling.
 /// Phase 1 uses gossip-based routing (eventual consistency for shard leader info).
+/// Phase 2 adds per-shard Raft replication for true distributed consensus.
 #[derive(Debug, Clone)]
 pub struct MultiRaftCacheConfig {
     /// Whether Multi-Raft mode is enabled.
@@ -653,6 +673,101 @@ pub struct MultiRaftCacheConfig {
     /// Debounce interval for broadcasting shard leader updates (milliseconds).
     /// Batches rapid leader changes to reduce gossip overhead.
     pub leader_broadcast_debounce_ms: u64,
+
+    /// Whether per-shard Raft replication is enabled (Phase 2).
+    /// When enabled, each shard becomes an independent Raft group with real replication.
+    /// When disabled (default), shards use local storage only (Phase 1 behavior).
+    pub per_shard_raft_enabled: bool,
+
+    /// Per-shard Raft configuration (only used when per_shard_raft_enabled is true).
+    pub shard_raft_config: ShardRaftConfig,
+}
+
+/// Configuration for per-shard Raft replication (Phase 2).
+#[derive(Debug, Clone)]
+pub struct ShardRaftConfig {
+    /// Election timeout in ticks.
+    pub election_tick: usize,
+
+    /// Heartbeat interval in ticks.
+    pub heartbeat_tick: usize,
+
+    /// Tick interval in milliseconds.
+    pub tick_interval_ms: u64,
+
+    /// Read consistency mode for shard operations.
+    pub read_mode: ShardReadMode,
+
+    /// Maximum size of entries in a single append message.
+    pub max_size_per_msg: u64,
+
+    /// Maximum number of inflight append messages.
+    pub max_inflight_msgs: usize,
+
+    /// Whether to enable pre-vote.
+    pub pre_vote: bool,
+}
+
+impl Default for ShardRaftConfig {
+    fn default() -> Self {
+        Self {
+            election_tick: 10,
+            heartbeat_tick: 3,
+            tick_interval_ms: 100,
+            read_mode: ShardReadMode::Local,
+            max_size_per_msg: 1024 * 1024, // 1MB
+            max_inflight_msgs: 256,
+            pre_vote: true,
+        }
+    }
+}
+
+impl ShardRaftConfig {
+    /// Convert to RaftConfig for creating RaftNode.
+    pub fn to_raft_config(&self) -> RaftConfig {
+        RaftConfig {
+            election_tick: self.election_tick,
+            heartbeat_tick: self.heartbeat_tick,
+            tick_interval_ms: self.tick_interval_ms,
+            max_size_per_msg: self.max_size_per_msg,
+            max_inflight_msgs: self.max_inflight_msgs,
+            pre_vote: self.pre_vote,
+            applied: 0,
+            storage_type: RaftStorageType::Memory,
+        }
+    }
+
+    /// Create a fast configuration suitable for tests.
+    pub fn fast_for_tests() -> Self {
+        Self {
+            election_tick: 5,
+            heartbeat_tick: 1,
+            tick_interval_ms: 20,
+            ..Default::default()
+        }
+    }
+}
+
+/// Read consistency mode for shard operations.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShardReadMode {
+    /// Read from local cache (eventual consistency).
+    /// Fastest option, suitable for cache workloads that tolerate staleness.
+    Local,
+
+    /// Use Raft read-index protocol for linearizable reads.
+    /// Guarantees reading the most recent committed value.
+    Linearizable,
+
+    /// Forward reads to the shard leader.
+    /// Ensures reading from the leader's state.
+    LeaderOnly,
+}
+
+impl Default for ShardReadMode {
+    fn default() -> Self {
+        Self::Local
+    }
 }
 
 impl Default for MultiRaftCacheConfig {
@@ -663,6 +778,8 @@ impl Default for MultiRaftCacheConfig {
             shard_capacity: 100_000,
             auto_init_shards: true,
             leader_broadcast_debounce_ms: 200,
+            per_shard_raft_enabled: false,
+            shard_raft_config: ShardRaftConfig::default(),
         }
     }
 }
@@ -704,6 +821,18 @@ impl MultiRaftCacheConfig {
     /// Set the leader broadcast debounce interval.
     pub fn with_leader_broadcast_debounce_ms(mut self, ms: u64) -> Self {
         self.leader_broadcast_debounce_ms = ms;
+        self
+    }
+
+    /// Enable per-shard Raft replication (Phase 2).
+    pub fn with_per_shard_raft(mut self, enabled: bool) -> Self {
+        self.per_shard_raft_enabled = enabled;
+        self
+    }
+
+    /// Set the per-shard Raft configuration.
+    pub fn with_shard_raft_config(mut self, config: ShardRaftConfig) -> Self {
+        self.shard_raft_config = config;
         self
     }
 
@@ -771,7 +900,8 @@ impl ForwardingConfig {
 
     /// Set the forward timeout as a Duration.
     pub fn with_timeout(mut self, timeout: Duration) -> Self {
-        self.forward_timeout_ms = timeout.as_millis() as u64;
+        // Safely clamp to u64::MAX to avoid truncation
+        self.forward_timeout_ms = timeout.as_millis().min(u64::MAX as u128) as u64;
         self
     }
 

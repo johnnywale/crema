@@ -5,23 +5,28 @@ pub mod storage;
 
 use crate::cluster::{ClusterDiscovery, ClusterEvent, ClusterMembership, NoOpClusterDiscovery};
 use crate::config::CacheConfig;
-use crate::consensus::{CacheStateMachine, RaftNode};
+use crate::consensus::{CacheStateMachine, RaftNode, TransportConfig};
 use crate::error::{Error, Result};
 use crate::metrics::CacheMetrics;
 use crate::multiraft::{MultiRaftBuilder, MultiRaftCoordinator};
-use crate::network::rpc::{ForwardedCommand, ForwardResponse};
+use crate::network::router::{MainRaftAdapter, NodeMessageRouter};
+use crate::network::rpc::{ForwardResponse, ForwardedCommand};
 use crate::network::{Message, MessageHandler, NetworkServer};
 use crate::types::{CacheCommand, CacheStats, ClusterStatus, NodeId};
 use bytes::Bytes;
 use dashmap::DashMap;
 use parking_lot::Mutex;
 use router::CacheRouter;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use storage::CacheStorage;
 use tokio::sync::{mpsc, oneshot};
 use tracing::{debug, info, warn};
+
+/// Type alias for pending forward requests map.
+/// Maps request_id -> (response sender, creation time for cleanup).
+type PendingForwardsMap = Arc<DashMap<u64, (oneshot::Sender<Result<Option<Bytes>>>, Instant)>>;
 
 /// The main distributed cache instance.
 ///
@@ -46,6 +51,9 @@ pub struct DistributedCache {
     /// Cluster discovery service (trait-based, supports multiple backends).
     discovery: Arc<Mutex<Box<dyn ClusterDiscovery>>>,
 
+    /// Metrics for monitoring.
+    metrics: Arc<CacheMetrics>,
+
     /// Configuration.
     config: CacheConfig,
 
@@ -59,14 +67,13 @@ pub struct DistributedCache {
     discovery_shutdown_tx: Option<mpsc::Sender<()>>,
 
     /// Pending forwarded requests awaiting leader response.
-    /// Maps request_id -> oneshot sender for the response.
-    pending_forwards: Arc<DashMap<u64, oneshot::Sender<Result<Option<Bytes>>>>>,
+    pending_forwards: PendingForwardsMap,
 
     /// Counter for generating unique forward request IDs.
     next_forward_id: AtomicU64,
 
-    /// Shutdown flag to stop accepting new requests.
-    shutdown_flag: AtomicBool,
+    /// Message handler reference (for setting shard handler after coordinator init).
+    message_handler: Arc<CacheMessageHandler>,
 }
 
 impl DistributedCache {
@@ -95,7 +102,6 @@ impl DistributedCache {
             multiraft_enabled = config.multiraft.enabled,
             "Starting distributed cache"
         );
-        info!(node_id = config.node_id, "Starting distributed cache");
 
         // Create local cache storage
         let storage = Arc::new(CacheStorage::new(&config));
@@ -123,64 +129,62 @@ impl DistributedCache {
         #[cfg(not(feature = "rocksdb-storage"))]
         let uses_persistent_storage = false;
 
-        let (recovered_index, checkpoint_manager) = if config.checkpoint.enabled && uses_persistent_storage {
-            match CheckpointManager::new(config.checkpoint.clone(), storage.clone()) {
-                Ok(manager) => {
-                    let manager = Arc::new(manager);
-                    // Find latest snapshot and get its index
-                    match manager.find_latest_snapshot() {
-                        Ok(Some(info)) => {
-                            info!(
-                                node_id = config.node_id,
-                                path = %info.path.display(),
-                                raft_index = info.raft_index,
-                                raft_term = info.raft_term,
-                                "Found existing snapshot for recovery"
-                            );
-                            (Some((info, manager.clone())), Some(manager))
-                        }
-                        Ok(None) => {
-                            debug!(
-                                node_id = config.node_id,
-                                "No existing snapshot found"
-                            );
-                            (None, Some(manager))
-                        }
-                        Err(e) => {
-                            warn!(
-                                node_id = config.node_id,
-                                error = %e,
-                                "Failed to find snapshot"
-                            );
-                            (None, Some(manager))
+        let (recovered_index, checkpoint_manager) =
+            if config.checkpoint.enabled && uses_persistent_storage {
+                match CheckpointManager::new(config.checkpoint.clone(), storage.clone()) {
+                    Ok(manager) => {
+                        let manager = Arc::new(manager);
+                        // Find latest snapshot and get its index
+                        match manager.find_latest_snapshot() {
+                            Ok(Some(info)) => {
+                                info!(
+                                    node_id = config.node_id,
+                                    path = %info.path.display(),
+                                    raft_index = info.raft_index,
+                                    raft_term = info.raft_term,
+                                    "Found existing snapshot for recovery"
+                                );
+                                (Some((info, manager.clone())), Some(manager))
+                            }
+                            Ok(None) => {
+                                debug!(node_id = config.node_id, "No existing snapshot found");
+                                (None, Some(manager))
+                            }
+                            Err(e) => {
+                                warn!(
+                                    node_id = config.node_id,
+                                    error = %e,
+                                    "Failed to find snapshot"
+                                );
+                                (None, Some(manager))
+                            }
                         }
                     }
+                    Err(e) => {
+                        warn!(
+                            node_id = config.node_id,
+                            error = %e,
+                            "Failed to create checkpoint manager"
+                        );
+                        (None, None)
+                    }
                 }
-                Err(e) => {
-                    warn!(
-                        node_id = config.node_id,
-                        error = %e,
-                        "Failed to create checkpoint manager"
-                    );
-                    (None, None)
+            } else if config.checkpoint.enabled {
+                // Checkpointing enabled but using in-memory storage - create manager but don't recover
+                match CheckpointManager::new(config.checkpoint.clone(), storage.clone()) {
+                    Ok(manager) => (None, Some(Arc::new(manager))),
+                    Err(e) => {
+                        warn!(
+                            node_id = config.node_id,
+                            error = %e,
+                            "Failed to create checkpoint manager"
+                        );
+                        (None, None)
+                    }
                 }
-            }
-        } else if config.checkpoint.enabled {
-            // Checkpointing enabled but using in-memory storage - create manager but don't recover
-            match CheckpointManager::new(config.checkpoint.clone(), storage.clone()) {
-                Ok(manager) => (None, Some(Arc::new(manager))),
-                Err(e) => {
-                    warn!(
-                        node_id = config.node_id,
-                        error = %e,
-                        "Failed to create checkpoint manager"
-                    );
-                    (None, None)
-                }
-            }
-        } else {
-            (None, None)
-        };
+            } else {
+                (None, None)
+            };
 
         // Create Raft config with correct applied index for recovery
         let mut raft_config = config.raft.clone();
@@ -193,13 +197,31 @@ impl DistributedCache {
             );
         }
 
-        // Create Raft node with the correct applied index
-        let raft = RaftNode::new(
+        // Create node-wide message router FIRST - this is shared between main Raft and per-shard Raft
+        // This ensures a single connection pool to each peer regardless of shard count
+        let node_router = Arc::new(NodeMessageRouter::new(
+            config.node_id,
+            TransportConfig::default(),
+        ));
+
+        // Add peers to the router before creating Raft node
+        for (peer_id, addr) in &config.seed_nodes {
+            if *peer_id != config.node_id {
+                node_router.add_peer(*peer_id, *addr).await;
+            }
+        }
+
+        // Create MainRaftAdapter wrapping the shared router
+        let main_transport = Arc::new(MainRaftAdapter::new(node_router.clone()));
+
+        // Create Raft node with the shared transport
+        let raft = RaftNode::new_with_transport(
             config.node_id,
             initial_peers.clone(),
             raft_config,
             state_machine.clone(),
             config.raft_addr.to_string(),
+            main_transport,
         )?;
 
         // Set checkpoint manager on Raft node if available
@@ -234,13 +256,6 @@ impl DistributedCache {
             }
         }
 
-        // Add peers to transport using their actual node IDs
-        for (peer_id, addr) in &config.seed_nodes {
-            if *peer_id != config.node_id {
-                raft.transport().add_peer(*peer_id, *addr).await;
-            }
-        }
-
         // Create membership manager with default config
         let (membership, _event_rx) =
             ClusterMembership::new(config.node_id, crate::config::MembershipConfig::default());
@@ -249,15 +264,19 @@ impl DistributedCache {
         let pending_forwards = Arc::new(DashMap::new());
 
         // Create message handler
-        let handler = CacheMessageHandler {
+        let handler = Arc::new(CacheMessageHandler {
             raft: raft.clone(),
             pending_forwards: pending_forwards.clone(),
             node_id: config.node_id,
-        };
+            shard_handler: parking_lot::RwLock::new(None),
+            shard_forward_handler: parking_lot::RwLock::new(None),
+            shard_forward_response_handler: parking_lot::RwLock::new(None),
+            pending_shard_messages: parking_lot::Mutex::new(Vec::new()),
+        });
 
         // Create and start network server
         let (server, shutdown_tx) =
-            NetworkServer::new(config.raft_addr, config.node_id, Arc::new(handler));
+            NetworkServer::new(config.raft_addr, config.node_id, handler.clone());
 
         tokio::spawn(async move {
             if let Err(e) = server.run().await {
@@ -270,6 +289,33 @@ impl DistributedCache {
         let (tick_shutdown_tx, tick_shutdown_rx) = mpsc::channel(1);
         tokio::spawn(async move {
             raft_clone.run_tick_loop(tick_shutdown_rx).await;
+        });
+
+        // Start pending forwards cleanup task (prevent memory leaks from orphaned requests)
+        let cleanup_pending_forwards = pending_forwards.clone();
+        let cleanup_timeout = config.forwarding.timeout();
+        tokio::spawn(async move {
+            let cleanup_interval = cleanup_timeout.max(Duration::from_secs(5));
+            // Clean up entries older than timeout + buffer to avoid race with normal timeout handling
+            let max_age = cleanup_timeout + Duration::from_secs(5);
+            loop {
+                tokio::time::sleep(cleanup_interval).await;
+                let now = Instant::now();
+                let mut removed = 0u64;
+                cleanup_pending_forwards.retain(|_id, (_tx, created_at)| {
+                    let is_stale = now.duration_since(*created_at) > max_age;
+                    if is_stale {
+                        removed = removed.saturating_add(1);
+                    }
+                    !is_stale
+                });
+                if removed > 0 {
+                    tracing::debug!(
+                        removed = removed,
+                        "Cleaned up stale pending forward entries"
+                    );
+                }
+            }
         });
 
         // Get cluster discovery from config or create default NoOp
@@ -330,26 +376,42 @@ impl DistributedCache {
         };
         let (discovery, discovery_shutdown_tx) = discovery_shutdown_tx;
 
+        // Create metrics instance
+        let metrics = Arc::new(CacheMetrics::new());
+
         // Create the appropriate router based on configuration
         let router = if config.multiraft.enabled {
-            // Create Multi-Raft coordinator
-            let metrics = Arc::new(CacheMetrics::new());
-            let coordinator = MultiRaftBuilder::new(config.node_id)
+            // Create Multi-Raft coordinator with optional per-shard Raft
+            // Pass the shared node_router so per-shard Raft shares the same connection pool
+            let builder = MultiRaftBuilder::new(config.node_id)
                 .num_shards(config.multiraft.num_shards)
                 .shard_capacity(config.multiraft.shard_capacity)
-                .metrics(metrics)
-                .build();
+                .metrics(metrics.clone())
+                .local_raft_addr(config.raft_addr.to_string())
+                .per_shard_raft(config.multiraft.per_shard_raft_enabled)
+                .with_node_router(node_router.clone())
+                .with_seed_nodes(config.seed_nodes.clone());
 
-            // Initialize if auto-init is enabled
-            if config.multiraft.auto_init_shards {
-                coordinator.init().await.map_err(|e| {
-                    Error::Internal(format!("Failed to initialize Multi-Raft coordinator: {}", e))
-                })?;
-            }
+            let coordinator = if config.multiraft.auto_init_shards {
+                // Use build_and_init which handles per-shard Raft setup:
+                // - Initializes shard Raft infrastructure
+                // - Registers peer addresses with shard transport
+                // - Initializes shards
+                // - Starts shard Raft manager
+                builder.build_and_init().await.map_err(|e| {
+                    Error::Internal(format!(
+                        "Failed to initialize Multi-Raft coordinator: {}",
+                        e
+                    ))
+                })?
+            } else {
+                builder.build()
+            };
 
             info!(
                 node_id = config.node_id,
                 num_shards = config.multiraft.num_shards,
+                per_shard_raft = config.multiraft.per_shard_raft_enabled,
                 "Multi-Raft mode enabled"
             );
 
@@ -357,6 +419,136 @@ impl DistributedCache {
         } else {
             CacheRouter::single(storage.clone(), raft.clone())
         };
+
+        // Set up shard message handlers if per-shard Raft is enabled and initialized
+        // This enables ShardRaft message routing for replication
+        if router.is_multi_raft() {
+            if let Some(coordinator) = router.coordinator() {
+                if coordinator.is_per_shard_raft_enabled() {
+                    // 1. Set the transport on the shard forwarder so it can forward requests
+                    // to shard leaders on other nodes
+                    coordinator
+                        .shard_forwarder()
+                        .set_transport(raft.transport().clone());
+
+                    info!(
+                        node_id = config.node_id,
+                        "Shard forwarder transport initialized"
+                    );
+
+                    // 2. Set up ShardRaft message handler (CRITICAL for replication)
+                    if let Some(manager) = coordinator.shard_raft_manager() {
+                        let multiplexer = manager.transport().clone();
+                        let shard_handler: ShardMessageHandler =
+                            Arc::new(move |shard_msg| multiplexer.handle_shard_message(shard_msg));
+                        handler.set_shard_handler(shard_handler);
+
+                        info!(
+                            node_id = config.node_id,
+                            "Per-shard Raft message handler installed"
+                        );
+                    }
+
+                    // 3. Set up handler for ShardForwardedCommand messages (leader forwarding)
+                    let coord_for_forward = coordinator.clone();
+                    let node_id = config.node_id;
+
+                    let forward_handler: ShardForwardHandler = Arc::new(move |fwd_cmd| {
+                        let coord = coord_for_forward.clone();
+                        Box::pin(async move {
+                            let shard_id = fwd_cmd.shard_id;
+                            let command = fwd_cmd.command;
+                            let request_id = fwd_cmd.request_id;
+                            let origin = fwd_cmd.origin_node_id;
+
+                            tracing::debug!(
+                                shard_id,
+                                request_id,
+                                origin,
+                                "Processing ShardForwardedCommand"
+                            );
+
+                            // Get the shard and execute the command
+                            if let Some(shard) = coord.get_shard(shard_id) {
+                                match &command {
+                                    crate::types::CacheCommand::Put {
+                                        key,
+                                        value,
+                                        expires_at_ms,
+                                    } => {
+                                        let key = bytes::Bytes::from(key.clone());
+                                        let value = bytes::Bytes::from(value.clone());
+
+                                        let result = if let Some(exp_ms) = expires_at_ms {
+                                            let now_ms = std::time::SystemTime::now()
+                                                .duration_since(std::time::UNIX_EPOCH)
+                                                .unwrap_or_default()
+                                                .as_millis()
+                                                as u64;
+                                            if *exp_ms > now_ms {
+                                                let ttl = std::time::Duration::from_millis(
+                                                    *exp_ms - now_ms,
+                                                );
+                                                shard.put_with_ttl(key, value, ttl).await
+                                            } else {
+                                                Ok(())
+                                            }
+                                        } else {
+                                            shard.put(key, value).await
+                                        };
+
+                                        match result {
+                                            Ok(()) => (true, None, None),
+                                            Err(e) => (false, None, Some(e.to_string())),
+                                        }
+                                    }
+                                    crate::types::CacheCommand::Delete { key } => {
+                                        match shard.delete(key).await {
+                                            Ok(()) => (true, None, None),
+                                            Err(e) => (false, None, Some(e.to_string())),
+                                        }
+                                    }
+                                    crate::types::CacheCommand::Get { key } => {
+                                        let value = shard.get(key).await.map(|b| b.to_vec());
+                                        (true, value, None)
+                                    }
+                                    crate::types::CacheCommand::Clear => {
+                                        shard.clear().await;
+                                        (true, None, None)
+                                    }
+                                }
+                            } else {
+                                tracing::warn!(
+                                    node_id,
+                                    shard_id,
+                                    "Received ShardForwardedCommand for unknown shard"
+                                );
+                                (false, None, Some(format!("shard {} not found", shard_id)))
+                            }
+                        })
+                    });
+
+                    handler.set_shard_forward_handler(forward_handler);
+                    info!(
+                        node_id = config.node_id,
+                        "Shard forward command handler installed"
+                    );
+
+                    // 4. Set up handler for ShardForwardResponse messages
+                    let coord_for_response = coordinator.clone();
+                    let response_handler: ShardForwardResponseHandler = Arc::new(move |response| {
+                        coord_for_response
+                            .shard_forwarder()
+                            .handle_response(response);
+                    });
+                    handler.set_shard_forward_response_handler(response_handler);
+                    info!(
+                        node_id = config.node_id,
+                        "Shard forward response handler installed"
+                    );
+                }
+            }
+        }
 
         info!(node_id = config.node_id, "Distributed cache started");
 
@@ -366,13 +558,14 @@ impl DistributedCache {
             raft,
             membership,
             discovery,
+            metrics,
             config,
             shutdown_tx,
             tick_shutdown_tx,
             discovery_shutdown_tx,
             pending_forwards,
             next_forward_id: AtomicU64::new(1),
-            shutdown_flag: AtomicBool::new(false),
+            message_handler: handler,
         })
     }
 
@@ -551,16 +744,23 @@ impl DistributedCache {
 
     // ==================== Read Operations ====================
 
-    /// Get a value from the local cache.
+    /// Get a value from the cache.
     ///
-    /// This reads directly from the local Moka cache. On followers, this may
-    /// return stale data. For strongly consistent reads, use `get_consistent`.
+    /// In Multi-Raft mode, this routes to the appropriate shard based on key hash.
+    /// In single-Raft mode, this reads directly from the local Moka cache.
+    /// On followers, this may return stale data. For strongly consistent reads,
+    /// use `get_consistent`.
     ///
-    /// Note: This method implements a Read-Index style wait to ensure the local
-    /// state machine has caught up to the known commit index before reading.
-    /// This helps avoid stale reads in test scenarios (TC23 fix).
+    /// Note: In single-Raft mode, this method implements a Read-Index style wait
+    /// to ensure the local state machine has caught up to the known commit index
+    /// before reading. This helps avoid stale reads in test scenarios (TC23 fix).
     pub async fn get(&self, key: &[u8]) -> Option<Bytes> {
-        // Read-Index: Wait for state machine to apply up to commit_index
+        // In Multi-Raft mode, delegate to router which handles shard routing
+        if self.router.is_multi_raft() {
+            return self.router.get(key).await;
+        }
+
+        // Single-Raft mode: Read-Index wait for state machine to apply up to commit_index
         let commit_index = self.raft.commit_index();
         let start = std::time::Instant::now();
         let max_wait = Duration::from_secs(1);
@@ -641,25 +841,47 @@ impl DistributedCache {
         Ok(self.storage.get(key).await)
     }
 
-    /// Check if a key exists in the local cache.
+    /// Check if a key exists in the cache.
+    ///
+    /// In Multi-Raft mode, this routes to the appropriate shard based on key hash.
     pub fn contains(&self, key: &[u8]) -> bool {
-        self.storage.contains(key)
+        self.router.contains(key)
     }
 
-    /// Get the number of entries in the local cache.
+    /// Get the number of entries in the cache.
+    ///
+    /// In Multi-Raft mode, this returns the total across all shards.
     pub fn entry_count(&self) -> u64 {
-        self.storage.entry_count()
+        self.router.entry_count()
     }
 
     /// Get cache statistics.
     pub fn stats(&self) -> CacheStats {
-        self.storage.stats()
+        if let Some(coordinator) = self.multiraft_coordinator() {
+            // In Multi-Raft mode, aggregate stats from all shards
+            let stats = coordinator.stats();
+            CacheStats {
+                entry_count: stats.total_entries,
+                weighted_size: stats.total_size_bytes,
+                hits: self.metrics.get_hits.get(),
+                misses: self.metrics.get_misses.get(),
+            }
+        } else {
+            self.storage.stats()
+        }
+    }
+
+    /// Get the metrics instance.
+    pub fn metrics(&self) -> &Arc<CacheMetrics> {
+        &self.metrics
     }
 
     /// Run pending cache maintenance tasks.
     /// This ensures all async cache operations have been processed.
+    ///
+    /// In Multi-Raft mode, this runs pending tasks on all shards.
     pub async fn run_pending_tasks(&self) {
-        self.storage.run_pending_tasks().await;
+        self.router.run_pending_tasks().await;
     }
 
     // ==================== Write Operations ====================
@@ -667,13 +889,33 @@ impl DistributedCache {
     /// Put a key-value pair into the cache.
     ///
     /// This operation goes through Raft consensus and will be replicated
-    /// to all nodes in the cluster. If this node is not the leader and
-    /// forwarding is enabled, the request will be forwarded to the leader.
+    /// to all nodes in the cluster. In Multi-Raft mode, the operation is
+    /// routed to the appropriate shard based on key hash. In single-Raft mode,
+    /// if this node is not the leader and forwarding is enabled, the request
+    /// will be forwarded to the leader.
     pub async fn put(&self, key: impl Into<Bytes>, value: impl Into<Bytes>) -> Result<()> {
         let key = key.into();
         let value = value.into();
 
+        // Validate key
+        if key.is_empty() {
+            return Err(Error::InvalidKey("key cannot be empty".to_string()));
+        }
+
         let key_preview = String::from_utf8_lossy(&key[..std::cmp::min(key.len(), 32)]);
+
+        // In Multi-Raft mode, delegate to router which handles shard routing
+        if self.router.is_multi_raft() {
+            debug!(
+                node_id = self.config.node_id,
+                key = %key_preview,
+                value_len = value.len(),
+                "PUT: Routing to shard (Multi-Raft mode)"
+            );
+            return self.router.put(key, value).await;
+        }
+
+        // Single-Raft mode: use traditional leader forwarding
         let command = CacheCommand::put(key.to_vec(), value.to_vec());
 
         // Try local propose if leader, otherwise forward
@@ -718,7 +960,26 @@ impl DistributedCache {
         let key = key.into();
         let value = value.into();
 
+        // Validate key
+        if key.is_empty() {
+            return Err(Error::InvalidKey("key cannot be empty".to_string()));
+        }
+
         let key_preview = String::from_utf8_lossy(&key[..std::cmp::min(key.len(), 32)]);
+
+        // In Multi-Raft mode, delegate to router which handles shard routing
+        if self.router.is_multi_raft() {
+            debug!(
+                node_id = self.config.node_id,
+                key = %key_preview,
+                value_len = value.len(),
+                ttl_ms = ttl.as_millis(),
+                "PUT_TTL: Routing to shard (Multi-Raft mode)"
+            );
+            return self.router.put_with_ttl(key, value, ttl).await;
+        }
+
+        // Single-Raft mode: use traditional leader forwarding
         let command = CacheCommand::put_with_ttl(key.to_vec(), value.to_vec(), ttl);
 
         if self.raft.is_leader() {
@@ -758,7 +1019,24 @@ impl DistributedCache {
     pub async fn delete(&self, key: impl Into<Bytes>) -> Result<()> {
         let key = key.into();
 
+        // Validate key
+        if key.is_empty() {
+            return Err(Error::InvalidKey("key cannot be empty".to_string()));
+        }
+
         let key_preview = String::from_utf8_lossy(&key[..std::cmp::min(key.len(), 32)]);
+
+        // In Multi-Raft mode, delegate to router which handles shard routing
+        if self.router.is_multi_raft() {
+            debug!(
+                node_id = self.config.node_id,
+                key = %key_preview,
+                "DELETE: Routing to shard (Multi-Raft mode)"
+            );
+            return self.router.delete(&key).await;
+        }
+
+        // Single-Raft mode: use traditional leader forwarding
         let command = CacheCommand::delete(key.to_vec());
 
         if self.raft.is_leader() {
@@ -792,6 +1070,16 @@ impl DistributedCache {
 
     /// Clear all entries from the cache.
     pub async fn clear(&self) -> Result<()> {
+        // In Multi-Raft mode, delegate to router which handles shard clearing
+        if self.router.is_multi_raft() {
+            info!(
+                node_id = self.config.node_id,
+                "CLEAR: Clearing all shards (Multi-Raft mode)"
+            );
+            return self.router.clear().await;
+        }
+
+        // Single-Raft mode: use traditional leader forwarding
         let command = CacheCommand::clear();
 
         if self.raft.is_leader() {
@@ -844,7 +1132,9 @@ impl DistributedCache {
                 max = self.config.forwarding.max_pending_forwards,
                 "FORWARD: Rejecting request due to backpressure"
             );
-            return Err(Error::ServerBusy { pending: pending_count });
+            return Err(Error::ServerBusy {
+                pending: pending_count,
+            });
         }
 
         // Get leader ID
@@ -861,7 +1151,8 @@ impl DistributedCache {
 
         // Create completion channel
         let (tx, rx) = oneshot::channel();
-        self.pending_forwards.insert(request_id, tx);
+        self.pending_forwards
+            .insert(request_id, (tx, Instant::now()));
 
         // Create forwarded command message
         let msg = Message::ForwardedCommand(ForwardedCommand::new(
@@ -930,13 +1221,16 @@ impl DistributedCache {
     ///
     /// This is called when we receive a response to a forwarded request.
     pub fn handle_forward_response(&self, response: &ForwardResponse) {
-        if let Some((_, tx)) = self.pending_forwards.remove(&response.request_id) {
+        if let Some((_, (tx, _))) = self.pending_forwards.remove(&response.request_id) {
             let result = if response.success {
                 // Convert Option<Vec<u8>> to Option<Bytes>
                 Ok(response.value.as_ref().map(|v| Bytes::from(v.clone())))
             } else {
                 Err(Error::RemoteError(
-                    response.error.clone().unwrap_or_else(|| "unknown error".to_string()),
+                    response
+                        .error
+                        .clone()
+                        .unwrap_or_else(|| "unknown error".to_string()),
                 ))
             };
             debug!(
@@ -957,7 +1251,7 @@ impl DistributedCache {
     }
 
     /// Get the pending forwards map (for message handler access).
-    pub fn pending_forwards(&self) -> &Arc<DashMap<u64, oneshot::Sender<Result<Option<Bytes>>>>> {
+    pub fn pending_forwards(&self) -> &PendingForwardsMap {
         &self.pending_forwards
     }
 
@@ -1018,6 +1312,141 @@ impl DistributedCache {
     /// Get this node's ID.
     pub fn node_id(&self) -> NodeId {
         self.config.node_id
+    }
+
+    /// Check if the cache is ready to handle requests.
+    ///
+    /// Readiness depends on the operating mode:
+    /// - **Single Raft mode**: Ready when a Raft leader is known
+    /// - **Multi-Raft mode (Phase 1)**: Ready when coordinator is running and shards are active
+    /// - **Multi-Raft mode (Phase 2 / per-shard Raft)**: Ready when all shard leaders are elected
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// let cache = DistributedCache::new(config).await?;
+    ///
+    /// // Wait until the cache is ready
+    /// cache.wait_until_ready(Duration::from_secs(30)).await?;
+    ///
+    /// // Now safe to use
+    /// cache.put("key", "value").await?;
+    /// ```
+    pub fn is_ready(&self) -> bool {
+        if self.router.is_multi_raft() {
+            // Multi-Raft mode
+            if let Some(coordinator) = self.router.coordinator() {
+                if coordinator.is_per_shard_raft_enabled() {
+                    // Phase 2: All shard leaders must be elected
+                    self.are_all_shard_leaders_elected()
+                } else {
+                    // Phase 1: Coordinator must be running and have active shards
+                    coordinator.is_running()
+                        && coordinator.stats().active_shards == self.config.multiraft.num_shards
+                }
+            } else {
+                false
+            }
+        } else {
+            // Single Raft mode: Need a known leader
+            self.raft.leader_id().is_some()
+        }
+    }
+
+    /// Check if all shard leaders are elected (for per-shard Raft mode).
+    ///
+    /// Returns true if every shard has a known leader, false otherwise.
+    /// In non-Multi-Raft mode, always returns true.
+    pub fn are_all_shard_leaders_elected(&self) -> bool {
+        if let Some(coordinator) = self.router.coordinator() {
+            if coordinator.is_per_shard_raft_enabled() {
+                if let Some(manager) = coordinator.shard_raft_manager() {
+                    let num_shards = self.config.multiraft.num_shards;
+                    for shard_id in 0..num_shards {
+                        if let Some(shard_node) = manager.get_shard(shard_id) {
+                            if shard_node.leader_id().is_none() {
+                                return false;
+                            }
+                        } else {
+                            return false;
+                        }
+                    }
+                    return true;
+                }
+            }
+        }
+        // Not in per-shard Raft mode, or coordinator not available
+        true
+    }
+
+    /// Get the number of shard leaders that have been elected.
+    ///
+    /// Returns `(elected_count, total_shards)`.
+    /// In non-Multi-Raft mode, returns `(0, 0)`.
+    pub fn shard_leader_status(&self) -> (u32, u32) {
+        if let Some(coordinator) = self.router.coordinator() {
+            let num_shards = self.config.multiraft.num_shards;
+
+            if coordinator.is_per_shard_raft_enabled() {
+                if let Some(manager) = coordinator.shard_raft_manager() {
+                    let mut elected = 0u32;
+                    for shard_id in 0..num_shards {
+                        if let Some(shard_node) = manager.get_shard(shard_id) {
+                            if shard_node.leader_id().is_some() {
+                                elected += 1;
+                            }
+                        }
+                    }
+                    return (elected, num_shards);
+                }
+            }
+
+            // Phase 1: Check router's cached shard leaders
+            let leaders = coordinator.shard_leaders();
+            let elected = leaders.values().filter(|l| l.is_some()).count() as u32;
+            (elected, num_shards)
+        } else {
+            (0, 0)
+        }
+    }
+
+    /// Wait until the cache is ready to handle requests.
+    ///
+    /// This method polls `is_ready()` until it returns true or the timeout is reached.
+    ///
+    /// # Arguments
+    ///
+    /// * `timeout` - Maximum time to wait for readiness
+    ///
+    /// # Returns
+    ///
+    /// * `Ok(())` - Cache is ready
+    /// * `Err(Error::Timeout)` - Timeout reached before cache became ready
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// let cache = DistributedCache::new(config).await?;
+    /// cache.wait_until_ready(Duration::from_secs(30)).await?;
+    /// ```
+    pub async fn wait_until_ready(&self, timeout: Duration) -> Result<()> {
+        let start = std::time::Instant::now();
+        let poll_interval = Duration::from_millis(100);
+
+        while start.elapsed() < timeout {
+            if self.is_ready() {
+                // Sync shard leaders to router cache if in per-shard Raft mode
+                if let Some(coordinator) = self.router.coordinator() {
+                    if coordinator.is_per_shard_raft_enabled() {
+                        coordinator.sync_shard_leaders_from_raft_manager();
+                    }
+                }
+                return Ok(());
+            }
+            tokio::time::sleep(poll_interval).await;
+        }
+
+        Err(Error::Timeout)
     }
 
     /// Get the current voters in the Raft cluster.
@@ -1083,6 +1512,7 @@ impl DistributedCache {
     }
 
     /// Shutdown the distributed cache with a custom timeout for pending operations.
+    #[allow(clippy::await_holding_lock)]
     pub async fn shutdown_with_timeout(&self, timeout: Duration) {
         info!(
             node_id = self.config.node_id,
@@ -1093,7 +1523,6 @@ impl DistributedCache {
         let start = std::time::Instant::now();
 
         // 1. Stop accepting new requests
-        self.shutdown_flag.store(true, Ordering::SeqCst);
         self.raft.stop_accepting_proposals();
 
         // 2. Wait for pending Raft proposals to complete (with timeout)
@@ -1128,12 +1557,21 @@ impl DistributedCache {
         }
 
         // 5. Leave cluster discovery gracefully
-        {
-            let mut disc = self.discovery.lock();
-            if disc.is_active() {
+        // Note: We hold the parking_lot mutex across await points here. This is generally
+        // discouraged, but is acceptable for shutdown-only code because:
+        // 1. Shutdown is single-threaded (no concurrent access expected)
+        // 2. Discovery implementations should not acquire locks that could deadlock
+        // 3. Converting to tokio::sync::Mutex would require making non-async methods async
+        let discovery_active = self.discovery.lock().is_active();
+        if discovery_active {
+            {
+                let mut disc = self.discovery.lock();
                 if let Err(e) = disc.leave().await {
                     warn!(node_id = self.config.node_id, error = %e, "Error leaving cluster discovery");
                 }
+            }
+            {
+                let mut disc = self.discovery.lock();
                 if let Err(e) = disc.shutdown().await {
                     warn!(node_id = self.config.node_id, error = %e, "Error shutting down cluster discovery");
                 }
@@ -1181,6 +1619,162 @@ impl DistributedCache {
         self.router.coordinator().map(|c| c.shard_for_key(key))
     }
 
+    /// Set up the shard message handler for per-shard Raft.
+    ///
+    /// This should be called after the coordinator's shard Raft manager is initialized.
+    /// It's automatically called during cache creation if auto_init_shards is true.
+    /// For manual initialization (auto_init_shards=false), call this after
+    /// `start_shard_raft_manager()`.
+    /// Set up all handlers for per-shard Raft message routing (Phase 2).
+    ///
+    /// This installs handlers for:
+    /// - ShardRaft messages (Raft protocol messages between shard replicas)
+    /// - ShardForwardedCommand messages (forwarded writes from non-leaders)
+    /// - ShardForwardResponse messages (responses to forwarded commands)
+    pub fn setup_shard_message_handler(&self) {
+        if let Some(coordinator) = self.router.coordinator() {
+            if coordinator.is_per_shard_raft_enabled() {
+                // Set the transport on the shard forwarder so it can send messages
+                coordinator
+                    .shard_forwarder()
+                    .set_transport(self.raft.transport().clone());
+                debug!(
+                    node_id = self.config.node_id,
+                    "Shard forwarder transport initialized"
+                );
+
+                // 1. Set up handler for ShardRaft messages (Raft replication)
+                if let Some(manager) = coordinator.shard_raft_manager() {
+                    let multiplexer = manager.transport().clone();
+                    let shard_handler: ShardMessageHandler =
+                        Arc::new(move |shard_msg| multiplexer.handle_shard_message(shard_msg));
+                    self.message_handler.set_shard_handler(shard_handler);
+                    debug!(
+                        node_id = self.config.node_id,
+                        "Shard Raft message handler installed"
+                    );
+                }
+
+                // 2. Set up handler for ShardForwardedCommand messages (leader forwarding)
+                let coord_for_forward = coordinator.clone();
+                let node_id = self.config.node_id;
+
+                let forward_handler: ShardForwardHandler = Arc::new(move |fwd_cmd| {
+                    let coord = coord_for_forward.clone();
+                    Box::pin(async move {
+                        let shard_id = fwd_cmd.shard_id;
+                        let command = fwd_cmd.command;
+                        let request_id = fwd_cmd.request_id;
+                        let origin = fwd_cmd.origin_node_id;
+
+                        tracing::debug!(
+                            shard_id,
+                            request_id,
+                            origin,
+                            "Processing ShardForwardedCommand"
+                        );
+
+                        // Get the shard and execute the command
+                        if let Some(shard) = coord.get_shard(shard_id) {
+                            match &command {
+                                crate::types::CacheCommand::Put {
+                                    key,
+                                    value,
+                                    expires_at_ms,
+                                } => {
+                                    let key_preview = String::from_utf8_lossy(
+                                        &key[..std::cmp::min(key.len(), 32)],
+                                    );
+                                    tracing::debug!(
+                                        shard_id,
+                                        key = %key_preview,
+                                        "Forward handler: executing PUT"
+                                    );
+
+                                    let key = bytes::Bytes::from(key.clone());
+                                    let value = bytes::Bytes::from(value.clone());
+
+                                    let result = if let Some(exp_ms) = expires_at_ms {
+                                        let now_ms = std::time::SystemTime::now()
+                                            .duration_since(std::time::UNIX_EPOCH)
+                                            .unwrap_or_default()
+                                            .as_millis()
+                                            as u64;
+                                        if *exp_ms > now_ms {
+                                            let ttl =
+                                                std::time::Duration::from_millis(*exp_ms - now_ms);
+                                            shard.put_with_ttl(key, value, ttl).await
+                                        } else {
+                                            Ok(())
+                                        }
+                                    } else {
+                                        shard.put(key, value).await
+                                    };
+
+                                    match &result {
+                                        Ok(()) => {
+                                            tracing::debug!(shard_id, "Forward PUT succeeded")
+                                        }
+                                        Err(e) => {
+                                            tracing::warn!(shard_id, error = %e, "Forward PUT failed")
+                                        }
+                                    }
+
+                                    match result {
+                                        Ok(()) => (true, None, None),
+                                        Err(e) => (false, None, Some(e.to_string())),
+                                    }
+                                }
+                                crate::types::CacheCommand::Delete { key } => {
+                                    match shard.delete(key).await {
+                                        Ok(()) => (true, None, None),
+                                        Err(e) => (false, None, Some(e.to_string())),
+                                    }
+                                }
+                                crate::types::CacheCommand::Get { key } => {
+                                    let value = shard.get(key).await.map(|b| b.to_vec());
+                                    (true, value, None)
+                                }
+                                crate::types::CacheCommand::Clear => {
+                                    shard.clear().await;
+                                    (true, None, None)
+                                }
+                            }
+                        } else {
+                            tracing::warn!(
+                                node_id = node_id,
+                                shard_id = shard_id,
+                                "Received ShardForwardedCommand for unknown shard"
+                            );
+                            (false, None, Some(format!("shard {} not found", shard_id)))
+                        }
+                    })
+                });
+
+                self.message_handler
+                    .set_shard_forward_handler(forward_handler);
+                debug!(
+                    node_id = self.config.node_id,
+                    "Shard forward command handler installed"
+                );
+
+                // 3. Set up handler for ShardForwardResponse messages
+                let coord_for_response = coordinator.clone();
+                let response_handler: ShardForwardResponseHandler = Arc::new(move |response| {
+                    coord_for_response
+                        .shard_forwarder()
+                        .handle_response(response);
+                });
+                self.message_handler
+                    .set_shard_forward_response_handler(response_handler);
+                debug!(
+                    node_id = self.config.node_id,
+                    "Shard forward response handler installed"
+                );
+            }
+        }
+    }
+
     // ==================== Recovery/Checkpoint Operations ====================
 
     /// Get the applied index (for recovery testing and monitoring).
@@ -1201,28 +1795,213 @@ impl DistributedCache {
             .map(|_| ())
             .map_err(|e| Error::Internal(format!("Snapshot failed: {}", e)))
     }
+
+    // ==================== Dynamic Shard Management ====================
+
+    /// Enable slot-based routing for dynamic shard management.
+    ///
+    /// This enables the slot-based sharding system which allows adding and removing
+    /// shards at runtime. When enabled:
+    /// - Keys are mapped to slots via `crc16(key) % 1024`
+    /// - Slots are assigned to shards
+    /// - Epoch-based routing ensures consistency
+    ///
+    /// Only available in Multi-Raft mode.
+    pub fn enable_slot_routing(&self) -> Result<()> {
+        let coordinator = self
+            .router
+            .coordinator()
+            .ok_or_else(|| Error::Internal("Multi-Raft not enabled".to_string()))?;
+        coordinator.enable_slot_routing()
+    }
+
+    /// Check if slot-based routing is enabled.
+    pub fn is_slot_routing_enabled(&self) -> bool {
+        self.router
+            .coordinator()
+            .map(|c| c.is_slot_routing_enabled())
+            .unwrap_or(false)
+    }
+
+    /// Add a new shard dynamically (slot-based routing only).
+    ///
+    /// This method:
+    /// 1. Creates a new empty shard
+    /// 2. Computes a rebalance plan (steals slots from existing shards)
+    /// 3. Updates the slot table with new ownership
+    /// 4. Starts background migration of data
+    ///
+    /// # Returns
+    ///
+    /// Returns the new shard ID and slot assignment details.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if Multi-Raft or slot routing is not enabled.
+    pub async fn add_shard(&self) -> Result<crate::multiraft::AddShardResult> {
+        let coordinator = self
+            .router
+            .coordinator()
+            .ok_or_else(|| Error::Internal("Multi-Raft not enabled".to_string()))?;
+
+        coordinator.add_shard_dynamic().await
+    }
+
+    /// Remove a shard dynamically (slot-based routing only).
+    ///
+    /// This method:
+    /// 1. Marks the shard as draining
+    /// 2. Redistributes its slots among remaining shards
+    /// 3. Starts background migration of data
+    /// 4. Removes the shard when migration completes
+    ///
+    /// # Note
+    ///
+    /// The shard is not immediately removed. It enters DRAINING state first,
+    /// then TOMBSTONE, and finally gets garbage collected.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if Multi-Raft or slot routing is not enabled.
+    pub async fn remove_shard(&self, shard_id: u32) -> Result<crate::multiraft::RemoveShardResult> {
+        let coordinator = self
+            .router
+            .coordinator()
+            .ok_or_else(|| Error::Internal("Multi-Raft not enabled".to_string()))?;
+
+        coordinator.remove_shard_dynamic(shard_id).await
+    }
+
+    /// Get a snapshot of the slot table.
+    ///
+    /// Returns None if slot routing is not enabled.
+    pub fn slot_table(&self) -> Option<crate::multiraft::SlotTableSnapshot> {
+        self.router.coordinator()?.slot_table_snapshot()
+    }
+
+    /// Get the current slot routing epoch.
+    ///
+    /// Returns None if slot routing is not enabled.
+    pub fn slot_epoch(&self) -> Option<crate::multiraft::Epoch> {
+        self.router.coordinator()?.slot_epoch()
+    }
+
+    /// Get the migration status for slot-based routing.
+    ///
+    /// Returns None if slot routing is not enabled.
+    pub fn slot_migration_status(&self) -> Option<crate::multiraft::MigrationStatus> {
+        self.router.coordinator()?.slot_migration_status()
+    }
+
+    /// Start the slot migration background loop.
+    ///
+    /// This should be called after enabling slot routing to start
+    /// background data migration when shards are added or removed.
+    pub fn start_slot_migration(&self) {
+        if let Some(coordinator) = self.router.coordinator() {
+            coordinator.start_slot_migration_loop();
+        }
+    }
+
+    /// Stop the slot migration background loop.
+    pub fn stop_slot_migration(&self) {
+        if let Some(coordinator) = self.router.coordinator() {
+            coordinator.stop_slot_migration_loop();
+        }
+    }
+
+    // ==================== End Dynamic Shard Management ====================
 }
+
+/// Callback type for handling shard Raft messages.
+pub type ShardMessageHandler =
+    Arc<dyn Fn(crate::network::rpc::ShardRaftMessage) -> Result<()> + Send + Sync>;
+
+/// Callback type for handling shard forwarded commands.
+/// Returns (success, value, error) tuple for the response.
+pub type ShardForwardHandler = Arc<
+    dyn Fn(
+            crate::network::rpc::ShardForwardedCommand,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = (bool, Option<Vec<u8>>, Option<String>)> + Send>,
+        > + Send
+        + Sync,
+>;
+
+/// Callback type for handling shard forward responses.
+pub type ShardForwardResponseHandler =
+    Arc<dyn Fn(&crate::network::rpc::ShardForwardResponse) + Send + Sync>;
 
 /// Message handler that routes messages to the Raft node.
 struct CacheMessageHandler {
     raft: Arc<RaftNode>,
     /// Pending forwarded requests awaiting leader response.
-    pending_forwards: Arc<DashMap<u64, oneshot::Sender<Result<Option<Bytes>>>>>,
+    pending_forwards: PendingForwardsMap,
     /// Node ID for logging.
     node_id: NodeId,
+    /// Optional handler for shard Raft messages (set after coordinator init).
+    shard_handler: parking_lot::RwLock<Option<ShardMessageHandler>>,
+    /// Optional handler for shard forwarded commands (set after coordinator init).
+    shard_forward_handler: parking_lot::RwLock<Option<ShardForwardHandler>>,
+    /// Optional handler for shard forward responses (set after coordinator init).
+    shard_forward_response_handler: parking_lot::RwLock<Option<ShardForwardResponseHandler>>,
+    /// Pending shard messages that arrived before handler was set (limited to avoid memory issues).
+    pending_shard_messages: parking_lot::Mutex<Vec<crate::network::rpc::ShardRaftMessage>>,
+}
+
+impl CacheMessageHandler {
+    /// Set the shard message handler for routing per-shard Raft messages.
+    ///
+    /// This also processes any pending shard messages that arrived before the handler was set.
+    pub fn set_shard_handler(&self, handler: ShardMessageHandler) {
+        // Set the handler first
+        *self.shard_handler.write() = Some(handler.clone());
+
+        // Process any pending messages that arrived before the handler was set
+        let pending = std::mem::take(&mut *self.pending_shard_messages.lock());
+        if !pending.is_empty() {
+            debug!(
+                node_id = self.node_id,
+                count = pending.len(),
+                "Processing pending shard messages after handler installation"
+            );
+            for shard_msg in pending {
+                if let Err(e) = handler(shard_msg) {
+                    warn!(
+                        node_id = self.node_id,
+                        error = %e,
+                        "Failed to handle pending shard Raft message"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Set the shard forward handler for handling forwarded shard commands.
+    pub fn set_shard_forward_handler(&self, handler: ShardForwardHandler) {
+        *self.shard_forward_handler.write() = Some(handler);
+    }
+
+    /// Set the shard forward response handler for completing pending forwards.
+    pub fn set_shard_forward_response_handler(&self, handler: ShardForwardResponseHandler) {
+        *self.shard_forward_response_handler.write() = Some(handler);
+    }
 }
 
 impl MessageHandler for CacheMessageHandler {
     fn handle(&self, msg: Message) -> Option<Message> {
         // Handle ForwardResponse separately - complete pending forwards
         if let Message::ForwardResponse(ref response) = msg {
-            if let Some((_, tx)) = self.pending_forwards.remove(&response.request_id) {
+            if let Some((_, (tx, _))) = self.pending_forwards.remove(&response.request_id) {
                 let result = if response.success {
                     // Convert Option<Vec<u8>> to Option<Bytes>
                     Ok(response.value.as_ref().map(|v| Bytes::from(v.clone())))
                 } else {
                     Err(Error::RemoteError(
-                        response.error.clone().unwrap_or_else(|| "unknown error".to_string()),
+                        response
+                            .error
+                            .clone()
+                            .unwrap_or_else(|| "unknown error".to_string()),
                     ))
                 };
                 debug!(
@@ -1238,6 +2017,116 @@ impl MessageHandler for CacheMessageHandler {
                     node_id = self.node_id,
                     request_id = response.request_id,
                     "FORWARD: Received response for unknown request ID"
+                );
+            }
+            return None;
+        }
+
+        // Handle per-shard Raft messages
+        if let Message::ShardRaft(shard_msg) = msg {
+            if let Some(handler) = self.shard_handler.read().as_ref() {
+                if let Err(e) = handler(shard_msg) {
+                    warn!(
+                        node_id = self.node_id,
+                        error = %e,
+                        "Failed to handle shard Raft message"
+                    );
+                }
+            } else {
+                // Handler not set yet (startup race) - queue the message for later processing.
+                // This typically only happens during the brief window between network server
+                // starting and coordinator initialization completing.
+                //
+                // Limit queue size to prevent memory issues. If handler is never set (e.g.,
+                // Multi-Raft disabled), messages will be dropped once queue is full.
+                // This is acceptable as Raft will retry from the sender side.
+                const MAX_PENDING_SHARD_MESSAGES: usize = 1000;
+                let mut pending = self.pending_shard_messages.lock();
+                if pending.len() < MAX_PENDING_SHARD_MESSAGES {
+                    debug!(
+                        node_id = self.node_id,
+                        shard_id = shard_msg.shard_id,
+                        pending_count = pending.len() + 1,
+                        "Queuing shard Raft message (handler not yet set)"
+                    );
+                    pending.push(shard_msg);
+                } else {
+                    warn!(
+                        node_id = self.node_id,
+                        shard_id = shard_msg.shard_id,
+                        "Dropping shard Raft message - pending queue full (handler not set)"
+                    );
+                }
+            }
+            return None;
+        }
+
+        // Handle shard forwarded commands (for per-shard Raft Phase 2)
+        if let Message::ShardForwardedCommand(fwd_cmd) = msg {
+            if let Some(handler) = self.shard_forward_handler.read().clone() {
+                let request_id = fwd_cmd.request_id;
+                let origin_node_id = fwd_cmd.origin_node_id;
+                let transport = self.raft.transport().clone();
+                let node_id = self.node_id;
+
+                debug!(
+                    node_id = node_id,
+                    request_id = request_id,
+                    origin = origin_node_id,
+                    shard_id = fwd_cmd.shard_id,
+                    "Handling ShardForwardedCommand"
+                );
+
+                // Spawn task to process the forwarded command and send response
+                tokio::spawn(async move {
+                    let (success, value, error) = handler(fwd_cmd).await;
+
+                    let response =
+                        Message::ShardForwardResponse(crate::network::rpc::ShardForwardResponse {
+                            request_id,
+                            success,
+                            error,
+                            value,
+                            leader_hint: None,
+                        });
+
+                    if let Err(e) = transport.send_message(origin_node_id, response).await {
+                        warn!(
+                            node_id = node_id,
+                            request_id = request_id,
+                            origin = origin_node_id,
+                            error = %e,
+                            "Failed to send ShardForwardResponse"
+                        );
+                    }
+                });
+            } else {
+                warn!(
+                    node_id = self.node_id,
+                    shard_id = fwd_cmd.shard_id,
+                    request_id = fwd_cmd.request_id,
+                    "Received ShardForwardedCommand but no handler is set"
+                );
+            }
+            return None;
+        }
+
+        // Handle shard forward responses (complete pending forwards)
+        if let Message::ShardForwardResponse(ref response) = msg {
+            debug!(
+                node_id = self.node_id,
+                request_id = response.request_id,
+                success = response.success,
+                "Received ShardForwardResponse"
+            );
+
+            if let Some(handler) = self.shard_forward_response_handler.read().as_ref() {
+                handler(response);
+            } else {
+                warn!(
+                    node_id = self.node_id,
+                    request_id = response.request_id,
+                    "Received ShardForwardResponse but no handler is set"
                 );
             }
             return None;
@@ -1480,6 +2369,9 @@ mod tests {
 
         let status = cache.cluster_status();
 
-        assert_eq!(status.memberlist_node_count, 1, "Local node should be counted");
+        assert_eq!(
+            status.memberlist_node_count, 1,
+            "Local node should be counted"
+        );
     }
 }

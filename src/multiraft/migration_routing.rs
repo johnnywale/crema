@@ -3,7 +3,7 @@
 //! This module implements routing strategies during shard migration to ensure
 //! consistency and availability while data is being transferred between nodes.
 
-use crate::error::{Result};
+use crate::error::Result;
 use crate::types::NodeId;
 use std::sync::atomic::{AtomicU8, Ordering};
 
@@ -140,10 +140,7 @@ pub enum WriteTarget {
     /// Write to a single node.
     Single(NodeId),
     /// Write to both nodes (primary must succeed, secondary failure tolerated).
-    Both {
-        primary: NodeId,
-        secondary: NodeId,
-    },
+    Both { primary: NodeId, secondary: NodeId },
     /// Writes are blocked.
     Blocked,
 }
@@ -161,10 +158,7 @@ pub struct ReadTargets {
 #[derive(Debug, Clone)]
 pub enum RoutingDecision {
     /// Route to a single node.
-    Single {
-        node: NodeId,
-        shard_id: ShardId,
-    },
+    Single { node: NodeId, shard_id: ShardId },
     /// Route to the primary with optional secondary for redundancy.
     WithFallback {
         primary: NodeId,
@@ -178,10 +172,7 @@ pub enum RoutingDecision {
         shard_id: ShardId,
     },
     /// Operation is blocked.
-    Blocked {
-        shard_id: ShardId,
-        reason: String,
-    },
+    Blocked { shard_id: ShardId, reason: String },
 }
 
 impl RoutingDecision {
@@ -240,7 +231,8 @@ impl MigrationRouter {
 
     /// Set the default strategy.
     pub fn set_default_strategy(&self, strategy: MigrationRoutingStrategy) {
-        self.default_strategy.store(strategy as u8, Ordering::Relaxed);
+        self.default_strategy
+            .store(strategy as u8, Ordering::Relaxed);
     }
 
     /// Determine routing for a write operation during migration.
@@ -290,10 +282,7 @@ impl MigrationRouter {
     }
 
     /// Check if a write should be allowed based on the current strategy.
-    pub fn should_allow_write(
-        &self,
-        strategy: Option<MigrationRoutingStrategy>,
-    ) -> bool {
+    pub fn should_allow_write(&self, strategy: Option<MigrationRoutingStrategy>) -> bool {
         let strategy = strategy.unwrap_or_else(|| self.default_strategy());
         strategy.allows_writes()
     }
@@ -470,7 +459,10 @@ impl DualWriteTracker {
     }
 
     /// Create with custom settings.
-    pub fn with_limits(max_failures_per_shard: usize, max_failure_age: std::time::Duration) -> Self {
+    pub fn with_limits(
+        max_failures_per_shard: usize,
+        max_failure_age: std::time::Duration,
+    ) -> Self {
         Self {
             failures: Mutex::new(HashMap::new()),
             max_failures_per_shard,
@@ -489,7 +481,7 @@ impl DualWriteTracker {
         error: impl Into<String>,
     ) -> bool {
         let mut failures = self.failures.lock();
-        let shard_failures = failures.entry(shard_id).or_insert_with(Vec::new);
+        let shard_failures = failures.entry(shard_id).or_default();
 
         // Check limit
         if shard_failures.len() >= self.max_failures_per_shard {
@@ -779,17 +771,13 @@ mod tests {
         assert!(success.is_success());
         assert!(success.both_succeeded());
 
-        let primary_only = DualWriteResult::new(
-            Ok(()),
-            Err(Error::Internal("secondary failed".to_string())),
-        );
+        let primary_only =
+            DualWriteResult::new(Ok(()), Err(Error::Internal("secondary failed".to_string())));
         assert!(primary_only.is_success());
         assert!(!primary_only.both_succeeded());
 
-        let failure = DualWriteResult::new(
-            Err(Error::Internal("primary failed".to_string())),
-            Ok(()),
-        );
+        let failure =
+            DualWriteResult::new(Err(Error::Internal("primary failed".to_string())), Ok(()));
         assert!(!failure.is_success());
     }
 
@@ -799,7 +787,10 @@ mod tests {
             .with_write_timeout_ms(10000)
             .with_logging();
 
-        assert_eq!(config.default_strategy, MigrationRoutingStrategy::DualWrites);
+        assert_eq!(
+            config.default_strategy,
+            MigrationRoutingStrategy::DualWrites
+        );
         assert_eq!(config.write_timeout_ms, 10000);
         assert!(config.log_routing_decisions);
     }

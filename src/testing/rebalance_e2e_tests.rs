@@ -113,7 +113,11 @@ mod tests {
 
         /// Create configuration for a node.
         /// Uses fast test settings for quicker test execution.
-        fn create_node_config(node_id: u64, port_configs: &[(u64, u16)], existing_count: usize) -> CacheConfig {
+        fn create_node_config(
+            node_id: u64,
+            port_configs: &[(u64, u16)],
+            existing_count: usize,
+        ) -> CacheConfig {
             let my_port = port_configs
                 .iter()
                 .find(|(id, _)| *id == node_id)
@@ -142,9 +146,9 @@ mod tests {
             let base_election_tick = 5;
 
             let raft_config = RaftConfig {
-                tick_interval_ms: 20,  // 5x faster than default
+                tick_interval_ms: 20, // 5x faster than default
                 election_tick: base_election_tick + (node_id as usize * 2), // Staggered: 7, 9, 11...
-                heartbeat_tick: 1,     // Fast heartbeats
+                heartbeat_tick: 1,                                          // Fast heartbeats
                 max_size_per_msg: 1024 * 1024,
                 max_inflight_msgs: 256,
                 pre_vote: true,
@@ -168,7 +172,8 @@ mod tests {
             };
 
             // Create MemberlistDiscovery
-            let discovery = MemberlistDiscovery::new(node_id, raft_addr, &memberlist_config, &seed_nodes);
+            let discovery =
+                MemberlistDiscovery::new(node_id, raft_addr, &memberlist_config, &seed_nodes);
 
             CacheConfig::new(node_id, raft_addr)
                 .with_seed_nodes(seed_nodes)
@@ -206,7 +211,10 @@ mod tests {
         }
 
         /// Wait for a leader to be elected.
-        async fn wait_for_leader(nodes: &[DistributedCache], timeout: Duration) -> Result<u64, String> {
+        async fn wait_for_leader(
+            nodes: &[DistributedCache],
+            timeout: Duration,
+        ) -> Result<u64, String> {
             let start = Instant::now();
             while start.elapsed() < timeout {
                 if let Some(leader) = nodes.iter().find(|n| n.is_leader()) {
@@ -293,7 +301,10 @@ mod tests {
 
         // ACTION: Add Node 4
         info!("Step 2: Adding Node 4...");
-        let new_node_id = cluster.add_node().await.expect("Should add node successfully");
+        let new_node_id = cluster
+            .add_node()
+            .await
+            .expect("Should add node successfully");
         assert_eq!(new_node_id, 4);
         assert_eq!(cluster.node_count(), 4);
 
@@ -567,10 +578,7 @@ mod tests {
         // Try to plan new migration (should fail)
         let result =
             coordinator.plan_migration(RaftMembershipChange::new(1, RaftChangeType::AddLearner, 6));
-        assert!(
-            result.is_err(),
-            "Should reject new migrations while paused"
-        );
+        assert!(result.is_err(), "Should reject new migrations while paused");
 
         // Resume
         coordinator.resume();

@@ -3,6 +3,7 @@ use crate::network::rpc::{encode_message_into, Message, RaftMessageWrapper};
 use crate::types::NodeId;
 use crate::Error;
 use bytes::BytesMut;
+use futures::future::BoxFuture;
 use parking_lot::RwLock;
 use raft::prelude::Message as RaftMessage;
 use socket2::{SockRef, TcpKeepalive};
@@ -16,6 +17,69 @@ use tokio::net::TcpStream;
 use tokio::sync::{mpsc, oneshot, OwnedSemaphorePermit, Semaphore};
 use tracing::{debug, error, info, trace, warn};
 
+/// Trait for sending Raft messages.
+///
+/// This trait allows injection of custom message routing logic, enabling
+/// shard-aware transport for Multi-Raft setups while maintaining backward
+/// compatibility with the existing single-Raft implementation.
+///
+/// # Usage
+///
+/// The default `RaftTransport` implements this trait directly. For Multi-Raft,
+/// a `ShardRaftTransport` adapter wraps messages with shard IDs before sending.
+///
+/// ```text
+/// Single Raft:  RaftNode → RaftTransport (impl RaftMessageSender) → Network
+/// Multi-Raft:   ShardRaftNode → ShardRaftTransport (impl RaftMessageSender)
+///                            → ShardTransportMultiplexer → Network
+/// ```
+pub trait RaftMessageSender: Send + Sync + 'static {
+    /// Send multiple Raft messages.
+    ///
+    /// This is the primary method for sending Raft protocol messages (heartbeats,
+    /// vote requests, log appends, etc.). Messages are queued and sent asynchronously.
+    fn send_messages(&self, msgs: Vec<RaftMessage>);
+
+    /// Send a single arbitrary message to a peer.
+    ///
+    /// Unlike `send_messages()` which takes Raft protocol messages, this method
+    /// sends our custom Message enum directly. Used for forwarded commands,
+    /// forwarded responses, and other application-level messages.
+    fn send_message(&self, to: NodeId, msg: Message) -> BoxFuture<'_, Result<()>>;
+
+    /// Add a peer to the sender's peer list.
+    ///
+    /// The transport will establish connections to this peer as needed.
+    fn add_peer(&self, id: NodeId, addr: SocketAddr) -> BoxFuture<'_, ()>;
+
+    /// Remove a peer from the sender's peer list.
+    ///
+    /// Any pending messages to this peer may be dropped.
+    fn remove_peer(&self, id: NodeId);
+
+    /// Get a peer's address.
+    ///
+    /// Returns `Some(addr)` if the peer is registered, `None` otherwise.
+    /// Useful for debugging and testing.
+    fn get_peer(&self, id: NodeId) -> Option<SocketAddr>;
+
+    /// Get all registered peer IDs.
+    ///
+    /// Returns a list of all peer node IDs that have been added to this sender.
+    /// Useful for debugging and testing.
+    fn peer_ids(&self) -> Vec<NodeId>;
+
+    /// Get transport metrics snapshot.
+    ///
+    /// Returns current statistics about messages sent, failed, connections, etc.
+    fn metrics(&self) -> TransportMetricsSnapshot;
+
+    /// Shutdown the sender.
+    ///
+    /// Gracefully closes all connections and stops background tasks.
+    fn shutdown(&self) -> BoxFuture<'_, ()>;
+}
+
 /// 消息优先级
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MessagePriority {
@@ -27,11 +91,21 @@ pub enum MessagePriority {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BackpressureEvent {
     /// 队列已满，消息被丢弃
-    QueueFull { peer_id: NodeId, priority: MessagePriority },
+    QueueFull {
+        peer_id: NodeId,
+        priority: MessagePriority,
+    },
     /// 队列接近满（达到 80% 容量）
-    QueueHighWatermark { peer_id: NodeId, priority: MessagePriority, current_size: usize },
+    QueueHighWatermark {
+        peer_id: NodeId,
+        priority: MessagePriority,
+        current_size: usize,
+    },
     /// 队列恢复正常（低于 50% 容量）
-    QueueNormal { peer_id: NodeId, priority: MessagePriority },
+    QueueNormal {
+        peer_id: NodeId,
+        priority: MessagePriority,
+    },
 }
 
 /// 背压回调函数类型
@@ -40,8 +114,10 @@ pub type BackpressureCallback = Arc<dyn Fn(BackpressureEvent) + Send + Sync>;
 /// 待发送的消息
 #[derive(Debug)]
 struct PendingMessage {
+    #[allow(dead_code)]
     to: NodeId,
     msg: Message,
+    #[allow(dead_code)]
     enqueued_at: Instant,
 }
 
@@ -218,11 +294,14 @@ impl TransportMetrics {
             connection_retries: self.connection_retries.load(Ordering::Relaxed),
             messages_dropped_queue_full: self.messages_dropped_queue_full.load(Ordering::Relaxed),
             pending_retries: self.pending_retries.load(Ordering::Relaxed),
-            background_reconnect_attempts: self.background_reconnect_attempts.load(Ordering::Relaxed),
+            background_reconnect_attempts: self
+                .background_reconnect_attempts
+                .load(Ordering::Relaxed),
         }
     }
 
-    fn record_send_latency(&self, latency: Duration) {
+    /// Record send latency for metrics tracking.
+    pub fn record_send_latency(&self, latency: Duration) {
         self.total_send_latency_us
             .fetch_add(latency.as_micros() as u64, Ordering::Relaxed);
         self.send_count_for_latency.fetch_add(1, Ordering::Relaxed);
@@ -253,6 +332,7 @@ pub struct TransportMetricsSnapshot {
 /// Per-Peer Worker 状态
 struct PeerWorker {
     peer_id: NodeId,
+    #[allow(dead_code)]
     addr: SocketAddr,
     high_priority_tx: mpsc::Sender<PendingMessage>,
     normal_priority_tx: mpsc::Sender<PendingMessage>,
@@ -266,6 +346,7 @@ pub struct RaftTransport {
     peers: Arc<RwLock<HashMap<NodeId, SocketAddr>>>,
     workers: Arc<RwLock<HashMap<NodeId, PeerWorker>>>,
     command_tx: mpsc::UnboundedSender<TransportCommand>,
+    #[allow(dead_code)]
     dispatcher_handle: Arc<tokio::task::JoinHandle<()>>,
     config: TransportConfig,
     metrics: Arc<TransportMetrics>,
@@ -301,7 +382,7 @@ impl RaftTransport {
                 Self::dispatcher_loop(
                     node_id, workers, peers, command_rx, config, metrics, semaphore,
                 )
-                    .await;
+                .await;
             })
         };
 
@@ -456,7 +537,7 @@ impl RaftTransport {
             if peer_known {
                 // Peer 已知但 worker 尚未就绪，将消息放入待发送队列
                 let mut pending_map = self.pending_messages.write();
-                let queue = pending_map.entry(to).or_insert_with(VecDeque::new);
+                let queue = pending_map.entry(to).or_default();
 
                 // 限制待发送队列大小，防止内存膨胀
                 if queue.len() < self.config.max_pending_retries {
@@ -469,8 +550,13 @@ impl RaftTransport {
                     );
                 } else {
                     // 队列满，丢弃消息
-                    self.metrics.messages_dropped_queue_full.fetch_add(1, Ordering::Relaxed);
-                    debug!(node_id = self.node_id, to, "Pending queue full, message dropped");
+                    self.metrics
+                        .messages_dropped_queue_full
+                        .fetch_add(1, Ordering::Relaxed);
+                    debug!(
+                        node_id = self.node_id,
+                        to, "Pending queue full, message dropped"
+                    );
                     return Err(Error::from(NetworkError::SendFailed(
                         "pending queue full".to_string(),
                     )));
@@ -516,9 +602,7 @@ impl RaftTransport {
         // Try to send via worker (use high priority for forwarded commands)
         let worker = {
             let workers = self.workers.read();
-            workers
-                .get(&to)
-                .map(|w| w.high_priority_tx.clone())
+            workers.get(&to).map(|w| w.high_priority_tx.clone())
         };
 
         if let Some(tx) = worker {
@@ -527,11 +611,9 @@ impl RaftTransport {
                     trace!(from = self.node_id, to, "Custom message queued");
                     Ok(())
                 }
-                Err(_) => {
-                    Err(Error::from(NetworkError::SendFailed(
-                        "peer queue full".to_string(),
-                    )))
-                }
+                Err(_) => Err(Error::from(NetworkError::SendFailed(
+                    "peer queue full".to_string(),
+                ))),
             }
         } else {
             // Check if peer is known but worker not ready
@@ -599,9 +681,10 @@ impl RaftTransport {
 
                 tokio::spawn(async move {
                     Self::peer_worker_loop(
-                        peer_id, addr, hp_rx, np_rx, control_rx, config, metrics, semaphore, prewarm,
+                        peer_id, addr, hp_rx, np_rx, control_rx, config, metrics, semaphore,
+                        prewarm,
                     )
-                        .await;
+                    .await;
                 })
             };
 
@@ -623,7 +706,10 @@ impl RaftTransport {
         // Worker 创建后，立即将待发送队列中的消息转发给 worker
         let pending_msgs: Vec<PendingMessage> = {
             let mut pending_map = self.pending_messages.write();
-            pending_map.remove(&peer_id).map(|q| q.into_iter().collect()).unwrap_or_default()
+            pending_map
+                .remove(&peer_id)
+                .map(|q| q.into_iter().collect())
+                .unwrap_or_default()
         };
 
         if !pending_msgs.is_empty() {
@@ -631,10 +717,16 @@ impl RaftTransport {
             for msg in pending_msgs {
                 // 将待发送消息发送到高优先级队列（因为这些是早期关键消息）
                 if hp_tx_clone.try_send(msg).is_err() {
-                    debug!(node_id = self.node_id, peer_id, "Failed to forward pending message to worker");
+                    debug!(
+                        node_id = self.node_id,
+                        peer_id, "Failed to forward pending message to worker"
+                    );
                 }
             }
-            debug!(node_id = self.node_id, peer_id, count, "Forwarded pending messages to worker");
+            debug!(
+                node_id = self.node_id,
+                peer_id, count, "Forwarded pending messages to worker"
+            );
         }
     }
 
@@ -660,8 +752,8 @@ impl RaftTransport {
                             // 1. 发送停止信号
                             if worker.control_tx.send(WorkerCommand::Stop(tx)).is_ok() {
                                 // 2. 给一段较短的优雅时间（例如 200ms，测试环境下可以更短）
-                                if let Err(_) =
-                                    tokio::time::timeout(Duration::from_millis(200), rx).await
+                                if (tokio::time::timeout(Duration::from_millis(200), rx).await)
+                                    .is_err()
                                 {
                                     debug!(peer_id, "Worker graceful stop timeout, forcing abort");
                                 }
@@ -688,7 +780,7 @@ impl RaftTransport {
                                 peer_id, new_addr, hp_rx, np_rx, control_rx, config, metrics,
                                 semaphore, prewarm,
                             )
-                                .await;
+                            .await;
                         })
                     };
 
@@ -736,7 +828,7 @@ impl RaftTransport {
 
                         drain_futures.push(async move {
                             // Give each worker time to flush (configurable, default 1s, 50ms for tests)
-                            if let Err(_) = tokio::time::timeout(shutdown_timeout, rx).await {
+                            if (tokio::time::timeout(shutdown_timeout, rx).await).is_err() {
                                 debug!(peer_id = worker.peer_id, "Worker stop timeout, aborting");
                             }
                             // 关键点 2：显式调用 abort 确保 handle 结束
@@ -748,8 +840,9 @@ impl RaftTransport {
                     // 关键点 3：总控超时，确保 Dispatcher 一定能退出
                     let _ = tokio::time::timeout(
                         Duration::from_secs(3),
-                        futures::future::join_all(drain_futures)
-                    ).await;
+                        futures::future::join_all(drain_futures),
+                    )
+                    .await;
 
                     let _ = ack.send(());
                     break;
@@ -765,6 +858,7 @@ impl RaftTransport {
     /// 1. 增加后台重连机制：即使没有新消息，也会定期尝试重新建立连接
     /// 2. 连接失败后强制标记需要重连，避免 Pre-Vote 死循环
     /// 3. 确保连接失败时完全清除旧连接，下次发送时触发重连
+    #[allow(clippy::too_many_arguments)]
     async fn peer_worker_loop(
         peer_id: NodeId,
         addr: SocketAddr,
@@ -791,12 +885,17 @@ impl RaftTransport {
         // 连接预热：在 worker 启动时立即尝试建立连接（使用带重试的版本）
         if prewarm {
             debug!(peer_id, "Pre-warming connection");
-            connection = Self::establish_connection_with_retry(peer_id, addr, &config, &metrics, &semaphore).await;
+            connection =
+                Self::establish_connection_with_retry(peer_id, addr, &config, &metrics, &semaphore)
+                    .await;
             if connection.is_some() {
                 debug!(peer_id, "Connection pre-warmed successfully");
                 last_connection_failure = None; // 连接成功，清除失败标记
             } else {
-                debug!(peer_id, "Connection pre-warm failed, will retry on first message");
+                debug!(
+                    peer_id,
+                    "Connection pre-warm failed, will retry on first message"
+                );
                 last_connection_failure = Some(Instant::now()); // 标记连接失败
             }
         }
@@ -842,7 +941,8 @@ impl RaftTransport {
             // 如果连接断开且在强制重连窗口内，定期尝试重连
             let background_reconnect_fut = if connection.is_none()
                 && last_connection_failure.is_some()
-                && last_connection_failure.unwrap().elapsed() < config.force_reconnect_window {
+                && last_connection_failure.unwrap().elapsed() < config.force_reconnect_window
+            {
                 if let Some(interval) = config.background_reconnect_interval {
                     tokio::time::sleep(interval)
                 } else {
@@ -1102,9 +1202,16 @@ impl RaftTransport {
         // 清理待重试队列的指标
         let remaining = pending_retry.len();
         if remaining > 0 {
-            metrics.pending_retries.fetch_sub(remaining, Ordering::Relaxed);
-            metrics.messages_failed.fetch_add(remaining as u64, Ordering::Relaxed);
-            debug!(peer_id, remaining, "Discarding pending retry messages on worker exit");
+            metrics
+                .pending_retries
+                .fetch_sub(remaining, Ordering::Relaxed);
+            metrics
+                .messages_failed
+                .fetch_add(remaining as u64, Ordering::Relaxed);
+            debug!(
+                peer_id,
+                remaining, "Discarding pending retry messages on worker exit"
+            );
         }
 
         debug!(peer_id, "Worker exited");
@@ -1113,6 +1220,7 @@ impl RaftTransport {
     /// 批量处理消息（零拷贝优化）
     ///
     /// **关键改进：增加连接失败追踪**
+    #[allow(clippy::too_many_arguments)]
     async fn process_batch(
         peer_id: NodeId,
         addr: SocketAddr,
@@ -1128,11 +1236,17 @@ impl RaftTransport {
             return;
         }
 
-        trace!(peer_id, batch_size = batch.len(), "Processing message batch");
+        trace!(
+            peer_id,
+            batch_size = batch.len(),
+            "Processing message batch"
+        );
 
         // 确保有连接（使用带重试的版本）
         if connection.is_none() {
-            *connection = Self::establish_connection_with_retry(peer_id, addr, config, metrics, semaphore).await;
+            *connection =
+                Self::establish_connection_with_retry(peer_id, addr, config, metrics, semaphore)
+                    .await;
             if connection.is_none() {
                 *last_connection_failure = Some(Instant::now());
             } else {
@@ -1168,10 +1282,16 @@ impl RaftTransport {
                             metrics.active_connections.fetch_sub(1, Ordering::Relaxed);
                         }
                         *last_connection_failure = Some(Instant::now());
-                        metrics.messages_failed.fetch_add(batch.len() as u64, Ordering::Relaxed);
+                        metrics
+                            .messages_failed
+                            .fetch_add(batch.len() as u64, Ordering::Relaxed);
                     } else {
-                        metrics.messages_sent.fetch_add(batch.len() as u64, Ordering::Relaxed);
-                        metrics.normal_priority_sent.fetch_add(batch.len() as u64, Ordering::Relaxed);
+                        metrics
+                            .messages_sent
+                            .fetch_add(batch.len() as u64, Ordering::Relaxed);
+                        metrics
+                            .normal_priority_sent
+                            .fetch_add(batch.len() as u64, Ordering::Relaxed);
                         trace!(peer_id, count = batch.len(), "Batch sent successfully");
                         *last_connection_failure = None; // 发送成功，清除失败标记
                     }
@@ -1184,7 +1304,9 @@ impl RaftTransport {
                         metrics.active_connections.fetch_sub(1, Ordering::Relaxed);
                     }
                     *last_connection_failure = Some(Instant::now());
-                    metrics.messages_failed.fetch_add(batch.len() as u64, Ordering::Relaxed);
+                    metrics
+                        .messages_failed
+                        .fetch_add(batch.len() as u64, Ordering::Relaxed);
                 }
                 Err(_) => {
                     warn!(peer_id, "Batch write timeout");
@@ -1194,12 +1316,16 @@ impl RaftTransport {
                         metrics.active_connections.fetch_sub(1, Ordering::Relaxed);
                     }
                     *last_connection_failure = Some(Instant::now());
-                    metrics.messages_failed.fetch_add(batch.len() as u64, Ordering::Relaxed);
+                    metrics
+                        .messages_failed
+                        .fetch_add(batch.len() as u64, Ordering::Relaxed);
                 }
             }
         } else {
             *last_connection_failure = Some(Instant::now());
-            metrics.messages_failed.fetch_add(batch.len() as u64, Ordering::Relaxed);
+            metrics
+                .messages_failed
+                .fetch_add(batch.len() as u64, Ordering::Relaxed);
         }
 
         batch.clear();
@@ -1208,6 +1334,7 @@ impl RaftTransport {
     /// 处理单条消息（带指数退避 + Jitter）
     ///
     /// **关键改进：增加连接失败追踪参数**
+    #[allow(clippy::too_many_arguments)]
     async fn process_message(
         peer_id: NodeId,
         addr: SocketAddr,
@@ -1231,8 +1358,10 @@ impl RaftTransport {
 
             // 确保有连接（使用带重试的版本）
             if connection.is_none() {
-                *connection =
-                    Self::establish_connection_with_retry(peer_id, addr, config, metrics, semaphore).await;
+                *connection = Self::establish_connection_with_retry(
+                    peer_id, addr, config, metrics, semaphore,
+                )
+                .await;
                 if connection.is_none() {
                     *last_connection_failure = Some(Instant::now());
                 } else {
@@ -1243,7 +1372,9 @@ impl RaftTransport {
             if let Some(ref mut conn) = connection {
                 buffer.clear(); // 复用缓冲区
 
-                match Self::send_message_to_stream(&mut conn.stream, &pending.msg, buffer, config).await {
+                match Self::send_message_to_stream(&mut conn.stream, &pending.msg, buffer, config)
+                    .await
+                {
                     Ok(_) => {
                         success = true;
                         metrics.messages_sent.fetch_add(1, Ordering::Relaxed);
@@ -1298,6 +1429,7 @@ impl RaftTransport {
     }
 
     /// 建立连接（返回 TiedConnection，自动管理 Permit）
+    #[allow(dead_code)]
     async fn establish_connection(
         peer_id: NodeId,
         addr: SocketAddr,
@@ -1309,7 +1441,11 @@ impl RaftTransport {
         let permit = match semaphore.clone().try_acquire_owned() {
             Ok(p) => p,
             Err(_) => {
-                warn!(peer_id, "Connection limit reached");
+                warn!(
+                    peer_id,
+                    "Connection limit reached, cannot acquire semaphore permit"
+                );
+                metrics.connections_failed.fetch_add(1, Ordering::Relaxed);
                 return None;
             }
         };
@@ -1361,7 +1497,11 @@ impl RaftTransport {
             let permit = match semaphore.clone().try_acquire_owned() {
                 Ok(p) => p,
                 Err(_) => {
-                    warn!(peer_id, "Connection limit reached");
+                    warn!(
+                        peer_id,
+                        "Connection limit reached, cannot acquire semaphore permit"
+                    );
+                    metrics.connections_failed.fetch_add(1, Ordering::Relaxed);
                     return None;
                 }
             };
@@ -1398,7 +1538,8 @@ impl RaftTransport {
                         // 指数退避 + Jitter
                         if config.enable_retry_jitter {
                             let jitter = Duration::from_millis(rand::random::<u64>() % 20);
-                            retry_delay = (retry_delay * 2 + jitter).min(config.max_connect_retry_delay);
+                            retry_delay =
+                                (retry_delay * 2 + jitter).min(config.max_connect_retry_delay);
                         } else {
                             retry_delay = (retry_delay * 2).min(config.max_connect_retry_delay);
                         }
@@ -1502,5 +1643,44 @@ impl std::fmt::Debug for RaftTransport {
             .field("peer_count", &self.peer_count())
             .field("metrics", &self.metrics())
             .finish()
+    }
+}
+
+/// Implementation of RaftMessageSender for RaftTransport.
+///
+/// This allows RaftTransport to be used as the default message sender
+/// for single-Raft setups while enabling injection of shard-aware
+/// transport for Multi-Raft.
+impl RaftMessageSender for RaftTransport {
+    fn send_messages(&self, msgs: Vec<RaftMessage>) {
+        RaftTransport::send_messages(self, msgs)
+    }
+
+    fn send_message(&self, to: NodeId, msg: Message) -> BoxFuture<'_, Result<()>> {
+        Box::pin(async move { RaftTransport::send_message(self, to, msg).await })
+    }
+
+    fn add_peer(&self, id: NodeId, addr: SocketAddr) -> BoxFuture<'_, ()> {
+        Box::pin(async move { RaftTransport::add_peer(self, id, addr).await })
+    }
+
+    fn remove_peer(&self, id: NodeId) {
+        RaftTransport::remove_peer(self, id)
+    }
+
+    fn get_peer(&self, id: NodeId) -> Option<SocketAddr> {
+        RaftTransport::get_peer(self, id)
+    }
+
+    fn peer_ids(&self) -> Vec<NodeId> {
+        RaftTransport::peer_ids(self)
+    }
+
+    fn metrics(&self) -> TransportMetricsSnapshot {
+        RaftTransport::metrics(self)
+    }
+
+    fn shutdown(&self) -> BoxFuture<'_, ()> {
+        Box::pin(async move { RaftTransport::shutdown(self).await })
     }
 }

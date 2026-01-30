@@ -98,7 +98,11 @@ mod tests {
         for shard_id in 0..4 {
             let shard = coordinator.get_shard(shard_id);
             assert!(shard.is_some(), "Shard {} should exist", shard_id);
-            assert!(shard.unwrap().is_active(), "Shard {} should be active", shard_id);
+            assert!(
+                shard.unwrap().is_active(),
+                "Shard {} should be active",
+                shard_id
+            );
         }
 
         coordinator.shutdown().await.unwrap();
@@ -114,16 +118,25 @@ mod tests {
             .no_auto_init()
             .build();
 
-        coordinator.init().await.expect("Failed to initialize coordinator");
+        coordinator
+            .init()
+            .await
+            .expect("Failed to initialize coordinator");
 
         // No shards should exist yet
         assert_eq!(coordinator.stats().active_shards, 0);
 
         // Create shards manually
-        coordinator.create_shard(0).await.expect("Failed to create shard 0");
+        coordinator
+            .create_shard(0)
+            .await
+            .expect("Failed to create shard 0");
         assert_eq!(coordinator.stats().active_shards, 1);
 
-        coordinator.create_shard(1).await.expect("Failed to create shard 1");
+        coordinator
+            .create_shard(1)
+            .await
+            .expect("Failed to create shard 1");
         assert_eq!(coordinator.stats().active_shards, 2);
 
         // Try to create duplicate shard - should fail
@@ -147,9 +160,15 @@ mod tests {
         assert_eq!(coordinator.stats().active_shards, 4);
 
         // Remove a shard
-        coordinator.remove_shard(2).await.expect("Failed to remove shard");
+        coordinator
+            .remove_shard(2)
+            .await
+            .expect("Failed to remove shard");
         assert_eq!(coordinator.stats().active_shards, 3);
-        assert!(coordinator.get_shard(2).is_none(), "Shard 2 should be removed");
+        assert!(
+            coordinator.get_shard(2).is_none(),
+            "Shard 2 should be removed"
+        );
 
         // Try to remove non-existent shard - should fail
         let result = coordinator.remove_shard(2).await;
@@ -484,10 +503,16 @@ mod tests {
 
         // Verify shard's is_leader reflects when this node is leader
         let shard0 = coordinator.get_shard(0).unwrap();
-        assert!(shard0.is_leader(), "Shard 0 should have this node as leader");
+        assert!(
+            shard0.is_leader(),
+            "Shard 0 should have this node as leader"
+        );
 
         let shard1 = coordinator.get_shard(1).unwrap();
-        assert!(!shard1.is_leader(), "Shard 1 should not have this node as leader");
+        assert!(
+            !shard1.is_leader(),
+            "Shard 1 should not have this node as leader"
+        );
 
         coordinator.shutdown().await.unwrap();
     }
@@ -554,10 +579,16 @@ mod tests {
         assert_eq!(coordinator.state(), CoordinatorState::Running);
 
         // Add some data
-        coordinator.put("shutdown-key", "shutdown-value").await.unwrap();
+        coordinator
+            .put("shutdown-key", "shutdown-value")
+            .await
+            .unwrap();
 
         // Shutdown
-        coordinator.shutdown().await.expect("Shutdown should succeed");
+        coordinator
+            .shutdown()
+            .await
+            .expect("Shutdown should succeed");
 
         assert!(!coordinator.is_running());
         assert_eq!(coordinator.state(), CoordinatorState::Stopped);
@@ -645,7 +676,10 @@ mod tests {
         assert_eq!(result, Some(value));
 
         // Test delete via router
-        router.delete(&key).await.expect("Router delete should succeed");
+        router
+            .delete(&key)
+            .await
+            .expect("Router delete should succeed");
         let result = router.get(&key).await.expect("Router get should succeed");
         assert_eq!(result, None);
     }
@@ -950,13 +984,13 @@ mod tests {
         assert!(shard.owns_key(0));
         assert!(shard.owns_key(4));
         assert!(shard.owns_key(8));
-        assert!(shard.owns_key(100));  // 100 % 4 == 0
+        assert!(shard.owns_key(100)); // 100 % 4 == 0
 
         // Keys with hash % 4 != 0 don't belong to shard 0
         assert!(!shard.owns_key(1));
         assert!(!shard.owns_key(2));
         assert!(!shard.owns_key(3));
-        assert!(!shard.owns_key(101));  // 101 % 4 == 1
+        assert!(!shard.owns_key(101)); // 101 % 4 == 1
 
         // Verify key range
         let range = shard.key_range();
@@ -1026,7 +1060,10 @@ mod tests {
 
         // Should still work after cache clear
         let shard3 = router.shard_for_key(key);
-        assert_eq!(shard1, shard3, "Routing should be consistent after cache clear");
+        assert_eq!(
+            shard1, shard3,
+            "Routing should be consistent after cache clear"
+        );
     }
 
     // ========================================================================
@@ -1109,7 +1146,9 @@ mod tests {
         assert!(!shard.is_active());
 
         // Put some data
-        shard.put(Bytes::from("test-key"), Bytes::from("test-value")).await;
+        shard
+            .put(Bytes::from("test-key"), Bytes::from("test-value"))
+            .await;
 
         // Get should return None when shard is inactive
         let result = shard.get(b"test-key").await;
@@ -1120,7 +1159,9 @@ mod tests {
         assert!(shard.is_active());
 
         // Now put should work and be retrievable
-        shard.put(Bytes::from("test-key2"), Bytes::from("test-value2")).await;
+        shard
+            .put(Bytes::from("test-key2"), Bytes::from("test-value2"))
+            .await;
         let result = shard.get(b"test-key2").await;
         assert_eq!(result, Some(Bytes::from("test-value2")));
     }

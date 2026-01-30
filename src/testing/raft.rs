@@ -5,6 +5,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 /// Helper to create a logger for Raft
+#[allow(dead_code)]
 fn create_logger() -> slog::Logger {
     let decorator = slog_term::PlainSyncDecorator::new(std::io::stdout());
     let drain = slog_term::FullFormat::new(decorator).build().fuse();
@@ -12,12 +13,14 @@ fn create_logger() -> slog::Logger {
 }
 
 /// Wrapper around Raft node for testing
+#[allow(dead_code)]
 struct TestNode {
     raft: RawNode<MemStorage>,
     #[allow(dead_code)]
     id: u64,
 }
 
+#[allow(dead_code)]
 impl TestNode {
     fn new(id: u64, peers: Vec<u64>) -> Self {
         let logger = create_logger();
@@ -140,10 +143,12 @@ impl TestNode {
 }
 
 /// Test cluster for managing multiple Raft nodes
+#[allow(dead_code)]
 struct TestCluster {
     nodes: HashMap<u64, Arc<Mutex<TestNode>>>,
 }
 
+#[allow(dead_code)]
 impl TestCluster {
     fn new(node_ids: Vec<u64>) -> Self {
         let mut nodes = HashMap::new();

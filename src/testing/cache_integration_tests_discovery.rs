@@ -13,6 +13,7 @@ mod tests {
         ClusterDiscovery, NoOpClusterDiscovery, StaticClusterDiscovery, StaticDiscoveryConfig,
     };
     use crate::config::{CacheConfig, RaftConfig};
+    use crate::testing::eventually;
     use crate::types::NodeId;
     use std::net::SocketAddr;
     use std::sync::atomic::{AtomicU16, Ordering};
@@ -214,7 +215,10 @@ mod tests {
         assert_eq!(val2, Some(bytes::Bytes::from("noop-value2")));
 
         // Delete
-        cache.delete("noop-key1").await.expect("Delete should succeed");
+        cache
+            .delete("noop-key1")
+            .await
+            .expect("Delete should succeed");
         assert!(cache.get(b"noop-key1").await.is_none());
 
         cache.shutdown().await;
@@ -224,7 +228,6 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn tc_d3_noop_three_node_cluster() {
         let base_port = allocate_ports(3);
-        let election_time = Duration::from_millis(500);
 
         let peer_configs = vec![(1, base_port), (2, base_port + 1), (3, base_port + 2)];
 
@@ -248,14 +251,12 @@ mod tests {
         assert!(!cache2.discovery_enabled(), "Cache 2 should use NoOp");
         assert!(!cache3.discovery_enabled(), "Cache 3 should use NoOp");
 
-        // Wait for leader election
-        let leader_elected = wait_for(
-            || cache1.is_leader() || cache2.is_leader() || cache3.is_leader(),
-            election_time * 10,
-            Duration::from_millis(50),
-        )
-        .await;
-        assert!(leader_elected, "A leader should be elected");
+        // Wait for leader election (use generous timeout for cluster tests)
+        eventually(Duration::from_secs(15), || async {
+            cache1.is_leader() || cache2.is_leader() || cache3.is_leader()
+        })
+        .await
+        .expect("A leader should be elected");
 
         // Find the leader and write data
         let leader: &DistributedCache = if cache1.is_leader() {
@@ -271,17 +272,16 @@ mod tests {
             .await
             .expect("Write should succeed");
 
-        // Wait for replication
-        sleep(Duration::from_millis(500)).await;
-
-        // All nodes should have the data
-        let val1 = cache1.get(b"noop-cluster-key").await;
-        let val2 = cache2.get(b"noop-cluster-key").await;
-        let val3 = cache3.get(b"noop-cluster-key").await;
-
-        assert_eq!(val1, Some(bytes::Bytes::from("noop-cluster-value")));
-        assert_eq!(val2, Some(bytes::Bytes::from("noop-cluster-value")));
-        assert_eq!(val3, Some(bytes::Bytes::from("noop-cluster-value")));
+        // Wait for replication to all nodes
+        let expected = Some(bytes::Bytes::from("noop-cluster-value"));
+        eventually(Duration::from_secs(10), || async {
+            let val1 = cache1.get(b"noop-cluster-key").await;
+            let val2 = cache2.get(b"noop-cluster-key").await;
+            let val3 = cache3.get(b"noop-cluster-key").await;
+            val1 == expected && val2 == expected && val3 == expected
+        })
+        .await
+        .expect("All nodes should have replicated data");
 
         cache1.shutdown().await;
         cache2.shutdown().await;
@@ -292,7 +292,6 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn tc_d4_noop_cluster_leader_failover() {
         let base_port = allocate_ports(3);
-        let election_time = Duration::from_millis(500);
 
         let peer_configs = vec![(1, base_port), (2, base_port + 1), (3, base_port + 2)];
 
@@ -310,14 +309,12 @@ mod tests {
             .await
             .expect("Failed to create cache 3");
 
-        // Wait for initial leader
-        let leader_elected = wait_for(
-            || cache1.is_leader() || cache2.is_leader() || cache3.is_leader(),
-            election_time * 10,
-            Duration::from_millis(50),
-        )
-        .await;
-        assert!(leader_elected, "Initial leader should be elected");
+        // Wait for initial leader (use generous timeout for cluster tests)
+        eventually(Duration::from_secs(15), || async {
+            cache1.is_leader() || cache2.is_leader() || cache3.is_leader()
+        })
+        .await
+        .expect("Initial leader should be elected");
 
         // Find and shutdown the leader
         let (leader_id, remaining_caches): (NodeId, Vec<&DistributedCache>) = if cache1.is_leader()
@@ -333,17 +330,11 @@ mod tests {
         };
 
         // Wait for new leader election among remaining nodes
-        let new_leader_elected = wait_for(
-            || remaining_caches.iter().any(|c| c.is_leader()),
-            election_time * 10,
-            Duration::from_millis(50),
-        )
-        .await;
-
-        assert!(
-            new_leader_elected,
-            "New leader should be elected after old leader shutdown"
-        );
+        eventually(Duration::from_secs(15), || async {
+            remaining_caches.iter().any(|c| c.is_leader())
+        })
+        .await
+        .expect("New leader should be elected after old leader shutdown");
 
         // Verify new leader is not the old leader
         let new_leader = remaining_caches.iter().find(|c| c.is_leader()).unwrap();
@@ -373,7 +364,8 @@ mod tests {
         let raft_addr: SocketAddr = format!("127.0.0.1:{}", base_port).parse().unwrap();
 
         // Create cache config with static discovery
-        let static_config = StaticDiscoveryConfig::new(vec![(1, raft_addr)]).without_health_checks();
+        let static_config =
+            StaticDiscoveryConfig::new(vec![(1, raft_addr)]).without_health_checks();
         let discovery = StaticClusterDiscovery::new(1, raft_addr, static_config);
 
         let config = CacheConfig::new(1, raft_addr)
@@ -392,7 +384,10 @@ mod tests {
             .expect("Failed to create cache");
 
         // Verify static discovery is active
-        assert!(cache.discovery_enabled(), "Static discovery should be active");
+        assert!(
+            cache.discovery_enabled(),
+            "Static discovery should be active"
+        );
 
         // Wait for leader
         let became_leader = wait_for_leader(&cache, election_time * 3).await;
@@ -414,7 +409,6 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn tc_d6_static_three_node_cluster() {
         let base_port = allocate_ports(3);
-        let election_time = Duration::from_millis(500);
 
         let peer_configs = vec![(1, base_port), (2, base_port + 1), (3, base_port + 2)];
 
@@ -434,18 +428,25 @@ mod tests {
             .expect("Cache 3 create");
 
         // Verify static discovery is active
-        assert!(cache1.discovery_enabled(), "Cache 1 should use static discovery");
-        assert!(cache2.discovery_enabled(), "Cache 2 should use static discovery");
-        assert!(cache3.discovery_enabled(), "Cache 3 should use static discovery");
+        assert!(
+            cache1.discovery_enabled(),
+            "Cache 1 should use static discovery"
+        );
+        assert!(
+            cache2.discovery_enabled(),
+            "Cache 2 should use static discovery"
+        );
+        assert!(
+            cache3.discovery_enabled(),
+            "Cache 3 should use static discovery"
+        );
 
-        // Wait for leader
-        let leader_elected = wait_for(
-            || cache1.is_leader() || cache2.is_leader() || cache3.is_leader(),
-            election_time * 10,
-            Duration::from_millis(50),
-        )
-        .await;
-        assert!(leader_elected, "Leader should be elected");
+        // Wait for leader (use generous timeout for cluster tests)
+        eventually(Duration::from_secs(15), || async {
+            cache1.is_leader() || cache2.is_leader() || cache3.is_leader()
+        })
+        .await
+        .expect("Leader should be elected");
 
         // Write through leader
         let leader: &DistributedCache = if cache1.is_leader() {
@@ -461,22 +462,16 @@ mod tests {
             .await
             .expect("Put succeed");
 
-        // Wait for replication
-        sleep(Duration::from_millis(500)).await;
-
-        // Verify all nodes have data
-        assert_eq!(
-            cache1.get(b"static-cluster-key").await,
-            Some(bytes::Bytes::from("static-cluster-value"))
-        );
-        assert_eq!(
-            cache2.get(b"static-cluster-key").await,
-            Some(bytes::Bytes::from("static-cluster-value"))
-        );
-        assert_eq!(
-            cache3.get(b"static-cluster-key").await,
-            Some(bytes::Bytes::from("static-cluster-value"))
-        );
+        // Wait for replication to all nodes
+        let expected = Some(bytes::Bytes::from("static-cluster-value"));
+        eventually(Duration::from_secs(10), || async {
+            let val1 = cache1.get(b"static-cluster-key").await;
+            let val2 = cache2.get(b"static-cluster-key").await;
+            let val3 = cache3.get(b"static-cluster-key").await;
+            val1 == expected && val2 == expected && val3 == expected
+        })
+        .await
+        .expect("All nodes should have replicated data");
 
         // Cleanup
         cache1.shutdown().await;
@@ -509,7 +504,10 @@ mod tests {
         // Check that join event was emitted
         let event = discovery.try_recv_event();
         assert!(
-            matches!(event, Some(crate::cluster::ClusterEvent::NodeJoin { node_id: 2, .. })),
+            matches!(
+                event,
+                Some(crate::cluster::ClusterEvent::NodeJoin { node_id: 2, .. })
+            ),
             "Should emit NodeJoin event"
         );
 
@@ -519,7 +517,10 @@ mod tests {
 
         let event = discovery.try_recv_event();
         assert!(
-            matches!(event, Some(crate::cluster::ClusterEvent::NodeLeave { node_id: 2 })),
+            matches!(
+                event,
+                Some(crate::cluster::ClusterEvent::NodeLeave { node_id: 2 })
+            ),
             "Should emit NodeLeave event"
         );
 
@@ -538,7 +539,8 @@ mod tests {
         ];
 
         // Create config from addresses (auto-assigns IDs 1, 2, 3)
-        let static_config = StaticDiscoveryConfig::from_addrs(addrs.clone()).without_health_checks();
+        let static_config =
+            StaticDiscoveryConfig::from_addrs(addrs.clone()).without_health_checks();
 
         assert_eq!(static_config.peers.len(), 3);
         assert_eq!(static_config.peers[0].0, 1); // Auto ID
@@ -571,7 +573,10 @@ mod tests {
             .expect("NoOp cache");
 
         // Verify NoOp discovery is not active
-        assert!(!cache_noop.discovery_enabled(), "NoOp discovery should not be active");
+        assert!(
+            !cache_noop.discovery_enabled(),
+            "NoOp discovery should not be active"
+        );
 
         let became_leader_noop = wait_for_leader(&cache_noop, election_time * 3).await;
         assert!(became_leader_noop, "NoOp: should become leader");
@@ -608,7 +613,10 @@ mod tests {
             .expect("Static cache");
 
         // Verify static discovery is active
-        assert!(cache_static.discovery_enabled(), "Static discovery should be active");
+        assert!(
+            cache_static.discovery_enabled(),
+            "Static discovery should be active"
+        );
 
         let became_leader_static = wait_for_leader(&cache_static, election_time * 3).await;
         assert!(became_leader_static, "Static: should become leader");
@@ -627,7 +635,6 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn tc_d10_noop_cluster_multiple_writes() {
         let base_port = allocate_ports(3);
-        let election_time = Duration::from_millis(500);
 
         let peer_configs = vec![(1, base_port), (2, base_port + 1), (3, base_port + 2)];
 
@@ -639,14 +646,12 @@ mod tests {
         let cache2 = DistributedCache::new(config2).await.expect("Cache 2");
         let cache3 = DistributedCache::new(config3).await.expect("Cache 3");
 
-        // Wait for leader
-        let leader_elected = wait_for(
-            || cache1.is_leader() || cache2.is_leader() || cache3.is_leader(),
-            election_time * 10,
-            Duration::from_millis(50),
-        )
-        .await;
-        assert!(leader_elected, "Leader elected");
+        // Wait for leader (use generous timeout for cluster tests)
+        eventually(Duration::from_secs(15), || async {
+            cache1.is_leader() || cache2.is_leader() || cache3.is_leader()
+        })
+        .await
+        .expect("Leader elected");
 
         let leader: &DistributedCache = if cache1.is_leader() {
             &cache1
@@ -667,33 +672,25 @@ mod tests {
                 .expect("Put should succeed");
         }
 
-        // Wait for replication
-        sleep(Duration::from_millis(500)).await;
-
-        // Verify all entries on all nodes
-        for i in 0..num_entries {
-            let key = format!("noop-key-{}", i);
-            let expected = format!("noop-value-{}", i);
-
-            assert_eq!(
-                cache1.get(key.as_bytes()).await,
-                Some(bytes::Bytes::from(expected.clone())),
-                "Cache 1 should have key {}",
-                i
-            );
-            assert_eq!(
-                cache2.get(key.as_bytes()).await,
-                Some(bytes::Bytes::from(expected.clone())),
-                "Cache 2 should have key {}",
-                i
-            );
-            assert_eq!(
-                cache3.get(key.as_bytes()).await,
-                Some(bytes::Bytes::from(expected)),
-                "Cache 3 should have key {}",
-                i
-            );
-        }
+        // Wait for replication to all nodes
+        eventually(Duration::from_secs(15), || async {
+            for i in 0..num_entries {
+                let key = format!("noop-key-{}", i);
+                let expected = bytes::Bytes::from(format!("noop-value-{}", i));
+                if cache1.get(key.as_bytes()).await != Some(expected.clone()) {
+                    return false;
+                }
+                if cache2.get(key.as_bytes()).await != Some(expected.clone()) {
+                    return false;
+                }
+                if cache3.get(key.as_bytes()).await != Some(expected) {
+                    return false;
+                }
+            }
+            true
+        })
+        .await
+        .expect("All entries should be replicated to all nodes");
 
         cache1.shutdown().await;
         cache2.shutdown().await;

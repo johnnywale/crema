@@ -7,6 +7,7 @@ use tokio::time::sleep;
 
 /// Allocate OS-assigned ports by briefly binding to port 0.
 /// Returns a vector of (NodeId, port) pairs.
+#[allow(dead_code)]
 pub(crate) async fn allocate_os_ports(node_ids: &[NodeId]) -> Vec<(NodeId, u16)> {
     let mut results = Vec::with_capacity(node_ids.len());
     for &node_id in node_ids {
@@ -24,7 +25,9 @@ pub(crate) async fn allocate_os_ports(node_ids: &[NodeId]) -> Vec<(NodeId, u16)>
 /// On Windows, TCP and UDP ports are in separate namespaces, and certain
 /// port ranges may be excluded. This function allocates both ports from
 /// the OS to ensure they are available.
-pub(crate) async fn allocate_os_ports_with_memberlist(node_ids: &[NodeId]) -> Vec<(NodeId, u16, u16)> {
+pub(crate) async fn allocate_os_ports_with_memberlist(
+    node_ids: &[NodeId],
+) -> Vec<(NodeId, u16, u16)> {
     let mut results = Vec::with_capacity(node_ids.len());
     for &node_id in node_ids {
         // Allocate raft port (TCP)
@@ -41,6 +44,7 @@ pub(crate) async fn allocate_os_ports_with_memberlist(node_ids: &[NodeId]) -> Ve
     }
     results
 }
+#[allow(dead_code)]
 pub async fn wait_for_result<F, Fut, T, P>(
     mut action: F,
     predicate: P,
@@ -64,6 +68,7 @@ where
     None // 超时未达成条件
 }
 /// Create a cache config for a node in a multi-node cluster using pre-allocated ports.
+#[allow(dead_code)]
 pub(crate) fn cluster_node_config(node_id: NodeId, port_configs: &[(NodeId, u16)]) -> CacheConfig {
     let my_port = port_configs
         .iter()
@@ -103,6 +108,7 @@ pub(crate) fn cluster_node_config(node_id: NodeId, port_configs: &[(NodeId, u16)
 }
 
 /// Wait for a condition with timeout
+#[allow(dead_code)]
 pub(crate) async fn wait_for<F>(condition: F, timeout: Duration, check_interval: Duration) -> bool
 where
     F: Fn() -> bool,
@@ -118,6 +124,7 @@ where
 }
 
 /// Wait for exactly one leader in the cluster
+#[allow(dead_code)]
 pub(crate) async fn wait_for_single_leader(
     caches: &[&DistributedCache],
     timeout: Duration,
@@ -140,6 +147,7 @@ pub(crate) async fn wait_for_single_leader(
 }
 
 /// Helper function to verify all nodes agree on leader
+#[allow(dead_code)]
 pub(crate) fn verify_leader_agreement(caches: &[&DistributedCache]) -> Option<NodeId> {
     let leader_ids: HashSet<Option<NodeId>> = caches.iter().map(|c| c.leader_id()).collect();
 

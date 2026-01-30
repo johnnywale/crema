@@ -107,6 +107,10 @@ pub enum Error {
     /// Migration timed out.
     #[error("migration timed out")]
     MigrationTimeout,
+
+    /// Invalid key (empty or too long).
+    #[error("invalid key: {0}")]
+    InvalidKey(String),
 }
 
 /// Raft consensus related errors.
@@ -189,10 +193,7 @@ pub enum StorageError {
     /// This indicates that the entries slice itself contains a gap.
     /// The prev_index is followed by curr_index, but they should be consecutive.
     #[error("non-contiguous entries in append: index {prev_index} followed by {curr_index}")]
-    NonContiguous {
-        prev_index: u64,
-        curr_index: u64,
-    },
+    NonContiguous { prev_index: u64, curr_index: u64 },
 
     /// Log gap detected - entries are not contiguous with existing log.
     ///
@@ -200,10 +201,7 @@ pub enum StorageError {
     /// The last_index is the highest index currently in the log,
     /// and first_new is the index of the first entry being appended.
     #[error("log gap detected: last_index={last_index}, first_new={first_new}, expected contiguous append")]
-    LogGap {
-        last_index: u64,
-        first_new: u64,
-    },
+    LogGap { last_index: u64, first_new: u64 },
     /// Log compacted, entry no longer available.
     #[error("log compacted at index {0}")]
     Compacted(u64),
@@ -266,7 +264,7 @@ impl Error {
             // Top-level transient errors
             Error::Timeout => true,
             Error::ServerBusy { .. } => true,
-            Error::MigrationPaused => true, // May resume later
+            Error::MigrationPaused => true,   // May resume later
             Error::TooManyMigrations => true, // May have capacity later
 
             // Delegate to nested error types
@@ -287,13 +285,16 @@ impl Error {
             Error::ShardAlreadyExists(_) => false,
             Error::ShardNotActive(_) => false,
             Error::RemoteError(_) => false,
-            Error::ForwardFailed(_) => true, // Network issue, might succeed
+            // ForwardFailed may be temporary (network blip) or permanent (node down).
+            // We mark it retryable but callers should limit retry attempts.
+            Error::ForwardFailed(_) => true,
             Error::ForwardTtlExpired => false, // Configuration/routing issue
             Error::ShardAlreadyMigrating(_) => false, // Must wait for current migration
             Error::MigrationNotFound(_) => false,
             Error::InvalidMigrationPhase(_) => false,
             Error::MigrationFailed(_) => false, // Terminal failure
-            Error::MigrationTimeout => true, // Might succeed with retry
+            Error::MigrationTimeout => true,    // Might succeed with retry
+            Error::InvalidKey(_) => false,      // Validation error, won't change
         }
     }
 
@@ -322,7 +323,8 @@ impl Error {
             Error::MigrationPaused => Some(Duration::from_secs(1)),
             Error::TooManyMigrations => Some(Duration::from_millis(500)),
             Error::MigrationTimeout => Some(Duration::from_millis(200)),
-            Error::ForwardFailed(_) => Some(Duration::from_millis(50)),
+            // ForwardFailed gets a longer delay since target node may be recovering
+            Error::ForwardFailed(_) => Some(Duration::from_millis(200)),
             Error::ShardNotLocal { .. } => Some(Duration::from_millis(10)), // Fast retry with forwarding
             Error::ShardLeaderUnknown(_) => Some(Duration::from_millis(100)), // Wait for gossip
             Error::Raft(e) => e.retry_delay(),
@@ -471,8 +473,16 @@ mod tests {
         assert!(Error::MigrationTimeout.is_retryable());
 
         // New shard routing errors are retryable
-        assert!(Error::ShardNotLocal { shard_id: 1, target_node: Some(2) }.is_retryable());
-        assert!(Error::ShardNotLocal { shard_id: 1, target_node: None }.is_retryable());
+        assert!(Error::ShardNotLocal {
+            shard_id: 1,
+            target_node: Some(2)
+        }
+        .is_retryable());
+        assert!(Error::ShardNotLocal {
+            shard_id: 1,
+            target_node: None
+        }
+        .is_retryable());
         assert!(Error::ShardLeaderUnknown(1).is_retryable());
 
         assert!(!Error::Config("bad config".to_string()).is_retryable());

@@ -16,10 +16,12 @@ use tokio::sync::mpsc;
 use uuid::Uuid;
 
 use super::migration::{
-    MigrationPhase, SharedRateLimiter, ShardMigration, ShardMigrationCoordinator, TransferBatch,
+    MigrationPhase, ShardMigration, ShardMigrationCoordinator, SharedRateLimiter, TransferBatch,
 };
 use super::migration_metrics::MigrationMetrics;
-use super::migration_routing::{DualWriteTracker, MigrationRouter, MigrationRoutingStrategy, RoutingDecision};
+use super::migration_routing::{
+    DualWriteTracker, MigrationRouter, MigrationRoutingStrategy, RoutingDecision,
+};
 use super::shard::ShardId;
 use super::shard_placement::{ShardMovement, ShardPlacement};
 use super::shard_registry::{ShardLifecycleState, ShardRegistry};
@@ -215,6 +217,7 @@ pub struct MigrationOrchestrator {
     /// Data transporter for data transfer.
     data_transporter: RwLock<Option<Arc<dyn DataTransporter>>>,
     /// Whether orchestration is running.
+    #[allow(dead_code)]
     running: AtomicBool,
     /// Active orchestrations by shard.
     active_orchestrations: RwLock<HashMap<ShardId, OrchestrationState>>,
@@ -311,11 +314,7 @@ impl MigrationOrchestrator {
     pub fn set_coordinator_term(&self, term: u64) {
         let old_term = self.coordinator_term.swap(term, Ordering::SeqCst);
         if term != old_term {
-            tracing::info!(
-                old_term,
-                new_term = term,
-                "Coordinator term updated"
-            );
+            tracing::info!(old_term, new_term = term, "Coordinator term updated");
         }
     }
 
@@ -604,7 +603,8 @@ impl MigrationOrchestrator {
                     break;
                 }
 
-                self.metrics.record_transfer(batch_entries, batch_bytes, rate);
+                self.metrics
+                    .record_transfer(batch_entries, batch_bytes, rate);
 
                 tracing::debug!(
                     shard_id,
@@ -769,7 +769,9 @@ impl MigrationOrchestrator {
     /// Returns Ok(()) if all failures were reconciled successfully, or an error
     /// if reconciliation failed and the migration should be aborted.
     async fn reconcile_dual_write_failures(&self, shard_id: ShardId) -> Result<()> {
-        let failures = self.dual_write_tracker.get_failures_for_reconciliation(shard_id);
+        let failures = self
+            .dual_write_tracker
+            .get_failures_for_reconciliation(shard_id);
 
         if failures.is_empty() {
             tracing::debug!(shard_id, "No dual-write failures to reconcile");
@@ -816,10 +818,7 @@ impl MigrationOrchestrator {
             match transporter.apply_batch(shard_id, batch).await {
                 Ok(()) => {
                     reconciled_keys.push(failure.key);
-                    tracing::debug!(
-                        shard_id,
-                        "Reconciled dual-write failure"
-                    );
+                    tracing::debug!(shard_id, "Reconciled dual-write failure");
                 }
                 Err(e) => {
                     tracing::warn!(
@@ -835,7 +834,8 @@ impl MigrationOrchestrator {
 
         // Clear successfully reconciled entries
         if !reconciled_keys.is_empty() {
-            self.dual_write_tracker.clear_keys(shard_id, &reconciled_keys);
+            self.dual_write_tracker
+                .clear_keys(shard_id, &reconciled_keys);
             tracing::info!(
                 shard_id,
                 reconciled_count = reconciled_keys.len(),
@@ -864,7 +864,8 @@ impl MigrationOrchestrator {
         value: Vec<u8>,
         error: impl Into<String>,
     ) {
-        self.dual_write_tracker.record_failure(shard_id, key, value, error);
+        self.dual_write_tracker
+            .record_failure(shard_id, key, value, error);
     }
 
     /// Check if there are pending dual-write failures for a shard.
@@ -925,12 +926,8 @@ impl MigrationOrchestrator {
                 // CRITICAL: Validate coordinator term for zombie fencing
                 self.validate_coordinator_term(coordinator_term)?;
 
-                self.apply_abort_migration(
-                    Uuid::from_bytes(migration_id),
-                    shard_id,
-                    reason,
-                )
-                .await
+                self.apply_abort_migration(Uuid::from_bytes(migration_id), shard_id, reason)
+                    .await
             }
             MigrationCommand::UpdatePlacement {
                 shard_id,
@@ -1021,15 +1018,13 @@ impl MigrationOrchestrator {
         replicas: Vec<NodeId>,
         epoch: u64,
     ) -> Result<()> {
-        tracing::info!(
-            shard_id,
-            ?replicas,
-            epoch,
-            "Applying placement update"
-        );
+        tracing::info!(shard_id, ?replicas, epoch, "Applying placement update");
 
         // Update registry with new replica set - set_replicas_if_newer handles epoch checking
-        if !self.registry.set_replicas_if_newer(shard_id, replicas, epoch) {
+        if !self
+            .registry
+            .set_replicas_if_newer(shard_id, replicas, epoch)
+        {
             if let Some(metadata) = self.registry.get(shard_id) {
                 tracing::warn!(
                     shard_id,
@@ -1181,7 +1176,8 @@ impl MigrationOrchestrator {
     /// Apply ownership transfer locally after Raft commit.
     fn apply_ownership_transfer(&self, shard_id: ShardId, new_owner: NodeId, epoch: u64) {
         // Update registry
-        self.registry.set_primary_if_newer(shard_id, new_owner, epoch);
+        self.registry
+            .set_primary_if_newer(shard_id, new_owner, epoch);
 
         // Update placement if needed (commit the pending ring)
         if self.placement.has_pending() {
@@ -1346,7 +1342,11 @@ impl MigrationOrchestrator {
 
     /// Get the current state of all active orchestrations.
     pub fn active_orchestrations(&self) -> Vec<OrchestrationState> {
-        self.active_orchestrations.read().values().cloned().collect()
+        self.active_orchestrations
+            .read()
+            .values()
+            .cloned()
+            .collect()
     }
 
     /// Check if a shard is being orchestrated.
@@ -1413,10 +1413,7 @@ mod tests {
             state_store,
         ));
         let registry = Arc::new(ShardRegistry::new(num_shards));
-        let placement = Arc::new(ShardPlacement::new(
-            num_shards,
-            PlacementConfig::new(3),
-        ));
+        let placement = Arc::new(ShardPlacement::new(num_shards, PlacementConfig::new(3)));
 
         MigrationOrchestrator::new(node_id, coordinator, registry, placement)
     }
@@ -1565,7 +1562,8 @@ mod tests {
         // Set up registry
         for shard_id in 0..4 {
             orch.registry.set_replicas(shard_id, vec![1, 2, 3, 4]);
-            orch.registry.set_primary(shard_id, Some((shard_id % 4 + 1) as NodeId));
+            orch.registry
+                .set_primary(shard_id, Some((shard_id % 4 + 1) as NodeId));
         }
 
         // Handle node 4 leaving

@@ -83,7 +83,13 @@ impl NodeMetadata {
 
     /// Serialize metadata to bytes.
     pub fn to_bytes(&self) -> Vec<u8> {
-        bincode::serialize(self).unwrap_or_default()
+        match bincode::serialize(self) {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                tracing::error!(error = %e, "Failed to serialize NodeMetadata, returning empty");
+                Vec::new()
+            }
+        }
     }
 
     /// Deserialize metadata from bytes.
@@ -132,7 +138,8 @@ impl ShardLeaderMetadata for NodeMetadata {
             .map(|(shard_id, info)| format!("{}:{}:{}", shard_id, info.leader_id, info.epoch))
             .collect::<Vec<_>>()
             .join(",");
-        self.tags.insert("multiraft.shard_leaders".to_string(), encoded);
+        self.tags
+            .insert("multiraft.shard_leaders".to_string(), encoded);
     }
 
     fn get_shard_leaders(&self) -> HashMap<u32, ShardLeaderInfo> {
@@ -204,18 +211,15 @@ pub enum ClusterEvent {
 #[derive(Debug, Clone)]
 struct TrackedNode {
     metadata: NodeMetadata,
-    first_seen: Instant,
     last_seen: Instant,
     is_healthy: bool,
 }
 
 impl TrackedNode {
     fn new(metadata: NodeMetadata) -> Self {
-        let now = Instant::now();
         Self {
             metadata,
-            first_seen: now,
-            last_seen: now,
+            last_seen: Instant::now(),
             is_healthy: true,
         }
     }
@@ -274,7 +278,10 @@ impl NodeRegistry {
 
     /// Get the Raft address for a node.
     pub fn get_addr(&self, node_id: NodeId) -> Option<SocketAddr> {
-        self.nodes.read().get(&node_id).map(|n| n.metadata.raft_addr)
+        self.nodes
+            .read()
+            .get(&node_id)
+            .map(|n| n.metadata.raft_addr)
     }
 
     /// Get full metadata for a node.
@@ -395,7 +402,10 @@ pub trait ClusterDiscovery: Send + Sync {
     fn get_node_addr(&self, node_id: NodeId) -> Option<SocketAddr>;
 
     /// Update local node metadata (triggers broadcast to cluster).
-    async fn update_local_metadata(&self, metadata: NodeMetadata) -> Result<(), ClusterDiscoveryError>;
+    async fn update_local_metadata(
+        &self,
+        metadata: NodeMetadata,
+    ) -> Result<(), ClusterDiscoveryError>;
 
     /// Check if discovery is actually doing something (vs NoOp).
     fn is_active(&self) -> bool {
@@ -504,7 +514,10 @@ impl ClusterDiscovery for NoOpClusterDiscovery {
         self.registry.get_addr(node_id)
     }
 
-    async fn update_local_metadata(&self, metadata: NodeMetadata) -> Result<(), ClusterDiscoveryError> {
+    async fn update_local_metadata(
+        &self,
+        metadata: NodeMetadata,
+    ) -> Result<(), ClusterDiscoveryError> {
         self.registry.register(metadata);
         Ok(())
     }
@@ -842,7 +855,10 @@ impl ClusterDiscovery for StaticClusterDiscovery {
     }
 
     async fn shutdown(&mut self) -> Result<(), ClusterDiscoveryError> {
-        tracing::info!(node_id = self.node_id, "Shutting down static cluster discovery");
+        tracing::info!(
+            node_id = self.node_id,
+            "Shutting down static cluster discovery"
+        );
 
         // Stop health check task
         if let Some(tx) = self.health_check_shutdown.take() {
@@ -921,8 +937,8 @@ mod tests {
 
     #[test]
     fn test_node_metadata_serialization() {
-        let metadata = NodeMetadata::new(1, "127.0.0.1:9000".parse().unwrap())
-            .with_tag("role", "leader");
+        let metadata =
+            NodeMetadata::new(1, "127.0.0.1:9000".parse().unwrap()).with_tag("role", "leader");
 
         let bytes = metadata.to_bytes();
         let decoded = NodeMetadata::from_bytes(&bytes).unwrap();
@@ -991,13 +1007,19 @@ mod tests {
 
         // Check event
         let event = discovery.try_recv_event();
-        assert!(matches!(event, Some(ClusterEvent::NodeJoin { node_id: 2, .. })));
+        assert!(matches!(
+            event,
+            Some(ClusterEvent::NodeJoin { node_id: 2, .. })
+        ));
         assert_eq!(discovery.members().len(), 2);
 
         // Simulate node 2 leaving
         discovery.simulate_leave(2);
         let event = discovery.try_recv_event();
-        assert!(matches!(event, Some(ClusterEvent::NodeLeave { node_id: 2 })));
+        assert!(matches!(
+            event,
+            Some(ClusterEvent::NodeLeave { node_id: 2 })
+        ));
         assert_eq!(discovery.members().len(), 1);
     }
 
@@ -1008,25 +1030,35 @@ mod tests {
         let config = StaticDiscoveryConfig::default();
         assert!(config.peers.is_empty());
         assert!(config.health_check_enabled);
-        assert_eq!(config.health_check_interval, std::time::Duration::from_secs(5));
-        assert_eq!(config.health_check_timeout, std::time::Duration::from_secs(2));
+        assert_eq!(
+            config.health_check_interval,
+            std::time::Duration::from_secs(5)
+        );
+        assert_eq!(
+            config.health_check_timeout,
+            std::time::Duration::from_secs(2)
+        );
     }
 
     #[test]
     fn test_static_discovery_config_builder() {
-        let config = StaticDiscoveryConfig::new(vec![
-            (1, "127.0.0.1:9000".parse().unwrap()),
-        ])
-        .with_peer(2, "127.0.0.1:9001".parse().unwrap())
-        .with_peer(3, "127.0.0.1:9002".parse().unwrap())
-        .with_health_check_interval(std::time::Duration::from_secs(10))
-        .with_health_check_timeout(std::time::Duration::from_secs(3))
-        .without_health_checks();
+        let config = StaticDiscoveryConfig::new(vec![(1, "127.0.0.1:9000".parse().unwrap())])
+            .with_peer(2, "127.0.0.1:9001".parse().unwrap())
+            .with_peer(3, "127.0.0.1:9002".parse().unwrap())
+            .with_health_check_interval(std::time::Duration::from_secs(10))
+            .with_health_check_timeout(std::time::Duration::from_secs(3))
+            .without_health_checks();
 
         assert_eq!(config.peers.len(), 3);
         assert!(!config.health_check_enabled);
-        assert_eq!(config.health_check_interval, std::time::Duration::from_secs(10));
-        assert_eq!(config.health_check_timeout, std::time::Duration::from_secs(3));
+        assert_eq!(
+            config.health_check_interval,
+            std::time::Duration::from_secs(10)
+        );
+        assert_eq!(
+            config.health_check_timeout,
+            std::time::Duration::from_secs(3)
+        );
     }
 
     #[test]
@@ -1104,10 +1136,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_static_discovery_add_peer() {
-        let config = StaticDiscoveryConfig::new(vec![
-            (1, "127.0.0.1:9000".parse().unwrap()),
-        ])
-        .without_health_checks();
+        let config = StaticDiscoveryConfig::new(vec![(1, "127.0.0.1:9000".parse().unwrap())])
+            .without_health_checks();
 
         let mut discovery =
             StaticClusterDiscovery::new(1, "127.0.0.1:9000".parse().unwrap(), config);
@@ -1126,7 +1156,10 @@ mod tests {
 
         // Check event was emitted
         let event = discovery.try_recv_event();
-        assert!(matches!(event, Some(ClusterEvent::NodeJoin { node_id: 2, .. })));
+        assert!(matches!(
+            event,
+            Some(ClusterEvent::NodeJoin { node_id: 2, .. })
+        ));
     }
 
     #[tokio::test]
@@ -1154,7 +1187,10 @@ mod tests {
 
         // Check event was emitted
         let event = discovery.try_recv_event();
-        assert!(matches!(event, Some(ClusterEvent::NodeLeave { node_id: 2 })));
+        assert!(matches!(
+            event,
+            Some(ClusterEvent::NodeLeave { node_id: 2 })
+        ));
     }
 
     #[tokio::test]
@@ -1185,10 +1221,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_static_discovery_update_metadata() {
-        let config = StaticDiscoveryConfig::new(vec![
-            (1, "127.0.0.1:9000".parse().unwrap()),
-        ])
-        .without_health_checks();
+        let config = StaticDiscoveryConfig::new(vec![(1, "127.0.0.1:9000".parse().unwrap())])
+            .without_health_checks();
 
         let mut discovery =
             StaticClusterDiscovery::new(1, "127.0.0.1:9000".parse().unwrap(), config);
@@ -1196,8 +1230,8 @@ mod tests {
         discovery.start().await.unwrap();
 
         // Update local metadata
-        let metadata = NodeMetadata::new(1, "127.0.0.1:9000".parse().unwrap())
-            .with_tag("role", "leader");
+        let metadata =
+            NodeMetadata::new(1, "127.0.0.1:9000".parse().unwrap()).with_tag("role", "leader");
 
         discovery.update_local_metadata(metadata).await.unwrap();
 
@@ -1215,8 +1249,7 @@ mod tests {
         ])
         .without_health_checks();
 
-        let discovery =
-            StaticClusterDiscovery::new(1, "127.0.0.1:9000".parse().unwrap(), config);
+        let discovery = StaticClusterDiscovery::new(1, "127.0.0.1:9000".parse().unwrap(), config);
 
         let debug_str = format!("{:?}", discovery);
         assert!(debug_str.contains("StaticClusterDiscovery"));

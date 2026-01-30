@@ -17,9 +17,9 @@ use std::net::SocketAddr;
 use std::time::Duration;
 use tokio::net::TcpListener;
 use tokio::time::sleep;
-use tracing::info;
 
 /// Port configuration for a node
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 struct NodePorts {
     raft_port: u16,
@@ -28,6 +28,7 @@ struct NodePorts {
 
 /// Allocate OS-assigned ports for multiple nodes.
 /// Each node needs 2 ports: one for Raft and one for memberlist.
+#[allow(dead_code)]
 async fn allocate_node_ports(node_ids: &[u64]) -> HashMap<u64, NodePorts> {
     let mut result = HashMap::new();
     for &node_id in node_ids {
@@ -41,7 +42,13 @@ async fn allocate_node_ports(node_ids: &[u64]) -> HashMap<u64, NodePorts> {
         let memberlist_port = ml_listener.local_addr().unwrap().port();
         drop(ml_listener);
 
-        result.insert(node_id, NodePorts { raft_port, memberlist_port });
+        result.insert(
+            node_id,
+            NodePorts {
+                raft_port,
+                memberlist_port,
+            },
+        );
     }
     result
 }
@@ -55,6 +62,7 @@ async fn allocate_node_ports(node_ids: &[u64]) -> HashMap<u64, NodePorts> {
 ///
 /// Memberlist handles: address discovery, health monitoring, dynamic peer updates
 /// Raft seed_nodes handles: initial voter configuration for consensus
+#[allow(dead_code)]
 fn create_memberlist_config(
     node_id: u64,
     ports: &NodePorts,
@@ -74,9 +82,9 @@ fn create_memberlist_config(
         seed_addrs: seed_memberlist_addrs,
         node_name: Some(format!("cache-node-{}", node_id)),
         peer_management: crate::config::PeerManagementConfig {
-            auto_add_peers: true,   // Automatically add discovered peers to Raft transport
+            auto_add_peers: true,     // Automatically add discovered peers to Raft transport
             auto_remove_peers: false, // Don't auto-remove (safer default)
-            auto_add_voters: false,  // Don't auto-add voters in tests (we configure them manually)
+            auto_add_voters: false,   // Don't auto-add voters in tests (we configure them manually)
             auto_remove_voters: false, // Don't auto-remove voters in tests
         },
     };
@@ -107,6 +115,7 @@ fn create_memberlist_config(
 }
 
 /// Wait for a condition with timeout
+#[allow(dead_code)]
 async fn wait_for<F>(condition: F, timeout: Duration, interval: Duration) -> bool
 where
     F: Fn() -> bool,
@@ -122,6 +131,7 @@ where
 }
 
 /// Wait for a leader to be elected among the caches
+#[allow(dead_code)]
 async fn wait_for_leader<'a>(
     caches: &[&'a DistributedCache],
     timeout: Duration,
@@ -139,6 +149,7 @@ async fn wait_for_leader<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tracing::info;
 
     /// Test Case 1: Three-node cluster with memberlist for health monitoring
     ///
@@ -149,9 +160,7 @@ mod tests {
     /// 4. Data is replicated to all nodes
     #[tokio::test]
     async fn test_three_node_cluster_auto_discovery() {
-        let _ = tracing_subscriber::fmt()
-            .with_env_filter("info")
-            .try_init();
+        let _ = tracing_subscriber::fmt().with_env_filter("info").try_init();
 
         let node_ids = [1u64, 2, 3];
         let ports = allocate_node_ports(&node_ids).await;
@@ -159,12 +168,20 @@ mod tests {
         info!("Allocated ports: {:?}", ports);
 
         // Build Raft peer addresses for all nodes
-        let raft_addr_1: SocketAddr = format!("127.0.0.1:{}", ports[&1].raft_port).parse().unwrap();
-        let raft_addr_2: SocketAddr = format!("127.0.0.1:{}", ports[&2].raft_port).parse().unwrap();
-        let raft_addr_3: SocketAddr = format!("127.0.0.1:{}", ports[&3].raft_port).parse().unwrap();
+        let raft_addr_1: SocketAddr = format!("127.0.0.1:{}", ports[&1].raft_port)
+            .parse()
+            .unwrap();
+        let raft_addr_2: SocketAddr = format!("127.0.0.1:{}", ports[&2].raft_port)
+            .parse()
+            .unwrap();
+        let raft_addr_3: SocketAddr = format!("127.0.0.1:{}", ports[&3].raft_port)
+            .parse()
+            .unwrap();
 
         // Memberlist addresses
-        let ml_addr_1: SocketAddr = format!("127.0.0.1:{}", ports[&1].memberlist_port).parse().unwrap();
+        let ml_addr_1: SocketAddr = format!("127.0.0.1:{}", ports[&1].memberlist_port)
+            .parse()
+            .unwrap();
 
         // Node 1: knows about nodes 2 and 3 for Raft, no memberlist seeds (it's the seed)
         let config1 = create_memberlist_config(
@@ -250,18 +267,24 @@ mod tests {
     /// memberlist discovery and participate in Raft consensus.
     #[tokio::test]
     async fn test_node_joins_existing_cluster() {
-        let _ = tracing_subscriber::fmt()
-            .with_env_filter("info")
-            .try_init();
+        let _ = tracing_subscriber::fmt().with_env_filter("info").try_init();
 
         let node_ids = [1u64, 2, 3];
         let ports = allocate_node_ports(&node_ids).await;
 
         // Build addresses
-        let raft_addr_1: SocketAddr = format!("127.0.0.1:{}", ports[&1].raft_port).parse().unwrap();
-        let raft_addr_2: SocketAddr = format!("127.0.0.1:{}", ports[&2].raft_port).parse().unwrap();
-        let raft_addr_3: SocketAddr = format!("127.0.0.1:{}", ports[&3].raft_port).parse().unwrap();
-        let ml_addr_1: SocketAddr = format!("127.0.0.1:{}", ports[&1].memberlist_port).parse().unwrap();
+        let raft_addr_1: SocketAddr = format!("127.0.0.1:{}", ports[&1].raft_port)
+            .parse()
+            .unwrap();
+        let raft_addr_2: SocketAddr = format!("127.0.0.1:{}", ports[&2].raft_port)
+            .parse()
+            .unwrap();
+        let raft_addr_3: SocketAddr = format!("127.0.0.1:{}", ports[&3].raft_port)
+            .parse()
+            .unwrap();
+        let ml_addr_1: SocketAddr = format!("127.0.0.1:{}", ports[&1].memberlist_port)
+            .parse()
+            .unwrap();
 
         // Start initial 2-node cluster (but configured to know about node 3)
         let config1 = create_memberlist_config(
@@ -353,18 +376,24 @@ mod tests {
     /// Verifies that cluster_status() reflects the configured peers.
     #[tokio::test]
     async fn test_cluster_status_shows_discovered_peers() {
-        let _ = tracing_subscriber::fmt()
-            .with_env_filter("info")
-            .try_init();
+        let _ = tracing_subscriber::fmt().with_env_filter("info").try_init();
 
         let node_ids = [1u64, 2, 3];
         let ports = allocate_node_ports(&node_ids).await;
 
         // Build addresses
-        let raft_addr_1: SocketAddr = format!("127.0.0.1:{}", ports[&1].raft_port).parse().unwrap();
-        let raft_addr_2: SocketAddr = format!("127.0.0.1:{}", ports[&2].raft_port).parse().unwrap();
-        let raft_addr_3: SocketAddr = format!("127.0.0.1:{}", ports[&3].raft_port).parse().unwrap();
-        let ml_addr_1: SocketAddr = format!("127.0.0.1:{}", ports[&1].memberlist_port).parse().unwrap();
+        let raft_addr_1: SocketAddr = format!("127.0.0.1:{}", ports[&1].raft_port)
+            .parse()
+            .unwrap();
+        let raft_addr_2: SocketAddr = format!("127.0.0.1:{}", ports[&2].raft_port)
+            .parse()
+            .unwrap();
+        let raft_addr_3: SocketAddr = format!("127.0.0.1:{}", ports[&3].raft_port)
+            .parse()
+            .unwrap();
+        let ml_addr_1: SocketAddr = format!("127.0.0.1:{}", ports[&1].memberlist_port)
+            .parse()
+            .unwrap();
 
         // Start all nodes
         let config1 = create_memberlist_config(
@@ -439,18 +468,24 @@ mod tests {
     /// Stress test to verify the cluster works correctly with memberlist enabled.
     #[tokio::test]
     async fn test_multiple_operations_after_discovery() {
-        let _ = tracing_subscriber::fmt()
-            .with_env_filter("info")
-            .try_init();
+        let _ = tracing_subscriber::fmt().with_env_filter("info").try_init();
 
         let node_ids = [1u64, 2, 3];
         let ports = allocate_node_ports(&node_ids).await;
 
         // Build addresses
-        let raft_addr_1: SocketAddr = format!("127.0.0.1:{}", ports[&1].raft_port).parse().unwrap();
-        let raft_addr_2: SocketAddr = format!("127.0.0.1:{}", ports[&2].raft_port).parse().unwrap();
-        let raft_addr_3: SocketAddr = format!("127.0.0.1:{}", ports[&3].raft_port).parse().unwrap();
-        let ml_addr_1: SocketAddr = format!("127.0.0.1:{}", ports[&1].memberlist_port).parse().unwrap();
+        let raft_addr_1: SocketAddr = format!("127.0.0.1:{}", ports[&1].raft_port)
+            .parse()
+            .unwrap();
+        let raft_addr_2: SocketAddr = format!("127.0.0.1:{}", ports[&2].raft_port)
+            .parse()
+            .unwrap();
+        let raft_addr_3: SocketAddr = format!("127.0.0.1:{}", ports[&3].raft_port)
+            .parse()
+            .unwrap();
+        let ml_addr_1: SocketAddr = format!("127.0.0.1:{}", ports[&1].memberlist_port)
+            .parse()
+            .unwrap();
 
         let config1 = create_memberlist_config(
             1,
@@ -542,18 +577,24 @@ mod tests {
     /// 4. Node 2 becomes a voter and can participate in consensus
     #[tokio::test]
     async fn test_dynamic_membership_via_confchange() {
-        let _ = tracing_subscriber::fmt()
-            .with_env_filter("info")
-            .try_init();
+        let _ = tracing_subscriber::fmt().with_env_filter("info").try_init();
 
         let node_ids = [1u64, 2];
         let ports = allocate_node_ports(&node_ids).await;
 
         // Build addresses
-        let raft_addr_1: SocketAddr = format!("127.0.0.1:{}", ports[&1].raft_port).parse().unwrap();
-        let ml_addr_1: SocketAddr = format!("127.0.0.1:{}", ports[&1].memberlist_port).parse().unwrap();
-        let raft_addr_2: SocketAddr = format!("127.0.0.1:{}", ports[&2].raft_port).parse().unwrap();
-        let ml_addr_2: SocketAddr = format!("127.0.0.1:{}", ports[&2].memberlist_port).parse().unwrap();
+        let raft_addr_1: SocketAddr = format!("127.0.0.1:{}", ports[&1].raft_port)
+            .parse()
+            .unwrap();
+        let ml_addr_1: SocketAddr = format!("127.0.0.1:{}", ports[&1].memberlist_port)
+            .parse()
+            .unwrap();
+        let raft_addr_2: SocketAddr = format!("127.0.0.1:{}", ports[&2].raft_port)
+            .parse()
+            .unwrap();
+        let ml_addr_2: SocketAddr = format!("127.0.0.1:{}", ports[&2].memberlist_port)
+            .parse()
+            .unwrap();
 
         // Node 1: Bootstrap as single-node cluster with auto_add_voters enabled
         let memberlist_config_1 = MemberlistConfig {
@@ -604,7 +645,10 @@ mod tests {
             Duration::from_millis(100),
         )
         .await;
-        assert!(leader_found, "Node 1 should become leader as single-node cluster");
+        assert!(
+            leader_found,
+            "Node 1 should become leader as single-node cluster"
+        );
 
         info!("Node 1 is now leader. Voters: {:?}", cache1.voters());
 
@@ -671,9 +715,15 @@ mod tests {
         .await;
 
         if node2_added {
-            info!("Node 2 successfully added as voter! Voters: {:?}", cache1.voters());
+            info!(
+                "Node 2 successfully added as voter! Voters: {:?}",
+                cache1.voters()
+            );
         } else {
-            info!("Node 2 not added yet. Current voters: {:?}", cache1.voters());
+            info!(
+                "Node 2 not added yet. Current voters: {:?}",
+                cache1.voters()
+            );
         }
 
         // Even if ConfChange hasn't completed, node 2 should be able to receive data via replication
@@ -685,13 +735,18 @@ mod tests {
         let value = cache2.get(b"before-join").await;
         info!(
             "Node 2 read 'before-join': {:?}",
-            value.as_ref().map(|v| String::from_utf8_lossy(v).to_string())
+            value
+                .as_ref()
+                .map(|v| String::from_utf8_lossy(v).to_string())
         );
 
         // Write new data (if we have a leader)
         let caches = [&cache1, &cache2];
         if let Some(leader) = caches.iter().find(|c| c.is_leader()) {
-            info!("Leader is node {}. Writing new data...", leader.cluster_status().node_id);
+            info!(
+                "Leader is node {}. Writing new data...",
+                leader.cluster_status().node_id
+            );
             leader
                 .put("after-join", "multi-node-value")
                 .await
@@ -714,8 +769,16 @@ mod tests {
         }
 
         info!("Final cluster status:");
-        info!("  Node 1 - Leader: {}, Voters: {:?}", cache1.is_leader(), cache1.voters());
-        info!("  Node 2 - Leader: {}, Voters: {:?}", cache2.is_leader(), cache2.voters());
+        info!(
+            "  Node 1 - Leader: {}, Voters: {:?}",
+            cache1.is_leader(),
+            cache1.voters()
+        );
+        info!(
+            "  Node 2 - Leader: {}, Voters: {:?}",
+            cache2.is_leader(),
+            cache2.voters()
+        );
 
         // Cleanup
         cache1.shutdown().await;

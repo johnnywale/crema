@@ -62,11 +62,7 @@ pub struct LabeledCounter<const N: usize> {
 
 impl<const N: usize> LabeledCounter<N> {
     /// Create a new labeled counter.
-    pub fn new(
-        name: &'static str,
-        help: &'static str,
-        label_names: [&'static str; N],
-    ) -> Self {
+    pub fn new(name: &'static str, help: &'static str, label_names: [&'static str; N]) -> Self {
         Self {
             name,
             help,
@@ -110,9 +106,7 @@ impl<const N: usize> LabeledCounter<N> {
 
         // Need to insert
         let mut counters = self.counters.write();
-        let counter = counters
-            .entry(key)
-            .or_insert_with(|| AtomicU64::new(0));
+        let counter = counters.entry(key).or_insert_with(|| AtomicU64::new(0));
         counter.fetch_add(n, Ordering::Relaxed);
     }
 
@@ -163,11 +157,8 @@ mod tests {
 
     #[test]
     fn test_labeled_counter() {
-        let counter = LabeledCounter::<2>::new(
-            "test_labeled",
-            "A labeled counter",
-            ["method", "status"],
-        );
+        let counter =
+            LabeledCounter::<2>::new("test_labeled", "A labeled counter", ["method", "status"]);
 
         counter.inc(["GET", "200"]);
         counter.inc(["GET", "200"]);
