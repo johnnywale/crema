@@ -13,6 +13,7 @@ use crate::network::router::{MainRaftAdapter, NodeMessageRouter};
 use crate::network::rpc::{ForwardResponse, ForwardedCommand};
 use crate::network::{Message, MessageHandler, NetworkServer};
 use crate::types::{CacheCommand, CacheStats, ClusterStatus, NodeId};
+use crate::{counter_inc, gauge_set, histogram_record, histogram_record_duration};
 use bytes::Bytes;
 use dashmap::DashMap;
 use parking_lot::Mutex;
@@ -271,6 +272,8 @@ impl DistributedCache {
             shard_handler: parking_lot::RwLock::new(None),
             shard_forward_handler: parking_lot::RwLock::new(None),
             shard_forward_response_handler: parking_lot::RwLock::new(None),
+            shard_creation_broadcast_handler: parking_lot::RwLock::new(None),
+            get_topology_handler: parking_lot::RwLock::new(None),
             pending_shard_messages: parking_lot::Mutex::new(Vec::new()),
         });
 
@@ -546,6 +549,41 @@ impl DistributedCache {
                         node_id = config.node_id,
                         "Shard forward response handler installed"
                     );
+
+                    // 5. Set up handler for ShardCreationBroadcast messages (cluster-wide shard sync)
+                    let coord_for_broadcast = coordinator.clone();
+                    let broadcast_handler: ShardCreationBroadcastHandler = Arc::new(
+                        move |broadcast| {
+                            let coord = coord_for_broadcast.clone();
+                            let request_id = broadcast.request_id;
+                            Box::pin(async move {
+                                match coord.handle_shard_creation_broadcast(broadcast).await {
+                                    Ok(ack) => ack,
+                                    Err(e) => {
+                                        tracing::warn!(error = %e, "Failed to handle shard creation broadcast");
+                                        crate::network::rpc::ShardCreationAck {
+                                            request_id,
+                                            success: false,
+                                            local_epoch: 0,
+                                            error: Some(e.to_string()),
+                                        }
+                                    }
+                                }
+                            })
+                        },
+                    );
+                    handler.set_shard_creation_broadcast_handler(broadcast_handler);
+                    info!(
+                        node_id = config.node_id,
+                        "Shard creation broadcast handler installed"
+                    );
+
+                    // 6. Set up handler for GetTopology messages (cluster state catch-up)
+                    let coord_for_topology = coordinator.clone();
+                    let topology_handler: GetTopologyHandler =
+                        Arc::new(move |request| coord_for_topology.handle_get_topology(request));
+                    handler.set_get_topology_handler(topology_handler);
+                    info!(node_id = config.node_id, "Get topology handler installed");
                 }
             }
         }
@@ -755,30 +793,62 @@ impl DistributedCache {
     /// to ensure the local state machine has caught up to the known commit index
     /// before reading. This helps avoid stale reads in test scenarios (TC23 fix).
     pub async fn get(&self, key: &[u8]) -> Option<Bytes> {
+        let start = Instant::now();
+        let node_id_str = self.config.node_id.to_string();
+
+        // Record key size
+        histogram_record!(
+            crate::metrics::descriptors::CACHE_KEY_SIZE_BYTES,
+            key.len() as f64,
+            "node_id" => node_id_str.clone()
+        );
+
         // In Multi-Raft mode, delegate to router which handles shard routing
-        if self.router.is_multi_raft() {
-            return self.router.get(key).await;
-        }
+        let result = if self.router.is_multi_raft() {
+            self.router.get(key).await
+        } else {
+            // Single-Raft mode: Read-Index wait for state machine to apply up to commit_index
+            let commit_index = self.raft.commit_index();
+            let max_wait = Duration::from_secs(1);
+            let wait_start = Instant::now();
 
-        // Single-Raft mode: Read-Index wait for state machine to apply up to commit_index
-        let commit_index = self.raft.commit_index();
-        let start = std::time::Instant::now();
-        let max_wait = Duration::from_secs(1);
-
-        while self.raft.applied_index() < commit_index {
-            if start.elapsed() > max_wait {
-                warn!(
-                    "Read-Index wait timeout: applied={} commit={}",
-                    self.raft.applied_index(),
-                    commit_index
-                );
-                break;
+            while self.raft.applied_index() < commit_index {
+                if wait_start.elapsed() > max_wait {
+                    warn!(
+                        "Read-Index wait timeout: applied={} commit={}",
+                        self.raft.applied_index(),
+                        commit_index
+                    );
+                    break;
+                }
+                // Use yield_now() for minimal latency instead of sleep
+                tokio::task::yield_now().await;
             }
-            // Use yield_now() for minimal latency instead of sleep
-            tokio::task::yield_now().await;
-        }
 
-        self.storage.get(key).await
+            self.storage.get(key).await
+        };
+
+        // Record metrics
+        let duration = start.elapsed();
+        let hit = result.is_some();
+        let result_str = if hit { "hit" } else { "miss" };
+
+        counter_inc!(
+            crate::metrics::descriptors::CACHE_GET_TOTAL,
+            "node_id" => node_id_str.clone(),
+            "result" => result_str
+        );
+        histogram_record_duration!(
+            crate::metrics::descriptors::CACHE_GET_DURATION_SECONDS,
+            duration,
+            "node_id" => node_id_str.clone(),
+            "result" => result_str
+        );
+
+        // Also record to legacy metrics
+        self.metrics.record_get(hit, duration);
+
+        result
     }
 
     /// Get a value with linearizable consistency (strongly consistent read).
@@ -857,7 +927,9 @@ impl DistributedCache {
 
     /// Get cache statistics.
     pub fn stats(&self) -> CacheStats {
-        if let Some(coordinator) = self.multiraft_coordinator() {
+        let node_id_str = self.config.node_id.to_string();
+
+        let stats = if let Some(coordinator) = self.multiraft_coordinator() {
             // In Multi-Raft mode, aggregate stats from all shards
             let stats = coordinator.stats();
             CacheStats {
@@ -868,7 +940,25 @@ impl DistributedCache {
             }
         } else {
             self.storage.stats()
-        }
+        };
+
+        // Update gauges with current stats
+        gauge_set!(
+            crate::metrics::descriptors::CACHE_ENTRIES,
+            stats.entry_count as f64,
+            "node_id" => node_id_str.clone()
+        );
+        gauge_set!(
+            crate::metrics::descriptors::CACHE_SIZE_BYTES,
+            stats.weighted_size as f64,
+            "node_id" => node_id_str
+        );
+
+        // Also update legacy metrics
+        self.metrics
+            .update_cache_stats(stats.entry_count, stats.weighted_size);
+
+        stats
     }
 
     /// Get the metrics instance.
@@ -894,60 +984,97 @@ impl DistributedCache {
     /// if this node is not the leader and forwarding is enabled, the request
     /// will be forwarded to the leader.
     pub async fn put(&self, key: impl Into<Bytes>, value: impl Into<Bytes>) -> Result<()> {
+        let start = Instant::now();
         let key = key.into();
         let value = value.into();
+        let node_id_str = self.config.node_id.to_string();
 
         // Validate key
         if key.is_empty() {
             return Err(Error::InvalidKey("key cannot be empty".to_string()));
         }
 
+        // Record key and value sizes
+        histogram_record!(
+            crate::metrics::descriptors::CACHE_KEY_SIZE_BYTES,
+            key.len() as f64,
+            "node_id" => node_id_str.clone()
+        );
+        histogram_record!(
+            crate::metrics::descriptors::CACHE_VALUE_SIZE_BYTES,
+            value.len() as f64,
+            "node_id" => node_id_str.clone()
+        );
+
         let key_preview = String::from_utf8_lossy(&key[..std::cmp::min(key.len(), 32)]);
 
         // In Multi-Raft mode, delegate to router which handles shard routing
-        if self.router.is_multi_raft() {
+        let result = if self.router.is_multi_raft() {
             debug!(
                 node_id = self.config.node_id,
                 key = %key_preview,
                 value_len = value.len(),
                 "PUT: Routing to shard (Multi-Raft mode)"
             );
-            return self.router.put(key, value).await;
-        }
-
-        // Single-Raft mode: use traditional leader forwarding
-        let command = CacheCommand::put(key.to_vec(), value.to_vec());
-
-        // Try local propose if leader, otherwise forward
-        if self.raft.is_leader() {
-            debug!(
-                node_id = self.config.node_id,
-                key = %key_preview,
-                value_len = value.len(),
-                "PUT: Submitting to Raft for replication (leader)"
-            );
-
-            let result = self.raft.propose(command).await?;
-
-            debug!(
-                node_id = self.config.node_id,
-                key = %key_preview,
-                raft_index = result.index,
-                raft_term = result.term,
-                "PUT: Successfully replicated via Raft"
-            );
-
-            Ok(())
+            self.router.put(key, value).await
         } else {
-            info!(
-                node_id = self.config.node_id,
-                key = %key_preview,
-                value_len = value.len(),
-                "PUT: Forwarding to leader (not leader)"
-            );
+            // Single-Raft mode: use traditional leader forwarding
+            let command = CacheCommand::put(key.to_vec(), value.to_vec());
 
-            self.forward_to_leader(command).await.map(|_| ())
-        }
+            // Try local propose if leader, otherwise forward
+            if self.raft.is_leader() {
+                debug!(
+                    node_id = self.config.node_id,
+                    key = %key_preview,
+                    value_len = value.len(),
+                    "PUT: Submitting to Raft for replication (leader)"
+                );
+
+                let raft_result = self.raft.propose(command).await?;
+
+                debug!(
+                    node_id = self.config.node_id,
+                    key = %key_preview,
+                    raft_index = raft_result.index,
+                    raft_term = raft_result.term,
+                    "PUT: Successfully replicated via Raft"
+                );
+
+                Ok(())
+            } else {
+                info!(
+                    node_id = self.config.node_id,
+                    key = %key_preview,
+                    value_len = value.len(),
+                    "PUT: Forwarding to leader (not leader)"
+                );
+
+                self.forward_to_leader(command).await.map(|_| ())
+            }
+        };
+
+        // Record metrics
+        let duration = start.elapsed();
+        let success = result.is_ok();
+        let success_str = if success { "true" } else { "false" };
+
+        counter_inc!(
+            crate::metrics::descriptors::CACHE_PUT_TOTAL,
+            "node_id" => node_id_str.clone(),
+            "success" => success_str,
+            "has_ttl" => "false"
+        );
+        histogram_record_duration!(
+            crate::metrics::descriptors::CACHE_PUT_DURATION_SECONDS,
+            duration,
+            "node_id" => node_id_str.clone(),
+            "success" => success_str
+        );
+
+        // Also record to legacy metrics
+        self.metrics.record_put(success, duration);
+
+        result
     }
 
     /// Put a key-value pair with a custom TTL.
@@ -1017,7 +1144,9 @@ impl DistributedCache {
 
     /// Delete a key from the cache.
     pub async fn delete(&self, key: impl Into<Bytes>) -> Result<()> {
+        let start = Instant::now();
         let key = key.into();
+        let node_id_str = self.config.node_id.to_string();
 
         // Validate key
         if key.is_empty() {
@@ -1027,85 +1156,118 @@ impl DistributedCache {
         let key_preview = String::from_utf8_lossy(&key[..std::cmp::min(key.len(), 32)]);
 
         // In Multi-Raft mode, delegate to router which handles shard routing
-        if self.router.is_multi_raft() {
+        let result = if self.router.is_multi_raft() {
             debug!(
                 node_id = self.config.node_id,
                 key = %key_preview,
                 "DELETE: Routing to shard (Multi-Raft mode)"
             );
-            return self.router.delete(&key).await;
-        }
-
-        // Single-Raft mode: use traditional leader forwarding
-        let command = CacheCommand::delete(key.to_vec());
-
-        if self.raft.is_leader() {
-            debug!(
-                node_id = self.config.node_id,
-                key = %key_preview,
-                "DELETE: Submitting to Raft for replication (leader)"
-            );
-
-            let result = self.raft.propose(command).await?;
-
-            debug!(
-                node_id = self.config.node_id,
-                key = %key_preview,
-                raft_index = result.index,
-                raft_term = result.term,
-                "DELETE: Successfully replicated via Raft"
-            );
-
-            Ok(())
+            self.router.delete(&key).await
         } else {
-            debug!(
-                node_id = self.config.node_id,
-                key = %key_preview,
-                "DELETE: Forwarding to leader (not leader)"
-            );
+            // Single-Raft mode: use traditional leader forwarding
+            let command = CacheCommand::delete(key.to_vec());
 
-            self.forward_to_leader(command).await.map(|_| ())
-        }
+            if self.raft.is_leader() {
+                debug!(
+                    node_id = self.config.node_id,
+                    key = %key_preview,
+                    "DELETE: Submitting to Raft for replication (leader)"
+                );
+
+                let raft_result = self.raft.propose(command).await?;
+
+                debug!(
+                    node_id = self.config.node_id,
+                    key = %key_preview,
+                    raft_index = raft_result.index,
+                    raft_term = raft_result.term,
+                    "DELETE: Successfully replicated via Raft"
+                );
+
+                Ok(())
+            } else {
+                debug!(
+                    node_id = self.config.node_id,
+                    key = %key_preview,
+                    "DELETE: Forwarding to leader (not leader)"
+                );
+
+                self.forward_to_leader(command).await.map(|_| ())
+            }
+        };
+
+        // Record metrics
+        let duration = start.elapsed();
+        let success = result.is_ok();
+        let success_str = if success { "true" } else { "false" };
+
+        counter_inc!(
+            crate::metrics::descriptors::CACHE_DELETE_TOTAL,
+            "node_id" => node_id_str.clone(),
+            "success" => success_str
+        );
+        histogram_record_duration!(
+            crate::metrics::descriptors::CACHE_DELETE_DURATION_SECONDS,
+            duration,
+            "node_id" => node_id_str
+        );
+
+        // Also record to legacy metrics
+        self.metrics.record_delete(duration);
+
+        result
     }
 
     /// Clear all entries from the cache.
     pub async fn clear(&self) -> Result<()> {
+        let node_id_str = self.config.node_id.to_string();
+
         // In Multi-Raft mode, delegate to router which handles shard clearing
-        if self.router.is_multi_raft() {
+        let result = if self.router.is_multi_raft() {
             info!(
                 node_id = self.config.node_id,
                 "CLEAR: Clearing all shards (Multi-Raft mode)"
             );
-            return self.router.clear().await;
-        }
-
-        // Single-Raft mode: use traditional leader forwarding
-        let command = CacheCommand::clear();
-
-        if self.raft.is_leader() {
-            info!(
-                node_id = self.config.node_id,
-                "CLEAR: Submitting to Raft for replication (leader)"
-            );
-
-            let result = self.raft.propose(command).await?;
-
-            info!(
-                node_id = self.config.node_id,
-                raft_index = result.index,
-                raft_term = result.term,
-                "CLEAR: Successfully replicated via Raft"
-            );
-
-            Ok(())
+            self.router.clear().await
         } else {
-            info!(
-                node_id = self.config.node_id,
-                "CLEAR: Forwarding to leader (not leader)"
-            );
+            // Single-Raft mode: use traditional leader forwarding
+            let command = CacheCommand::clear();
 
-            self.forward_to_leader(command).await.map(|_| ())
+            if self.raft.is_leader() {
+                info!(
+                    node_id = self.config.node_id,
+                    "CLEAR: Submitting to Raft for replication (leader)"
+                );
+
+                let raft_result = self.raft.propose(command).await?;
+
+                info!(
+                    node_id = self.config.node_id,
+                    raft_index = raft_result.index,
+                    raft_term = raft_result.term,
+                    "CLEAR: Successfully replicated via Raft"
+                );
+
+                Ok(())
+            } else {
+                info!(
+                    node_id = self.config.node_id,
+                    "CLEAR: Forwarding to leader (not leader)"
+                );
+
+                self.forward_to_leader(command).await.map(|_| ())
+            }
+        };
+
+        // Record metrics
+        if result.is_ok() {
+            counter_inc!(
+                crate::metrics::descriptors::CACHE_CLEAR_TOTAL,
+                "node_id" => node_id_str
+            );
         }
+
+        result
     }
 
     // ==================== Forwarding Logic ====================
@@ -1771,6 +1933,44 @@ impl DistributedCache {
                     node_id = self.config.node_id,
                     "Shard forward response handler installed"
                 );
+
+                // 4. Set up handler for ShardCreationBroadcast messages (cluster-wide shard sync)
+                let coord_for_broadcast = coordinator.clone();
+                let broadcast_handler: ShardCreationBroadcastHandler = Arc::new(move |broadcast| {
+                    let coord = coord_for_broadcast.clone();
+                    let request_id = broadcast.request_id;
+                    Box::pin(async move {
+                        match coord.handle_shard_creation_broadcast(broadcast).await {
+                            Ok(ack) => ack,
+                            Err(e) => {
+                                tracing::warn!(error = %e, "Failed to handle shard creation broadcast");
+                                crate::network::rpc::ShardCreationAck {
+                                    request_id,
+                                    success: false,
+                                    local_epoch: 0,
+                                    error: Some(e.to_string()),
+                                }
+                            }
+                        }
+                    })
+                });
+                self.message_handler
+                    .set_shard_creation_broadcast_handler(broadcast_handler);
+                debug!(
+                    node_id = self.config.node_id,
+                    "Shard creation broadcast handler installed (via setup_shard_message_handler)"
+                );
+
+                // 5. Set up handler for GetTopology messages (cluster state catch-up)
+                let coord_for_topology = coordinator.clone();
+                let topology_handler: GetTopologyHandler =
+                    Arc::new(move |request| coord_for_topology.handle_get_topology(request));
+                self.message_handler
+                    .set_get_topology_handler(topology_handler);
+                debug!(
+                    node_id = self.config.node_id,
+                    "Get topology handler installed (via setup_shard_message_handler)"
+                );
             }
         }
     }
@@ -1807,12 +2007,12 @@ impl DistributedCache {
     /// - Epoch-based routing ensures consistency
     ///
     /// Only available in Multi-Raft mode.
-    pub fn enable_slot_routing(&self) -> Result<()> {
+    pub async fn enable_slot_routing(&self) -> Result<()> {
         let coordinator = self
             .router
             .coordinator()
             .ok_or_else(|| Error::Internal("Multi-Raft not enabled".to_string()))?;
-        coordinator.enable_slot_routing()
+        coordinator.enable_slot_routing().await
     }
 
     /// Check if slot-based routing is enabled.
@@ -1932,6 +2132,25 @@ pub type ShardForwardHandler = Arc<
 pub type ShardForwardResponseHandler =
     Arc<dyn Fn(&crate::network::rpc::ShardForwardResponse) + Send + Sync>;
 
+/// Callback type for handling shard creation broadcasts.
+/// Returns a ShardCreationAck.
+pub type ShardCreationBroadcastHandler = Arc<
+    dyn Fn(
+            crate::network::rpc::ShardCreationBroadcast,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = crate::network::rpc::ShardCreationAck> + Send>,
+        > + Send
+        + Sync,
+>;
+
+/// Callback type for handling topology requests.
+/// Returns a TopologyResponse.
+pub type GetTopologyHandler = Arc<
+    dyn Fn(crate::network::rpc::GetTopologyRequest) -> crate::network::rpc::TopologyResponse
+        + Send
+        + Sync,
+>;
+
 /// Message handler that routes messages to the Raft node.
 struct CacheMessageHandler {
     raft: Arc<RaftNode>,
@@ -1945,6 +2164,10 @@ struct CacheMessageHandler {
     shard_forward_handler: parking_lot::RwLock<Option<ShardForwardHandler>>,
     /// Optional handler for shard forward responses (set after coordinator init).
     shard_forward_response_handler: parking_lot::RwLock<Option<ShardForwardResponseHandler>>,
+    /// Optional handler for shard creation broadcasts.
+    shard_creation_broadcast_handler: parking_lot::RwLock<Option<ShardCreationBroadcastHandler>>,
+    /// Optional handler for topology requests.
+    get_topology_handler: parking_lot::RwLock<Option<GetTopologyHandler>>,
     /// Pending shard messages that arrived before handler was set (limited to avoid memory issues).
     pending_shard_messages: parking_lot::Mutex<Vec<crate::network::rpc::ShardRaftMessage>>,
 }
@@ -1985,6 +2208,16 @@ impl CacheMessageHandler {
     /// Set the shard forward response handler for completing pending forwards.
     pub fn set_shard_forward_response_handler(&self, handler: ShardForwardResponseHandler) {
         *self.shard_forward_response_handler.write() = Some(handler);
+    }
+
+    /// Set the shard creation broadcast handler for handling shard coordination.
+    pub fn set_shard_creation_broadcast_handler(&self, handler: ShardCreationBroadcastHandler) {
+        *self.shard_creation_broadcast_handler.write() = Some(handler);
+    }
+
+    /// Set the get topology handler for handling topology requests.
+    pub fn set_get_topology_handler(&self, handler: GetTopologyHandler) {
+        *self.get_topology_handler.write() = Some(handler);
     }
 }
 
@@ -2129,6 +2362,94 @@ impl MessageHandler for CacheMessageHandler {
                     "Received ShardForwardResponse but no handler is set"
                 );
             }
+            return None;
+        }
+
+        // Handle shard creation broadcasts
+        if let Message::ShardCreationBroadcast(broadcast) = msg {
+            debug!(
+                node_id = self.node_id,
+                request_id = broadcast.request_id,
+                shard_id = broadcast.shard_id,
+                originator = broadcast.originator_node,
+                "Received ShardCreationBroadcast"
+            );
+
+            if let Some(handler) = self.shard_creation_broadcast_handler.read().clone() {
+                let transport = self.raft.transport().clone();
+                let node_id = self.node_id;
+                let request_id = broadcast.request_id;
+                let origin = broadcast.originator_node;
+
+                // Spawn task to process broadcast and send response
+                tokio::spawn(async move {
+                    let ack = handler(broadcast).await;
+                    let response = Message::ShardCreationAck(ack);
+
+                    if let Err(e) = transport.send_message(origin, response).await {
+                        warn!(
+                            node_id = node_id,
+                            request_id = request_id,
+                            origin = origin,
+                            error = %e,
+                            "Failed to send ShardCreationAck"
+                        );
+                    }
+                });
+            } else {
+                warn!(
+                    node_id = self.node_id,
+                    request_id = broadcast.request_id,
+                    "Received ShardCreationBroadcast but no handler is set"
+                );
+            }
+            return None;
+        }
+
+        // Handle shard creation acks (just log for now - fire-and-forget broadcast)
+        if let Message::ShardCreationAck(ref ack) = msg {
+            debug!(
+                node_id = self.node_id,
+                request_id = ack.request_id,
+                success = ack.success,
+                peer_epoch = ack.local_epoch,
+                "Received ShardCreationAck"
+            );
+            // Acks are currently fire-and-forget, no action needed
+            return None;
+        }
+
+        // Handle topology requests
+        if let Message::GetTopology(request) = msg {
+            debug!(
+                node_id = self.node_id,
+                request_id = request.request_id,
+                requesting_node = request.requesting_node,
+                "Received GetTopology request"
+            );
+
+            if let Some(handler) = self.get_topology_handler.read().clone() {
+                let response = handler(request);
+                return Some(Message::TopologyResponse(response));
+            } else {
+                warn!(
+                    node_id = self.node_id,
+                    "Received GetTopology but no handler is set"
+                );
+            }
+            return None;
+        }
+
+        // Handle topology responses (just log for now - handled by caller)
+        if let Message::TopologyResponse(ref response) = msg {
+            debug!(
+                node_id = self.node_id,
+                request_id = response.request_id,
+                epoch = response.current_epoch,
+                shards = response.shard_ids.len(),
+                "Received TopologyResponse"
+            );
+            // Responses are handled by the requesting side via send_raw_message_with_response
             return None;
         }
 

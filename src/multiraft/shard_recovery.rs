@@ -401,7 +401,7 @@ mod tests {
     async fn test_builder_pattern() {
         let temp_dir = TempDir::new().unwrap();
 
-        let (coordinator, storage_manager) = RecoveryCoordinatorBuilder::new(1)
+        let (coordinator, _storage_manager) = RecoveryCoordinatorBuilder::new(1)
             .with_base_dir(temp_dir.path())
             .build()
             .unwrap();

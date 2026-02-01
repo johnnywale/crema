@@ -70,6 +70,19 @@ pub enum Message {
 
     /// Response to a forwarded migration proposal.
     MigrationProposalForwardResponse(MigrationProposalForwardResponse),
+
+    // ==================== Shard Coordination Messages ====================
+    /// Broadcast new shard creation to cluster.
+    ShardCreationBroadcast(ShardCreationBroadcast),
+
+    /// Ack for shard creation broadcast.
+    ShardCreationAck(ShardCreationAck),
+
+    /// Request current topology (for catch-up).
+    GetTopology(GetTopologyRequest),
+
+    /// Response with current topology.
+    TopologyResponse(TopologyResponse),
 }
 
 /// Wrapper for Raft messages (since RaftMessage uses protobuf).
@@ -816,6 +829,144 @@ impl MigrationProposalForwardResponse {
             success: false,
             error: Some("Not leader".to_string()),
             leader_hint: leader,
+        }
+    }
+}
+
+// ==================== Shard Coordination Message Types ====================
+
+/// Broadcast new shard creation to cluster.
+///
+/// Sent by the node that initiates `add_shard_dynamic()` to inform all peers
+/// about the new shard and its slot assignments. Peers should create the shard
+/// locally (idempotent) and update their slot tables.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ShardCreationBroadcast {
+    /// Unique request ID for correlation.
+    pub request_id: u64,
+    /// The new shard ID being created.
+    pub shard_id: ShardId,
+    /// Slot assignments: (slot_id, new_owner_shard_id).
+    /// These are the slots being reassigned to the new shard.
+    pub slot_assignments: Vec<(u16, ShardId)>,
+    /// The new epoch after this topology change.
+    pub new_epoch: u64,
+    /// Node ID of the originator of this broadcast.
+    pub originator_node: NodeId,
+}
+
+impl ShardCreationBroadcast {
+    /// Create a new shard creation broadcast.
+    pub fn new(
+        request_id: u64,
+        shard_id: ShardId,
+        slot_assignments: Vec<(u16, ShardId)>,
+        new_epoch: u64,
+        originator_node: NodeId,
+    ) -> Self {
+        Self {
+            request_id,
+            shard_id,
+            slot_assignments,
+            new_epoch,
+            originator_node,
+        }
+    }
+}
+
+/// Acknowledgment for shard creation broadcast.
+///
+/// Sent by peers in response to `ShardCreationBroadcast` to indicate
+/// whether they successfully applied the topology change.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ShardCreationAck {
+    /// The request ID this is responding to.
+    pub request_id: u64,
+    /// Whether the broadcast was successfully applied.
+    pub success: bool,
+    /// The local epoch after processing (may be higher if already had this or newer).
+    pub local_epoch: u64,
+    /// Error message if failed.
+    pub error: Option<String>,
+}
+
+impl ShardCreationAck {
+    /// Create a success response.
+    pub fn success(request_id: u64, local_epoch: u64) -> Self {
+        Self {
+            request_id,
+            success: true,
+            local_epoch,
+            error: None,
+        }
+    }
+
+    /// Create an error response.
+    pub fn error(request_id: u64, local_epoch: u64, error: impl Into<String>) -> Self {
+        Self {
+            request_id,
+            success: false,
+            local_epoch,
+            error: Some(error.into()),
+        }
+    }
+}
+
+/// Request current topology (for catch-up).
+///
+/// Sent by a node that needs to synchronize its topology state,
+/// typically on startup or when detecting an epoch mismatch.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GetTopologyRequest {
+    /// Unique request ID for correlation.
+    pub request_id: u64,
+    /// Node ID of the requesting node.
+    pub requesting_node: NodeId,
+    /// Current epoch at the requesting node.
+    pub current_epoch: u64,
+}
+
+impl GetTopologyRequest {
+    /// Create a new topology request.
+    pub fn new(request_id: u64, requesting_node: NodeId, current_epoch: u64) -> Self {
+        Self {
+            request_id,
+            requesting_node,
+            current_epoch,
+        }
+    }
+}
+
+/// Response with current topology.
+///
+/// Sent in response to `GetTopologyRequest` with the current slot table
+/// and shard configuration so the requesting node can catch up.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TopologyResponse {
+    /// The request ID this is responding to.
+    pub request_id: u64,
+    /// Current epoch at the responding node.
+    pub current_epoch: u64,
+    /// List of all shard IDs in the cluster.
+    pub shard_ids: Vec<ShardId>,
+    /// Complete slot assignments: (slot_id, owner_shard_id).
+    /// This is the full slot table state.
+    pub slot_assignments: Vec<(u16, ShardId)>,
+}
+
+impl TopologyResponse {
+    /// Create a new topology response.
+    pub fn new(
+        request_id: u64,
+        current_epoch: u64,
+        shard_ids: Vec<ShardId>,
+        slot_assignments: Vec<(u16, ShardId)>,
+    ) -> Self {
+        Self {
+            request_id,
+            current_epoch,
+            shard_ids,
+            slot_assignments,
         }
     }
 }

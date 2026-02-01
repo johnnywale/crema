@@ -1,28 +1,37 @@
 //! Metrics module for monitoring and observability.
 //!
-//! This module provides Prometheus-style metrics for monitoring the cache:
-//! - Counters for request counts, errors, etc.
-//! - Gauges for current values like cache size, connections
-//! - Histograms for latency distributions
+//! This module provides comprehensive metrics for monitoring the distributed cache.
+//! It supports two modes of operation:
+//!
+//! 1. **Legacy mode** (default): Uses custom in-memory metrics types that can be
+//!    exported to Prometheus format via `CacheMetrics::to_prometheus()`.
+//!
+//! 2. **Native metrics crate mode** (with `metrics` feature): Uses the standard
+//!    `metrics` crate ecosystem with `metrics-exporter-prometheus` for export.
 //!
 //! # Architecture
 //!
 //! ```text
 //! ┌─────────────────────────────────────────────────────────────┐
-//! │                      CacheMetrics                            │
+//! │                      Metrics Module                          │
 //! │  ┌──────────────┐  ┌──────────────┐  ┌──────────────────┐  │
 //! │  │  Counters    │  │   Gauges     │  │   Histograms     │  │
 //! │  │ - requests   │  │ - cache_size │  │ - latencies      │  │
 //! │  │ - hits/miss  │  │ - raft_peers │  │ - raft_propose   │  │
 //! │  │ - errors     │  │ - is_leader  │  │ - rebalance_time │  │
 //! │  └──────────────┘  └──────────────┘  └──────────────────┘  │
+//! │                                                              │
+//! │  ┌──────────────┐  ┌──────────────┐  ┌──────────────────┐  │
+//! │  │   Facade     │  │  Registry    │  │   Prometheus     │  │
+//! │  │ (macros)     │  │ (init)       │  │   (export)       │  │
+//! │  └──────────────┘  └──────────────┘  └──────────────────┘  │
 //! └─────────────────────────────────────────────────────────────┘
 //! ```
 //!
-//! # Example
+//! # Example (Legacy Mode)
 //!
 //! ```rust,ignore
-//! use distributed_cache::metrics::CacheMetrics;
+//! use crema::metrics::CacheMetrics;
 //!
 //! let metrics = CacheMetrics::new();
 //!
@@ -36,15 +45,58 @@
 //! let snapshot = metrics.snapshot();
 //! println!("Hit rate: {:.2}%", snapshot.hit_rate() * 100.0);
 //! ```
+//!
+//! # Example (Native Metrics Mode)
+//!
+//! ```rust,ignore
+//! use crema::metrics::{MetricsRegistry, MetricsConfig};
+//! use crema::{counter_inc, gauge_set, histogram_record_duration};
+//!
+//! // Initialize the registry (once at startup)
+//! let config = MetricsConfig::new().with_node_id("node-1");
+//! let registry = MetricsRegistry::with_config(config);
+//! registry.init()?;
+//!
+//! // Record metrics using macros
+//! counter_inc!("crema_cache_get_total", "node_id" => "1", "result" => "hit");
+//! gauge_set!("crema_cache_entries", 1000, "node_id" => "1");
+//! histogram_record_duration!("crema_cache_get_duration_seconds", duration);
+//! ```
 
 mod counters;
+pub mod descriptors;
+pub mod facade;
 mod gauges;
 mod histograms;
+pub mod prometheus;
+pub mod registry;
 
 pub use counters::{Counter, LabeledCounter};
 pub use gauges::{FloatGauge, Gauge, LabeledGauge};
 pub use histograms::{
     Histogram, HistogramSnapshot, HistogramTimer, LabeledHistogram, DEFAULT_BUCKETS,
+};
+
+// Re-export facade types and macros
+pub use facade::TimerGuard;
+
+// Re-export registry types
+pub use registry::{global_registry, init_global_registry, MetricsConfig, MetricsRegistry};
+
+// Re-export prometheus types
+pub use prometheus::{
+    global_handle as prometheus_handle, install_global_recorder, install_recorder,
+    render_metrics as render_prometheus, PrometheusConfig, PrometheusHandle,
+};
+
+// Re-export descriptors
+pub use descriptors::{
+    CACHE_LATENCY_BUCKETS as DESCRIPTORS_CACHE_LATENCY_BUCKETS, LABEL_COMMAND_TYPE,
+    LABEL_DIRECTION, LABEL_ERROR_TYPE, LABEL_EVENT_TYPE, LABEL_HAS_TTL, LABEL_MODULE,
+    LABEL_NODE_ID, LABEL_OPERATION, LABEL_PEER_ID, LABEL_PHASE, LABEL_PRIORITY, LABEL_QUEUE,
+    LABEL_REASON, LABEL_RESULT, LABEL_SHARD_ID, LABEL_SLOT_ID, LABEL_SUCCESS, LABEL_TYPE,
+    MIGRATION_DURATION_BUCKETS, NETWORK_LATENCY_BUCKETS,
+    RAFT_LATENCY_BUCKETS as DESCRIPTORS_RAFT_LATENCY_BUCKETS, SIZE_BUCKETS, TENURE_BUCKETS,
 };
 
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -185,6 +237,30 @@ pub struct CacheMetrics {
     /// Time since last leader change.
     pub shard_leader_tenure: Histogram,
 
+    // Slot migration coordination metrics
+    /// Slots in pending state.
+    pub slots_pending: Gauge,
+    /// Slots in claimed state.
+    pub slots_claimed: Gauge,
+    /// Slots in streaming state.
+    pub slots_streaming: Gauge,
+    /// Slots in prepared state.
+    pub slots_prepared: Gauge,
+    /// Slots in completed state.
+    pub slots_completed: Counter,
+    /// Slots in failed state.
+    pub slots_failed: Counter,
+    /// Slots in cleaned state.
+    pub slots_cleaned: Counter,
+    /// Checksum mismatches during validation.
+    pub checksum_mismatches: Counter,
+    /// Migration retries.
+    pub migration_retries: Counter,
+    /// Epoch conflicts (stale claims).
+    pub epoch_conflicts: Counter,
+    /// Stale migration takeovers.
+    pub migration_takeovers: Counter,
+
     // Error counters by type
     /// Errors by type.
     pub errors: LabeledCounter<1>,
@@ -321,6 +397,37 @@ impl CacheMetrics {
                 "shard_leader_tenure_seconds",
                 "Duration a node held shard leadership",
                 vec![1.0, 10.0, 60.0, 300.0, 600.0, 1800.0, 3600.0, 7200.0],
+            ),
+
+            // Slot migration coordination metrics
+            slots_pending: Gauge::new("slots_pending", "Slots in pending migration state"),
+            slots_claimed: Gauge::new("slots_claimed", "Slots in claimed migration state"),
+            slots_streaming: Gauge::new("slots_streaming", "Slots in streaming migration state"),
+            slots_prepared: Gauge::new("slots_prepared", "Slots in prepared migration state"),
+            slots_completed: Counter::new(
+                "slots_completed_total",
+                "Total slots completed migration",
+            ),
+            slots_failed: Counter::new("slots_failed_total", "Total slots failed migration"),
+            slots_cleaned: Counter::new(
+                "slots_cleaned_total",
+                "Total slots cleaned after migration",
+            ),
+            checksum_mismatches: Counter::new(
+                "migration_checksum_mismatches_total",
+                "Checksum mismatches during migration validation",
+            ),
+            migration_retries: Counter::new(
+                "migration_retries_total",
+                "Total migration retry attempts",
+            ),
+            epoch_conflicts: Counter::new(
+                "migration_epoch_conflicts_total",
+                "Epoch conflicts (stale claims) during migration",
+            ),
+            migration_takeovers: Counter::new(
+                "migration_takeovers_total",
+                "Stale migration takeovers",
             ),
 
             // Errors
@@ -478,6 +585,55 @@ impl CacheMetrics {
     /// Record leader tenure duration when leadership is lost.
     pub fn record_leader_tenure(&self, duration: Duration) {
         self.shard_leader_tenure.observe_duration(duration);
+    }
+
+    /// Update slot migration state counts.
+    pub fn update_slot_migration_states(
+        &self,
+        pending: usize,
+        claimed: usize,
+        streaming: usize,
+        prepared: usize,
+    ) {
+        self.slots_pending.set(pending as i64);
+        self.slots_claimed.set(claimed as i64);
+        self.slots_streaming.set(streaming as i64);
+        self.slots_prepared.set(prepared as i64);
+    }
+
+    /// Record a slot migration completed.
+    pub fn record_slot_completed(&self) {
+        self.slots_completed.inc();
+    }
+
+    /// Record a slot migration failed.
+    pub fn record_slot_failed(&self) {
+        self.slots_failed.inc();
+    }
+
+    /// Record a slot cleaned after migration.
+    pub fn record_slot_cleaned(&self) {
+        self.slots_cleaned.inc();
+    }
+
+    /// Record a checksum mismatch during migration validation.
+    pub fn record_checksum_mismatch(&self) {
+        self.checksum_mismatches.inc();
+    }
+
+    /// Record a migration retry.
+    pub fn record_migration_retry(&self) {
+        self.migration_retries.inc();
+    }
+
+    /// Record an epoch conflict (stale claim).
+    pub fn record_epoch_conflict(&self) {
+        self.epoch_conflicts.inc();
+    }
+
+    /// Record a stale migration takeover.
+    pub fn record_migration_takeover(&self) {
+        self.migration_takeovers.inc();
     }
 
     /// Update leader status.

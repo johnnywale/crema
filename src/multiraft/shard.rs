@@ -686,12 +686,12 @@ mod tests {
         assert!(shard.is_active());
 
         // Test put/get
-        shard.put(Bytes::from("key1"), Bytes::from("value1")).await;
+        let _ = shard.put(Bytes::from("key1"), Bytes::from("value1")).await;
         let result = shard.get(b"key1").await;
         assert_eq!(result, Some(Bytes::from("value1")));
 
         // Test delete
-        shard.delete(b"key1").await;
+        let _ = shard.delete(b"key1").await;
         let result = shard.get(b"key1").await;
         assert_eq!(result, None);
     }

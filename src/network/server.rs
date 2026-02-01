@@ -1,6 +1,7 @@
 //! TCP server for handling incoming Raft and client messages.
 
 use crate::error::{NetworkError, Result};
+use crate::metrics::facade::{counter_add, counter_inc, gauge_dec, gauge_inc};
 use crate::network::rpc::{decode_message, Message, PongResponse};
 use crate::types::NodeId;
 use std::net::SocketAddr;
@@ -85,6 +86,10 @@ impl NetworkServer {
                             // Increment active connection count
                             active_conns.fetch_add(1, Ordering::SeqCst);
 
+                            // Record metrics
+                            counter_inc!("crema_network_connections_total", "node_id" => node_id.to_string());
+                            gauge_inc!("crema_network_connections_active", "node_id" => node_id.to_string());
+
                             tokio::spawn(async move {
                                 let result = Self::handle_connection(
                                     stream,
@@ -95,14 +100,17 @@ impl NetworkServer {
 
                                 // Decrement active connection count
                                 active_conns.fetch_sub(1, Ordering::SeqCst);
+                                gauge_dec!("crema_network_connections_active", "node_id" => node_id.to_string());
 
                                 if let Err(e) = result {
                                     debug!(error = %e, "Connection handler error");
+                                    counter_inc!("crema_network_connection_errors_total", "node_id" => node_id.to_string(), "error_type" => "handler_error");
                                 }
                             });
                         }
                         Err(e) => {
                             error!(error = %e, "Failed to accept connection");
+                            counter_inc!("crema_network_connection_errors_total", "node_id" => self.node_id.to_string(), "error_type" => "accept_failed");
                         }
                     }
                 }
@@ -186,6 +194,7 @@ impl NetworkServer {
                     max_size = MAX_MESSAGE_SIZE,
                     "Rejecting oversized message"
                 );
+                counter_inc!("crema_network_protocol_errors_total", "node_id" => node_id.to_string(), "error_type" => "message_too_large");
                 return Err(NetworkError::ReceiveFailed(format!(
                     "message too large: {} bytes (max {})",
                     len, MAX_MESSAGE_SIZE
@@ -200,6 +209,9 @@ impl NetworkServer {
                 .await
                 .map_err(NetworkError::Io)?;
 
+            // Record bytes received (length prefix + message body)
+            counter_add!("crema_network_bytes_received_total", (4 + len) as u64, "node_id" => node_id.to_string());
+
             // Check cancellation before handling message
             if cancel_token.is_cancelled() {
                 debug!("Connection handler cancelled before message handling");
@@ -207,7 +219,17 @@ impl NetworkServer {
             }
 
             // Decode message
-            let msg = decode_message(&data)?;
+            let msg = match decode_message(&data) {
+                Ok(m) => m,
+                Err(e) => {
+                    counter_inc!("crema_network_decode_errors_total", "node_id" => node_id.to_string());
+                    return Err(e.into());
+                }
+            };
+
+            // Record request
+            let msg_type = get_message_type(&msg);
+            counter_inc!("crema_network_requests_total", "node_id" => node_id.to_string(), "type" => msg_type.to_string());
 
             // Handle message and get optional response
             if let Some(response) = handler.handle(msg) {
@@ -224,8 +246,40 @@ impl NetworkServer {
                     .write_all(&response_data)
                     .await
                     .map_err(NetworkError::Io)?;
+
+                // Record bytes sent (length prefix + response body)
+                counter_add!("crema_network_bytes_sent_total", (4 + response_data.len()) as u64, "node_id" => node_id.to_string());
             }
         }
+    }
+}
+
+/// Get a string representation of the message type for metrics.
+fn get_message_type(msg: &Message) -> &'static str {
+    match msg {
+        Message::Raft(_) => "raft",
+        Message::ClientRequest(_) => "client_request",
+        Message::ClientResponse(_) => "client_response",
+        Message::Ping(_) => "ping",
+        Message::Pong(_) => "pong",
+        Message::ForwardedCommand(_) => "forwarded_command",
+        Message::ForwardResponse(_) => "forward_response",
+        Message::ShardForwardedCommand(_) => "shard_forward",
+        Message::ShardForwardResponse(_) => "shard_forward_response",
+        Message::ShardRaft(_) => "shard_raft",
+        Message::MigrationFetchRequest(_) => "migration_fetch",
+        Message::MigrationFetchResponse(_) => "migration_fetch_response",
+        Message::MigrationApplyRequest(_) => "migration_apply",
+        Message::MigrationApplyResponse(_) => "migration_apply_response",
+        Message::MigrationShardStatsRequest(_) => "migration_stats",
+        Message::MigrationShardStatsResponse(_) => "migration_stats_response",
+        Message::MigrationProposalForward(_) => "migration_proposal",
+        Message::MigrationProposalForwardResponse(_) => "migration_proposal_response",
+        // Shard coordination messages
+        Message::ShardCreationBroadcast(_) => "shard_creation_broadcast",
+        Message::ShardCreationAck(_) => "shard_creation_ack",
+        Message::GetTopology(_) => "get_topology",
+        Message::TopologyResponse(_) => "topology_response",
     }
 }
 

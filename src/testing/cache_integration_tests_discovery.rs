@@ -13,20 +13,11 @@ mod tests {
         ClusterDiscovery, NoOpClusterDiscovery, StaticClusterDiscovery, StaticDiscoveryConfig,
     };
     use crate::config::{CacheConfig, RaftConfig};
-    use crate::testing::eventually;
+    use crate::testing::{allocate_ports, eventually};
     use crate::types::NodeId;
     use std::net::SocketAddr;
-    use std::sync::atomic::{AtomicU16, Ordering};
     use std::time::{Duration, Instant};
     use tokio::time::sleep;
-
-    /// Port counter to ensure unique ports across tests
-    static PORT_COUNTER: AtomicU16 = AtomicU16::new(23000);
-
-    /// Allocate a range of ports for a test
-    fn allocate_ports(count: u16) -> u16 {
-        PORT_COUNTER.fetch_add(count * 2, Ordering::SeqCst)
-    }
 
     /// Create a cache config with NoOp discovery
     fn noop_discovery_config(node_id: NodeId, base_port: u16) -> CacheConfig {
@@ -146,8 +137,8 @@ mod tests {
     /// TC-D1: Single node with NoOp discovery becomes leader
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn tc_d1_noop_single_node_becomes_leader() {
-        let base_port = allocate_ports(1);
-        let config = noop_discovery_config(1, base_port);
+        let port = allocate_ports(1)[0];
+        let config = noop_discovery_config(1, port);
         let election_time = election_timeout(&config);
 
         let cache = DistributedCache::new(config)
@@ -185,8 +176,8 @@ mod tests {
     /// TC-D2: Single node with NoOp discovery - read/write operations
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn tc_d2_noop_single_node_read_write() {
-        let base_port = allocate_ports(1);
-        let config = noop_discovery_config(1, base_port);
+        let port = allocate_ports(1)[0];
+        let config = noop_discovery_config(1, port);
         let election_time = election_timeout(&config);
 
         let cache = DistributedCache::new(config)
@@ -227,14 +218,14 @@ mod tests {
     /// TC-D3: Three node cluster with NoOp discovery (using seed_nodes)
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn tc_d3_noop_three_node_cluster() {
-        let base_port = allocate_ports(3);
+        let ports = allocate_ports(3);
 
-        let peer_configs = vec![(1, base_port), (2, base_port + 1), (3, base_port + 2)];
+        let peer_configs = vec![(1, ports[0]), (2, ports[1]), (3, ports[2])];
 
         // Start all three nodes with NoOp discovery
-        let config1 = noop_discovery_cluster_config(1, base_port, peer_configs.clone());
-        let config2 = noop_discovery_cluster_config(2, base_port + 1, peer_configs.clone());
-        let config3 = noop_discovery_cluster_config(3, base_port + 2, peer_configs.clone());
+        let config1 = noop_discovery_cluster_config(1, ports[0], peer_configs.clone());
+        let config2 = noop_discovery_cluster_config(2, ports[1], peer_configs.clone());
+        let config3 = noop_discovery_cluster_config(3, ports[2], peer_configs.clone());
 
         let cache1 = DistributedCache::new(config1)
             .await
@@ -291,13 +282,13 @@ mod tests {
     /// TC-D4: NoOp discovery cluster - leader failover
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn tc_d4_noop_cluster_leader_failover() {
-        let base_port = allocate_ports(3);
+        let ports = allocate_ports(3);
 
-        let peer_configs = vec![(1, base_port), (2, base_port + 1), (3, base_port + 2)];
+        let peer_configs = vec![(1, ports[0]), (2, ports[1]), (3, ports[2])];
 
-        let config1 = noop_discovery_cluster_config(1, base_port, peer_configs.clone());
-        let config2 = noop_discovery_cluster_config(2, base_port + 1, peer_configs.clone());
-        let config3 = noop_discovery_cluster_config(3, base_port + 2, peer_configs.clone());
+        let config1 = noop_discovery_cluster_config(1, ports[0], peer_configs.clone());
+        let config2 = noop_discovery_cluster_config(2, ports[1], peer_configs.clone());
+        let config3 = noop_discovery_cluster_config(3, ports[2], peer_configs.clone());
 
         let cache1 = DistributedCache::new(config1)
             .await
@@ -360,8 +351,8 @@ mod tests {
     /// TC-D5: Single node with Static discovery
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn tc_d5_static_single_node() {
-        let base_port = allocate_ports(1);
-        let raft_addr: SocketAddr = format!("127.0.0.1:{}", base_port).parse().unwrap();
+        let port = allocate_ports(1)[0];
+        let raft_addr: SocketAddr = format!("127.0.0.1:{}", port).parse().unwrap();
 
         // Create cache config with static discovery
         let static_config =
@@ -408,14 +399,14 @@ mod tests {
     /// TC-D6: Three node cluster with Static discovery
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn tc_d6_static_three_node_cluster() {
-        let base_port = allocate_ports(3);
+        let ports = allocate_ports(3);
 
-        let peer_configs = vec![(1, base_port), (2, base_port + 1), (3, base_port + 2)];
+        let peer_configs = vec![(1, ports[0]), (2, ports[1]), (3, ports[2])];
 
         // Create cache configs with static discovery
-        let config1 = static_discovery_config(1, base_port, peer_configs.clone());
-        let config2 = static_discovery_config(2, base_port + 1, peer_configs.clone());
-        let config3 = static_discovery_config(3, base_port + 2, peer_configs.clone());
+        let config1 = static_discovery_config(1, ports[0], peer_configs.clone());
+        let config2 = static_discovery_config(2, ports[1], peer_configs.clone());
+        let config3 = static_discovery_config(3, ports[2], peer_configs.clone());
 
         let cache1 = DistributedCache::new(config1)
             .await
@@ -482,10 +473,10 @@ mod tests {
     /// TC-D7: Static discovery - dynamic peer addition
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn tc_d7_static_dynamic_peer_addition() {
-        let base_port = allocate_ports(2);
+        let ports = allocate_ports(2);
 
-        let addr1: SocketAddr = format!("127.0.0.1:{}", base_port).parse().unwrap();
-        let addr2: SocketAddr = format!("127.0.0.1:{}", base_port + 1).parse().unwrap();
+        let addr1: SocketAddr = format!("127.0.0.1:{}", ports[0]).parse().unwrap();
+        let addr2: SocketAddr = format!("127.0.0.1:{}", ports[1]).parse().unwrap();
 
         // Start with just node 1
         let static_config = StaticDiscoveryConfig::new(vec![(1, addr1)]).without_health_checks();
@@ -530,12 +521,12 @@ mod tests {
     /// TC-D8: Static discovery config from addresses
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn tc_d8_static_config_from_addrs() {
-        let base_port = allocate_ports(3);
+        let ports = allocate_ports(3);
 
         let addrs: Vec<SocketAddr> = vec![
-            format!("127.0.0.1:{}", base_port).parse().unwrap(),
-            format!("127.0.0.1:{}", base_port + 1).parse().unwrap(),
-            format!("127.0.0.1:{}", base_port + 2).parse().unwrap(),
+            format!("127.0.0.1:{}", ports[0]).parse().unwrap(),
+            format!("127.0.0.1:{}", ports[1]).parse().unwrap(),
+            format!("127.0.0.1:{}", ports[2]).parse().unwrap(),
         ];
 
         // Create config from addresses (auto-assigns IDs 1, 2, 3)
@@ -562,10 +553,10 @@ mod tests {
     /// TC-D9: NoOp vs Static discovery comparison - both work for single node
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn tc_d9_noop_vs_static_single_node_comparison() {
-        let base_port = allocate_ports(2);
+        let ports = allocate_ports(2);
 
         // Test 1: NoOp discovery
-        let config_noop = noop_discovery_config(1, base_port);
+        let config_noop = noop_discovery_config(1, ports[0]);
         let election_time = election_timeout(&config_noop);
 
         let cache_noop = DistributedCache::new(config_noop)
@@ -594,7 +585,7 @@ mod tests {
         sleep(Duration::from_millis(100)).await;
 
         // Test 2: Static discovery (same behavior expected)
-        let addr2: SocketAddr = format!("127.0.0.1:{}", base_port + 1).parse().unwrap();
+        let addr2: SocketAddr = format!("127.0.0.1:{}", ports[1]).parse().unwrap();
 
         let static_config = StaticDiscoveryConfig::new(vec![(2, addr2)]).without_health_checks();
         let discovery_static = StaticClusterDiscovery::new(2, addr2, static_config);
@@ -634,13 +625,13 @@ mod tests {
     /// TC-D10: Multiple writes and reads with NoOp discovery cluster
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn tc_d10_noop_cluster_multiple_writes() {
-        let base_port = allocate_ports(3);
+        let ports = allocate_ports(3);
 
-        let peer_configs = vec![(1, base_port), (2, base_port + 1), (3, base_port + 2)];
+        let peer_configs = vec![(1, ports[0]), (2, ports[1]), (3, ports[2])];
 
-        let config1 = noop_discovery_cluster_config(1, base_port, peer_configs.clone());
-        let config2 = noop_discovery_cluster_config(2, base_port + 1, peer_configs.clone());
-        let config3 = noop_discovery_cluster_config(3, base_port + 2, peer_configs.clone());
+        let config1 = noop_discovery_cluster_config(1, ports[0], peer_configs.clone());
+        let config2 = noop_discovery_cluster_config(2, ports[1], peer_configs.clone());
+        let config3 = noop_discovery_cluster_config(3, ports[2], peer_configs.clone());
 
         let cache1 = DistributedCache::new(config1).await.expect("Cache 1");
         let cache2 = DistributedCache::new(config2).await.expect("Cache 2");

@@ -12,10 +12,10 @@ use crate::cache::DistributedCache;
 use crate::dashboard::handlers::{
     cache::{delete_cache_value, get_cache_stats, get_cache_value, put_cache_value},
     cluster::{get_cluster_nodes, get_cluster_status, health_check},
-    metrics::{get_metrics, get_prometheus_metrics},
+    metrics::{get_comprehensive_metrics, get_metrics, get_prometheus_metrics},
     multiraft::{
-        add_shard, get_multiraft_stats, get_shard_leaders, get_shard_routing, get_shards,
-        get_slot_status, remove_shard,
+        add_shard, get_cluster_shards_comparison, get_multiraft_stats, get_shard_leaders,
+        get_shard_routing, get_shards, get_slot_status, remove_shard,
     },
 };
 use crate::dashboard::sse::events_stream;
@@ -42,8 +42,13 @@ pub fn build_router(cache: Arc<DistributedCache>) -> Router {
         // Metrics
         .route("/metrics", get(get_metrics))
         .route("/metrics/prometheus", get(get_prometheus_metrics))
+        .route("/metrics/comprehensive", get(get_comprehensive_metrics))
         // Multi-Raft
         .route("/multiraft/shards", get(get_shards))
+        .route(
+            "/multiraft/shards/compare",
+            get(get_cluster_shards_comparison),
+        )
         .route("/multiraft/stats", get(get_multiraft_stats))
         .route("/multiraft/leaders", get(get_shard_leaders))
         .route("/multiraft/routing/:key", get(get_shard_routing))

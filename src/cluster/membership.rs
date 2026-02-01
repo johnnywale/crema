@@ -10,6 +10,7 @@
 use crate::cluster::events::{MemberEvent, MemberEventListener};
 use crate::config::MembershipConfig;
 use crate::error::{MembershipError, Result};
+use crate::metrics::facade::{counter_inc, gauge_set};
 use crate::types::{NodeId, PeerInfo};
 use parking_lot::RwLock;
 use std::collections::{HashMap, HashSet};
@@ -141,16 +142,27 @@ impl ClusterMembership {
             state.mark_seen();
             state.info.raft_addr = addr;
 
+            // Record health check success
+            counter_inc!("crema_cluster_health_check_total", "node_id" => self.node_id.to_string(), "result" => "success");
+
             if !was_healthy {
                 // Node recovered
+                let healthy_count = discovered.values().filter(|s| s.is_healthy).count();
                 drop(discovered);
+
+                gauge_set!("crema_cluster_nodes_healthy", healthy_count as f64, "node_id" => self.node_id.to_string());
                 self.notify(MemberEvent::NodeRecovered { node_id, addr });
             }
         } else {
             // New node
             let info = PeerInfo::new(node_id, addr);
             discovered.insert(node_id, NodeState::new(info));
+            let total_discovered = discovered.len();
             drop(discovered);
+
+            // Record metrics
+            counter_inc!("crema_cluster_node_joins_total", "node_id" => self.node_id.to_string());
+            gauge_set!("crema_cluster_nodes_total", total_discovered as f64, "node_id" => self.node_id.to_string());
 
             info!(node_id, %addr, "Discovered new node");
             self.notify(MemberEvent::NodeJoin { node_id, addr });
@@ -167,11 +179,20 @@ impl ClusterMembership {
             let failed_checks = state.failed_checks;
             let was_healthy = state.is_healthy;
 
+            // Record health check failure
+            counter_inc!("crema_cluster_health_check_total", "node_id" => self.node_id.to_string(), "result" => "failed");
+
             if failed_checks >= self.config.failure_confirmations {
                 state.is_healthy = false;
 
                 if was_healthy {
+                    // Update healthy node count
+                    let healthy_count = discovered.values().filter(|s| s.is_healthy).count();
                     drop(discovered);
+
+                    gauge_set!("crema_cluster_nodes_healthy", healthy_count as f64, "node_id" => self.node_id.to_string());
+                    counter_inc!("crema_cluster_node_leaves_total", "node_id" => self.node_id.to_string(), "reason" => "failed");
+
                     warn!(node_id, "Node confirmed failed");
                     self.notify(MemberEvent::NodeFailed { node_id });
                 }
@@ -189,7 +210,14 @@ impl ClusterMembership {
     pub fn handle_node_leave(&self, node_id: NodeId) {
         let mut discovered = self.discovered.write();
         discovered.remove(&node_id);
+        let total_nodes = discovered.len();
+        let healthy_count = discovered.values().filter(|s| s.is_healthy).count();
         drop(discovered);
+
+        // Record metrics
+        counter_inc!("crema_cluster_node_leaves_total", "node_id" => self.node_id.to_string(), "reason" => "graceful");
+        gauge_set!("crema_cluster_nodes_total", total_nodes as f64, "node_id" => self.node_id.to_string());
+        gauge_set!("crema_cluster_nodes_healthy", healthy_count as f64, "node_id" => self.node_id.to_string());
 
         info!(node_id, "Node left cluster");
         self.notify(MemberEvent::NodeLeave { node_id });

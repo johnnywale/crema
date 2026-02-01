@@ -89,6 +89,15 @@ impl ShardStorageConfig {
         self.snapshot_entry_threshold = threshold;
         self
     }
+
+    /// Set minimum free disk space required for snapshots (in bytes).
+    ///
+    /// Default is 100MB. For testing environments with limited disk space,
+    /// this can be lowered.
+    pub fn with_min_free_space(mut self, bytes: u64) -> Self {
+        self.min_free_space = bytes;
+        self
+    }
 }
 
 /// Persisted metadata for a shard.

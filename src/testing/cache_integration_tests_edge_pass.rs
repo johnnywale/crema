@@ -11,6 +11,7 @@ pub(crate) mod multi_node_tests {
     use tokio::time::sleep;
 
     /// Helper function to verify data consistency across nodes
+    #[allow(dead_code)]
     async fn verify_data_consistency(
         caches: &[&DistributedCache],
         key: &[u8],
@@ -26,10 +27,12 @@ pub(crate) mod multi_node_tests {
     }
 
     /// Network partition simulator
+    #[allow(dead_code)]
     struct NetworkPartition {
         partitions: Arc<Mutex<HashMap<NodeId, HashSet<NodeId>>>>,
     }
 
+    #[allow(dead_code)]
     impl NetworkPartition {
         fn new() -> Self {
             Self {

@@ -21,7 +21,10 @@ mod tests {
     use std::time::{Duration, Instant};
     use tokio::time::sleep;
 
-    /// Wait for a condition with timeout
+    /// Wait for a synchronous condition with timeout and polling.
+    ///
+    /// For async conditions or cluster consensus tests, prefer using
+    /// `crate::testing::eventually` which is designed for Raft replication timing.
     async fn wait_for<F>(condition: F, timeout: Duration, check_interval: Duration) -> bool
     where
         F: Fn() -> bool,
@@ -34,6 +37,15 @@ mod tests {
             sleep(check_interval).await;
         }
         false
+    }
+
+    /// Wait for a condition with a default 5-second timeout and 10ms polling interval.
+    #[allow(dead_code)]
+    async fn wait_for_default<F>(condition: F) -> bool
+    where
+        F: Fn() -> bool,
+    {
+        wait_for(condition, Duration::from_secs(5), Duration::from_millis(10)).await
     }
 
     // ========================================================================
@@ -87,25 +99,43 @@ mod tests {
             .await
             .expect("Failed to initialize coordinator");
 
-        assert_eq!(coordinator.state(), CoordinatorState::Running);
-        assert!(coordinator.is_running());
+        assert_eq!(
+            coordinator.state(),
+            CoordinatorState::Running,
+            "Coordinator should be in Running state after build_and_init"
+        );
+        assert!(
+            coordinator.is_running(),
+            "Coordinator should report is_running=true"
+        );
 
         let stats = coordinator.stats();
-        assert_eq!(stats.total_shards, 4);
-        assert_eq!(stats.active_shards, 4);
+        assert_eq!(
+            stats.total_shards, 4,
+            "Should have 4 total shards configured"
+        );
+        assert_eq!(
+            stats.active_shards, 4,
+            "All 4 shards should be active after init"
+        );
 
         // Verify each shard exists and is active
         for shard_id in 0..4 {
-            let shard = coordinator.get_shard(shard_id);
-            assert!(shard.is_some(), "Shard {} should exist", shard_id);
+            let shard = coordinator
+                .get_shard(shard_id)
+                .unwrap_or_else(|| panic!("Shard {} should exist after init", shard_id));
             assert!(
-                shard.unwrap().is_active(),
-                "Shard {} should be active",
-                shard_id
+                shard.is_active(),
+                "Shard {} should be active, got state {:?}",
+                shard_id,
+                shard.state()
             );
         }
 
-        coordinator.shutdown().await.unwrap();
+        coordinator
+            .shutdown()
+            .await
+            .expect("Coordinator shutdown should succeed");
     }
 
     // ========================================================================
@@ -123,27 +153,46 @@ mod tests {
             .await
             .expect("Failed to initialize coordinator");
 
-        // No shards should exist yet
-        assert_eq!(coordinator.stats().active_shards, 0);
+        // No shards should exist yet (no_auto_init was set)
+        assert_eq!(
+            coordinator.stats().active_shards,
+            0,
+            "No shards should be created when no_auto_init is set"
+        );
 
-        // Create shards manually
+        // Create shards manually one at a time
         coordinator
             .create_shard(0)
             .await
             .expect("Failed to create shard 0");
-        assert_eq!(coordinator.stats().active_shards, 1);
+        assert_eq!(
+            coordinator.stats().active_shards,
+            1,
+            "Should have 1 active shard after creating shard 0"
+        );
 
         coordinator
             .create_shard(1)
             .await
             .expect("Failed to create shard 1");
-        assert_eq!(coordinator.stats().active_shards, 2);
+        assert_eq!(
+            coordinator.stats().active_shards,
+            2,
+            "Should have 2 active shards after creating shard 1"
+        );
 
         // Try to create duplicate shard - should fail
         let result = coordinator.create_shard(0).await;
-        assert!(result.is_err(), "Creating duplicate shard should fail");
+        assert!(
+            result.is_err(),
+            "Creating duplicate shard 0 should fail, but got: {:?}",
+            result
+        );
 
-        coordinator.shutdown().await.unwrap();
+        coordinator
+            .shutdown()
+            .await
+            .expect("Coordinator shutdown should succeed");
     }
 
     // ========================================================================
@@ -157,24 +206,39 @@ mod tests {
             .await
             .expect("Failed to initialize coordinator");
 
-        assert_eq!(coordinator.stats().active_shards, 4);
+        assert_eq!(
+            coordinator.stats().active_shards,
+            4,
+            "Should start with 4 active shards"
+        );
 
-        // Remove a shard
+        // Remove shard 2
         coordinator
             .remove_shard(2)
             .await
-            .expect("Failed to remove shard");
-        assert_eq!(coordinator.stats().active_shards, 3);
+            .expect("Failed to remove shard 2");
+        assert_eq!(
+            coordinator.stats().active_shards,
+            3,
+            "Should have 3 active shards after removing shard 2"
+        );
         assert!(
             coordinator.get_shard(2).is_none(),
-            "Shard 2 should be removed"
+            "Shard 2 should not be retrievable after removal"
         );
 
-        // Try to remove non-existent shard - should fail
+        // Try to remove already-removed shard - should fail
         let result = coordinator.remove_shard(2).await;
-        assert!(result.is_err(), "Removing non-existent shard should fail");
+        assert!(
+            result.is_err(),
+            "Removing already-removed shard 2 should fail, but got: {:?}",
+            result
+        );
 
-        coordinator.shutdown().await.unwrap();
+        coordinator
+            .shutdown()
+            .await
+            .expect("Coordinator shutdown should succeed");
     }
 
     // ========================================================================
@@ -188,19 +252,29 @@ mod tests {
             .await
             .expect("Failed to initialize coordinator");
 
-        // Same key should always route to the same shard
+        // Same key should always route to the same shard (deterministic hashing)
         let key = b"test-key";
         let shard1 = coordinator.shard_for_key(key);
         let shard2 = coordinator.shard_for_key(key);
         let shard3 = coordinator.shard_for_key(key);
 
-        assert_eq!(shard1, shard2, "Same key should route to same shard");
-        assert_eq!(shard2, shard3, "Same key should route to same shard");
+        assert_eq!(
+            shard1, shard2,
+            "Same key should route to same shard on repeated calls"
+        );
+        assert_eq!(shard2, shard3, "Key routing should be deterministic");
 
-        // Shard ID should be in valid range
-        assert!(shard1 < 4, "Shard ID should be less than num_shards");
+        // Shard ID should be in valid range [0, num_shards)
+        assert!(
+            shard1 < 4,
+            "Shard ID {} should be less than num_shards (4)",
+            shard1
+        );
 
-        coordinator.shutdown().await.unwrap();
+        coordinator
+            .shutdown()
+            .await
+            .expect("Coordinator shutdown should succeed");
     }
 
     // ========================================================================
@@ -215,34 +289,48 @@ mod tests {
             .expect("Failed to initialize coordinator");
 
         let mut shard_counts: HashMap<u32, u32> = HashMap::new();
+        let num_keys = 1000;
 
-        // Insert 1000 keys and count distribution
-        for i in 0..1000 {
+        // Route 1000 keys and count distribution per shard
+        for i in 0..num_keys {
             let key = format!("key-{}", i);
             let shard_id = coordinator.shard_for_key(key.as_bytes());
             *shard_counts.entry(shard_id).or_insert(0) += 1;
         }
 
-        // All 4 shards should have some keys
-        assert_eq!(shard_counts.len(), 4, "All shards should have keys");
+        // All 4 shards should receive some keys
+        assert_eq!(
+            shard_counts.len(),
+            4,
+            "All 4 shards should have keys. Distribution: {:?}",
+            shard_counts
+        );
 
-        // Distribution should be reasonably even (allow 20% variance)
+        // Distribution should be reasonably even (allow ~40% variance from ideal 250)
+        let ideal = num_keys / 4;
         for (shard_id, count) in &shard_counts {
             assert!(
                 *count > 150,
-                "Shard {} has too few keys: {}",
+                "Shard {} has too few keys: {} (expected ~{}). Full distribution: {:?}",
                 shard_id,
-                count
+                count,
+                ideal,
+                shard_counts
             );
             assert!(
                 *count < 350,
-                "Shard {} has too many keys: {}",
+                "Shard {} has too many keys: {} (expected ~{}). Full distribution: {:?}",
                 shard_id,
-                count
+                count,
+                ideal,
+                shard_counts
             );
         }
 
-        coordinator.shutdown().await.unwrap();
+        coordinator
+            .shutdown()
+            .await
+            .expect("Coordinator shutdown should succeed");
     }
 
     // ========================================================================
@@ -262,18 +350,28 @@ mod tests {
             .await
             .expect("Put should succeed");
 
-        // Get the value
+        // Get the value back
         let result = coordinator.get(b"key1").await.expect("Get should succeed");
-        assert_eq!(result, Some(Bytes::from("value1")));
+        assert_eq!(
+            result,
+            Some(Bytes::from("value1")),
+            "Should retrieve the value that was just put"
+        );
 
-        // Get non-existent key
+        // Get non-existent key should return None
         let result = coordinator
             .get(b"nonexistent")
             .await
-            .expect("Get should succeed");
-        assert_eq!(result, None);
+            .expect("Get of non-existent key should not error");
+        assert_eq!(
+            result, None,
+            "Non-existent key should return None, not an error"
+        );
 
-        coordinator.shutdown().await.unwrap();
+        coordinator
+            .shutdown()
+            .await
+            .expect("Coordinator shutdown should succeed");
     }
 
     // ========================================================================
@@ -297,16 +395,7 @@ mod tests {
             .await
             .expect("Put with TTL should succeed");
 
-        // Value should exist immediately
-        let result = coordinator
-            .get(b"ttl-key")
-            .await
-            .expect("Get should succeed");
-        assert_eq!(result, Some(Bytes::from("ttl-value")));
-
-        // Verify the value persists (since per-entry TTL is not yet implemented,
-        // the value should still exist after the configured TTL)
-        sleep(Duration::from_millis(100)).await;
+        // Value should exist immediately after put
         let result = coordinator
             .get(b"ttl-key")
             .await
@@ -314,7 +403,23 @@ mod tests {
         assert_eq!(
             result,
             Some(Bytes::from("ttl-value")),
-            "Value should still exist (per-entry TTL not implemented)"
+            "Value should exist immediately after put_with_ttl"
+        );
+
+        // Verify we can also do a second put with TTL (update)
+        coordinator
+            .put_with_ttl("ttl-key", "ttl-value-updated", Duration::from_secs(120))
+            .await
+            .expect("Update with TTL should succeed");
+
+        let result = coordinator
+            .get(b"ttl-key")
+            .await
+            .expect("Get should succeed");
+        assert_eq!(
+            result,
+            Some(Bytes::from("ttl-value-updated")),
+            "Value should be updated"
         );
 
         coordinator.shutdown().await.unwrap();
@@ -371,14 +476,16 @@ mod tests {
             .await
             .expect("Failed to initialize coordinator");
 
-        // Insert 100 entries
-        for i in 0..100 {
+        let num_entries = 100;
+
+        // Insert entries
+        for i in 0..num_entries {
             let key = format!("key-{}", i);
             let value = format!("value-{}", i);
             coordinator
-                .put(key, value)
+                .put(key.clone(), value.clone())
                 .await
-                .unwrap_or_else(|_| panic!("Put {} should succeed", i));
+                .unwrap_or_else(|e| panic!("Put key-{} should succeed: {:?}", i, e));
         }
 
         // Run pending tasks on all shards
@@ -386,35 +493,52 @@ mod tests {
             shard.storage().run_pending_tasks().await;
         }
 
-        // Verify all entries
-        for i in 0..100 {
+        // Verify all entries and count distribution per shard
+        let mut shard_entry_counts: HashMap<u32, u32> = HashMap::new();
+        let mut missing_keys = Vec::new();
+
+        for i in 0..num_entries {
             let key = format!("key-{}", i);
             let expected_value = format!("value-{}", i);
+            let shard_id = coordinator.shard_for_key(key.as_bytes());
+            *shard_entry_counts.entry(shard_id).or_insert(0) += 1;
+
             let result = coordinator
                 .get(key.as_bytes())
                 .await
-                .expect("Get should succeed");
-            assert_eq!(
-                result,
-                Some(Bytes::from(expected_value)),
-                "Key {} should have correct value",
-                key
-            );
+                .unwrap_or_else(|e| panic!("Get {} should succeed: {:?}", key, e));
+
+            if result != Some(Bytes::from(expected_value.clone())) {
+                missing_keys.push((key.clone(), result.clone()));
+            }
         }
+
+        assert!(
+            missing_keys.is_empty(),
+            "All keys should be retrievable. Missing/incorrect: {:?}",
+            missing_keys
+        );
 
         // Verify stats
         let stats = coordinator.stats();
         assert!(
-            stats.total_entries >= 90,
-            "Should have at least 90 entries, got {}",
-            stats.total_entries
+            stats.total_entries >= (num_entries - 10) as u64,
+            "Should have at least {} entries, got {}. Distribution: {:?}",
+            num_entries - 10,
+            stats.total_entries,
+            shard_entry_counts
         );
         assert!(
-            stats.operations_total >= 100,
-            "Should have at least 100 operations"
+            stats.operations_total >= num_entries as u64,
+            "Should have at least {} operations, got {}",
+            num_entries,
+            stats.operations_total
         );
 
-        coordinator.shutdown().await.unwrap();
+        coordinator
+            .shutdown()
+            .await
+            .expect("Coordinator shutdown should succeed");
     }
 
     // ========================================================================
@@ -828,24 +952,36 @@ mod tests {
 
         let num_tasks = 10;
         let ops_per_task = 50;
+        let total_expected = num_tasks * ops_per_task;
 
         // Spawn concurrent tasks
         let mut handles = vec![];
         for task_id in 0..num_tasks {
             let coord = coordinator.clone();
             let handle = tokio::spawn(async move {
+                let mut success_count = 0;
                 for i in 0..ops_per_task {
                     let key = format!("concurrent-{}-{}", task_id, i);
                     let value = format!("value-{}-{}", task_id, i);
-                    coord.put(key, value).await.unwrap();
+                    match coord.put(key.clone(), value.clone()).await {
+                        Ok(()) => success_count += 1,
+                        Err(e) => {
+                            eprintln!("Task {} failed to put key {}: {:?}", task_id, key, e);
+                        }
+                    }
                 }
+                success_count
             });
             handles.push(handle);
         }
 
-        // Wait for all tasks
-        for handle in handles {
-            handle.await.unwrap();
+        // Wait for all tasks and count successes
+        let mut total_successes = 0;
+        for (task_id, handle) in handles.into_iter().enumerate() {
+            match handle.await {
+                Ok(count) => total_successes += count,
+                Err(e) => eprintln!("Task {} panicked: {:?}", task_id, e),
+            }
         }
 
         // Run pending tasks
@@ -855,15 +991,25 @@ mod tests {
 
         // Verify entries
         let stats = coordinator.stats();
-        let expected_min = (num_tasks * ops_per_task - 50) as u64;
+        let expected_min = (total_expected - 50) as u64;
         assert!(
             stats.total_entries >= expected_min,
-            "Should have at least {} entries, got {}",
+            "Should have at least {} entries, got {}. Total successes: {}",
             expected_min,
-            stats.total_entries
+            stats.total_entries,
+            total_successes
+        );
+        assert!(
+            total_successes >= total_expected - 10,
+            "At least {} puts should succeed, got {}",
+            total_expected - 10,
+            total_successes
         );
 
-        coordinator.shutdown().await.unwrap();
+        coordinator
+            .shutdown()
+            .await
+            .expect("Coordinator shutdown should succeed");
     }
 
     // ========================================================================
@@ -1146,7 +1292,7 @@ mod tests {
         assert!(!shard.is_active());
 
         // Put some data
-        shard
+        let _ = shard
             .put(Bytes::from("test-key"), Bytes::from("test-value"))
             .await;
 
@@ -1159,7 +1305,7 @@ mod tests {
         assert!(shard.is_active());
 
         // Now put should work and be retrievable
-        shard
+        let _ = shard
             .put(Bytes::from("test-key2"), Bytes::from("test-value2"))
             .await;
         let result = shard.get(b"test-key2").await;

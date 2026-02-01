@@ -108,6 +108,19 @@ pub enum Error {
     #[error("migration timed out")]
     MigrationTimeout,
 
+    /// Migration validation failed.
+    #[error("migration validation failed: {0}")]
+    MigrationValidationFailed(String),
+
+    /// Migration epoch conflict (stale claim).
+    #[error("migration epoch conflict: expected {expected}, got {actual}")]
+    MigrationEpochConflict {
+        /// Expected epoch.
+        expected: u64,
+        /// Actual epoch received.
+        actual: u64,
+    },
+
     /// Invalid key (empty or too long).
     #[error("invalid key: {0}")]
     InvalidKey(String),
@@ -294,6 +307,8 @@ impl Error {
             Error::InvalidMigrationPhase(_) => false,
             Error::MigrationFailed(_) => false, // Terminal failure
             Error::MigrationTimeout => true,    // Might succeed with retry
+            Error::MigrationValidationFailed(_) => true, // May pass on retry after replication
+            Error::MigrationEpochConflict { .. } => false, // Stale claim, won't change
             Error::InvalidKey(_) => false,      // Validation error, won't change
         }
     }
@@ -323,6 +338,7 @@ impl Error {
             Error::MigrationPaused => Some(Duration::from_secs(1)),
             Error::TooManyMigrations => Some(Duration::from_millis(500)),
             Error::MigrationTimeout => Some(Duration::from_millis(200)),
+            Error::MigrationValidationFailed(_) => Some(Duration::from_millis(500)),
             // ForwardFailed gets a longer delay since target node may be recovering
             Error::ForwardFailed(_) => Some(Duration::from_millis(200)),
             Error::ShardNotLocal { .. } => Some(Duration::from_millis(10)), // Fast retry with forwarding

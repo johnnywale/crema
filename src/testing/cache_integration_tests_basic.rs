@@ -12,20 +12,11 @@
 mod tests {
     use crate::cache::DistributedCache;
     use crate::config::{CacheConfig, RaftConfig};
-    use crate::testing::eventually;
+    use crate::testing::{allocate_ports, eventually};
     use crate::types::NodeId;
     use std::net::SocketAddr;
-    use std::sync::atomic::{AtomicU16, Ordering};
     use std::time::{Duration, Instant};
     use tokio::time::sleep;
-
-    /// Port counter to ensure unique ports across tests
-    static PORT_COUNTER: AtomicU16 = AtomicU16::new(21000);
-
-    /// Allocate a range of ports for a test
-    fn allocate_ports(count: u16) -> u16 {
-        PORT_COUNTER.fetch_add(count * 2, Ordering::SeqCst)
-    }
 
     /// Create a cache config for a single node (standalone)
     fn single_node_config(node_id: NodeId, base_port: u16) -> CacheConfig {
@@ -119,8 +110,8 @@ mod tests {
     // ========================================================================
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn tc1_single_node_becomes_leader() {
-        let base_port = allocate_ports(1);
-        let config = single_node_config(1, base_port);
+        let port = allocate_ports(1)[0];
+        let config = single_node_config(1, port);
         let election_time = election_timeout(&config);
 
         // Start the cache
@@ -155,8 +146,8 @@ mod tests {
     // ========================================================================
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn tc2_leader_election_within_expected_time() {
-        let base_port = allocate_ports(1);
-        let config = single_node_config(1, base_port);
+        let port = allocate_ports(1)[0];
+        let config = single_node_config(1, port);
         let election_time = election_timeout(&config);
 
         let start = Instant::now();
@@ -204,8 +195,8 @@ mod tests {
     // ========================================================================
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn tc3_node_remains_leader_stable() {
-        let base_port = allocate_ports(1);
-        let config = single_node_config(1, base_port);
+        let port = allocate_ports(1)[0];
+        let config = single_node_config(1, port);
         let election_time = election_timeout(&config);
 
         let cache = DistributedCache::new(config)
@@ -252,8 +243,8 @@ mod tests {
     // ========================================================================
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn tc4_restart_single_node() {
-        let base_port = allocate_ports(1);
-        let config1 = single_node_config(1, base_port);
+        let port = allocate_ports(1)[0];
+        let config1 = single_node_config(1, port);
         let election_time = Duration::from_millis(
             config1.raft.tick_interval_ms * config1.raft.election_tick as u64,
         );
@@ -272,7 +263,7 @@ mod tests {
         sleep(Duration::from_millis(200)).await; // Allow cleanup
 
         // Restart with same config (same node ID, same port)
-        let config2 = single_node_config(1, base_port);
+        let config2 = single_node_config(1, port);
         let cache2 = DistributedCache::new(config2)
             .await
             .expect("Failed to restart cache");
@@ -303,8 +294,8 @@ mod tests {
     // ========================================================================
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn tc5_single_node_log_writes() {
-        let base_port = allocate_ports(1);
-        let config = single_node_config(1, base_port);
+        let port = allocate_ports(1)[0];
+        let config = single_node_config(1, port);
         let election_time = election_timeout(&config);
 
         let cache = DistributedCache::new(config)
@@ -384,16 +375,16 @@ mod tests {
     // ========================================================================
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn tc6_single_node_in_multinode_config_no_quorum() {
-        let base_port = allocate_ports(3);
+        let ports = allocate_ports(3);
 
         // Configure as if there are 3 nodes, but only start 1
         let peer_configs = vec![
-            (1, base_port),
-            (2, base_port + 1), // Not running
-            (3, base_port + 2), // Not running
+            (1, ports[0]),
+            (2, ports[1]), // Not running
+            (3, ports[2]), // Not running
         ];
 
-        let config = cluster_node_config(1, base_port, peer_configs);
+        let config = cluster_node_config(1, ports[0], peer_configs);
         let election_time = election_timeout(&config);
 
         let cache = DistributedCache::new(config)
@@ -437,10 +428,10 @@ mod tests {
     // ========================================================================
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn tc7_election_timeout_configuration() {
-        let base_port = allocate_ports(1);
+        let port = allocate_ports(1)[0];
 
         // Use a longer election timeout
-        let mut config = single_node_config(1, base_port);
+        let mut config = single_node_config(1, port);
         config.raft.election_tick = 10; // 10 ticks = 1 second
         config.raft.tick_interval_ms = 100;
 
@@ -478,8 +469,8 @@ mod tests {
     // ========================================================================
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn tc8_single_node_clear_operation() {
-        let base_port = allocate_ports(1);
-        let config = single_node_config(1, base_port);
+        let port = allocate_ports(1)[0];
+        let config = single_node_config(1, port);
         let election_time = election_timeout(&config);
 
         let cache = DistributedCache::new(config)
@@ -535,8 +526,8 @@ mod tests {
     // ========================================================================
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn tc9_multiple_writes_reads_consistency() {
-        let base_port = allocate_ports(1);
-        let config = single_node_config(1, base_port);
+        let port = allocate_ports(1)[0];
+        let config = single_node_config(1, port);
         let election_time = election_timeout(&config);
 
         let cache = DistributedCache::new(config)
@@ -602,44 +593,45 @@ mod tests {
     // ========================================================================
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn tc10_scale_one_to_three_nodes() {
-        let base_port = allocate_ports(3);
-        let election_time = Duration::from_millis(500); // 5 ticks * 100ms
+        let ports = allocate_ports(3);
 
         // Start with single node configured for 3-node cluster
-        let peer_configs = vec![(1, base_port), (2, base_port + 1), (3, base_port + 2)];
+        let peer_configs = vec![(1, ports[0]), (2, ports[1]), (3, ports[2])];
 
         // Node 1: Start first
-        let config1 = cluster_node_config(1, base_port, peer_configs.clone());
+        let config1 = cluster_node_config(1, ports[0], peer_configs.clone());
         let cache1 = DistributedCache::new(config1)
             .await
             .expect("Failed to create cache 1");
 
         // Wait a bit - node 1 alone cannot become leader (needs quorum of 2)
-        sleep(election_time * 3).await;
+        sleep(Duration::from_secs(2)).await;
         assert!(!cache1.is_leader(), "Node 1 should not be leader alone");
 
         // Node 2: Start second node
-        let config2 = cluster_node_config(2, base_port + 1, peer_configs.clone());
+        let config2 = cluster_node_config(2, ports[1], peer_configs.clone());
 
         let cache2 = DistributedCache::new(config2)
             .await
             .expect("Failed to create cache 2");
 
         // Now with 2 nodes, one should become leader (quorum = 2)
-        eventually(election_time * 10, || async {
+        // Use 15 seconds as per CLAUDE.md guidelines
+        eventually(Duration::from_secs(15), || async {
             cache1.is_leader() || cache2.is_leader()
         })
         .await
         .expect("A leader should be elected with 2 nodes");
 
         // Node 3: Start third node
-        let config3 = cluster_node_config(3, base_port + 2, peer_configs.clone());
+        let config3 = cluster_node_config(3, ports[2], peer_configs.clone());
         let cache3 = DistributedCache::new(config3)
             .await
             .expect("Failed to create cache 3");
 
         // Wait for exactly one leader and all nodes to agree
-        eventually(election_time * 10, || async {
+        // Use 15 seconds as per CLAUDE.md guidelines
+        eventually(Duration::from_secs(15), || async {
             let caches = [&cache1, &cache2, &cache3];
             let leader_count = caches.iter().filter(|c| c.is_leader()).count();
             if leader_count != 1 {
@@ -672,15 +664,14 @@ mod tests {
     // ========================================================================
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn tc11_three_node_data_replication() {
-        let base_port = allocate_ports(3);
-        let election_time = Duration::from_millis(500);
+        let ports = allocate_ports(3);
 
-        let peer_configs = vec![(1, base_port), (2, base_port + 1), (3, base_port + 2)];
+        let peer_configs = vec![(1, ports[0]), (2, ports[1]), (3, ports[2])];
 
         // Start all three nodes
-        let config1 = cluster_node_config(1, base_port, peer_configs.clone());
-        let config2 = cluster_node_config(2, base_port + 1, peer_configs.clone());
-        let config3 = cluster_node_config(3, base_port + 2, peer_configs.clone());
+        let config1 = cluster_node_config(1, ports[0], peer_configs.clone());
+        let config2 = cluster_node_config(2, ports[1], peer_configs.clone());
+        let config3 = cluster_node_config(3, ports[2], peer_configs.clone());
 
         let cache1 = DistributedCache::new(config1)
             .await
@@ -692,8 +683,8 @@ mod tests {
             .await
             .expect("Failed to create cache 3");
 
-        // Wait for leader election
-        eventually(election_time * 10, || async {
+        // Wait for leader election (use 15 seconds as per CLAUDE.md guidelines)
+        eventually(Duration::from_secs(15), || async {
             cache1.is_leader() || cache2.is_leader() || cache3.is_leader()
         })
         .await
@@ -712,9 +703,9 @@ mod tests {
         let write_result = leader.put("replicated-key", "replicated-value").await;
         assert!(write_result.is_ok(), "Write should succeed on leader");
 
-        // Wait for replication to all nodes
+        // Wait for replication to all nodes (use 10 seconds as per CLAUDE.md guidelines)
         let expected = Some(bytes::Bytes::from("replicated-value"));
-        eventually(Duration::from_secs(5), || async {
+        eventually(Duration::from_secs(10), || async {
             let val1 = cache1.get(b"replicated-key").await;
             let val2 = cache2.get(b"replicated-key").await;
             let val3 = cache3.get(b"replicated-key").await;
@@ -734,15 +725,14 @@ mod tests {
     // ========================================================================
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn tc12_write_to_non_leader_fails() {
-        let base_port = allocate_ports(3);
-        let election_time = Duration::from_millis(500);
+        let ports = allocate_ports(3);
 
-        let peer_configs = vec![(1, base_port), (2, base_port + 1), (3, base_port + 2)];
+        let peer_configs = vec![(1, ports[0]), (2, ports[1]), (3, ports[2])];
 
         // Start all three nodes
-        let config1 = cluster_node_config(1, base_port, peer_configs.clone());
-        let config2 = cluster_node_config(2, base_port + 1, peer_configs.clone());
-        let config3 = cluster_node_config(3, base_port + 2, peer_configs.clone());
+        let config1 = cluster_node_config(1, ports[0], peer_configs.clone());
+        let config2 = cluster_node_config(2, ports[1], peer_configs.clone());
+        let config3 = cluster_node_config(3, ports[2], peer_configs.clone());
 
         let cache1 = DistributedCache::new(config1)
             .await
@@ -754,8 +744,8 @@ mod tests {
             .await
             .expect("Failed to create cache 3");
 
-        // Wait for leader election
-        eventually(election_time * 10, || async {
+        // Wait for leader election (use 15 seconds as per CLAUDE.md guidelines)
+        eventually(Duration::from_secs(15), || async {
             cache1.is_leader() || cache2.is_leader() || cache3.is_leader()
         })
         .await
@@ -785,8 +775,8 @@ mod tests {
     // ========================================================================
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn tc13_term_monotonicity() {
-        let base_port = allocate_ports(1);
-        let config = single_node_config(1, base_port);
+        let port = allocate_ports(1)[0];
+        let config = single_node_config(1, port);
         let election_time = election_timeout(&config);
 
         let cache = DistributedCache::new(config)
@@ -821,8 +811,8 @@ mod tests {
     // ========================================================================
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn tc14_cluster_status_consistency() {
-        let base_port = allocate_ports(1);
-        let config = single_node_config(1, base_port);
+        let port = allocate_ports(1)[0];
+        let config = single_node_config(1, port);
         let election_time = election_timeout(&config);
 
         let cache = DistributedCache::new(config)
@@ -864,12 +854,12 @@ mod tests {
     // ========================================================================
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn tc15_local_operations_without_leadership() {
-        let base_port = allocate_ports(3);
+        let ports = allocate_ports(3);
 
         // Configure as 3-node cluster but only start 1 (no quorum, no leader)
-        let peer_configs = vec![(1, base_port), (2, base_port + 1), (3, base_port + 2)];
+        let peer_configs = vec![(1, ports[0]), (2, ports[1]), (3, ports[2])];
 
-        let config = cluster_node_config(1, base_port, peer_configs);
+        let config = cluster_node_config(1, ports[0], peer_configs);
         let cache = DistributedCache::new(config)
             .await
             .expect("Failed to create cache");

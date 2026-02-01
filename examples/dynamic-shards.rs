@@ -66,7 +66,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Enable slot-based routing
     println!("Step 2: Enabling slot-based routing...");
-    cache.enable_slot_routing()?;
+    cache.enable_slot_routing().await?;
 
     // Start the migration background loop
     cache.start_slot_migration();

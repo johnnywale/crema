@@ -148,7 +148,7 @@ pub struct MetricsResponse {
 }
 
 /// Shard information response.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct ShardInfoResponse {
     pub shard_id: ShardId,
     pub is_active: bool,
@@ -280,4 +280,108 @@ pub struct RemoveShardResponse {
     /// Error message (if failed).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+}
+
+// ============================================================================
+// Comprehensive Metrics Types
+// ============================================================================
+
+/// A single metric value with metadata.
+#[derive(Debug, Clone, Serialize)]
+pub struct MetricValue {
+    /// Metric name.
+    pub name: String,
+    /// Metric description.
+    pub description: String,
+    /// Metric type (counter, gauge, histogram).
+    pub metric_type: String,
+    /// Current value (for counters and gauges).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub value: Option<f64>,
+    /// Histogram data (for histograms).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub histogram: Option<HistogramData>,
+}
+
+/// Histogram data.
+#[derive(Debug, Clone, Serialize)]
+pub struct HistogramData {
+    pub count: u64,
+    pub sum: f64,
+    pub mean: f64,
+    pub p50: f64,
+    pub p90: f64,
+    pub p99: f64,
+}
+
+/// Metrics grouped by category.
+#[derive(Debug, Clone, Serialize)]
+pub struct MetricCategory {
+    /// Category name.
+    pub name: String,
+    /// Metrics in this category.
+    pub metrics: Vec<MetricValue>,
+}
+
+/// Comprehensive metrics response with all metrics.
+#[derive(Debug, Serialize)]
+pub struct ComprehensiveMetricsResponse {
+    /// Node ID.
+    pub node_id: NodeId,
+    /// Timestamp of the snapshot.
+    pub timestamp_ms: u64,
+    /// All metrics grouped by category.
+    pub categories: Vec<MetricCategory>,
+    /// Total metric count.
+    pub total_metrics: usize,
+}
+
+// ============================================================================
+// Cluster-Wide Shard Comparison Types
+// ============================================================================
+
+/// Shard information for a specific node.
+#[derive(Debug, Clone, Serialize)]
+pub struct NodeShardInfo {
+    /// Node ID.
+    pub node_id: NodeId,
+    /// Whether this node responded.
+    pub reachable: bool,
+    /// Error message if not reachable.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    /// Shard information from this node.
+    pub shards: Vec<ShardInfoResponse>,
+}
+
+/// Shard difference between nodes.
+#[derive(Debug, Clone, Serialize)]
+pub struct ShardDifference {
+    /// Shard ID.
+    pub shard_id: ShardId,
+    /// Difference type.
+    pub diff_type: String,
+    /// Description of the difference.
+    pub description: String,
+    /// Node A value.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub node_a_value: Option<String>,
+    /// Node B value.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub node_b_value: Option<String>,
+}
+
+/// Cluster-wide shard comparison response.
+#[derive(Debug, Serialize)]
+pub struct ClusterShardsComparisonResponse {
+    /// Local node ID.
+    pub local_node_id: NodeId,
+    /// Shard info from all nodes.
+    pub nodes: Vec<NodeShardInfo>,
+    /// Differences detected between nodes.
+    pub differences: Vec<ShardDifference>,
+    /// Whether all nodes are consistent.
+    pub is_consistent: bool,
+    /// Summary of the comparison.
+    pub summary: String,
 }

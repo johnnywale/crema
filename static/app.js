@@ -58,6 +58,24 @@ document.addEventListener('alpine:init', () => {
         showRemoveDialog: false,
         removeShardTarget: null,
 
+        // Cluster shard comparison
+        clusterComparison: {
+            local_node_id: 0,
+            nodes: [],
+            differences: [],
+            is_consistent: true,
+            summary: ''
+        },
+
+        // Comprehensive metrics
+        comprehensiveMetrics: {
+            node_id: 0,
+            timestamp_ms: 0,
+            categories: [],
+            total_metrics: 0
+        },
+        expandedCategories: ['Cache Operations', 'Latency'],
+
         // Cache operations form
         opKey: '',
         opValue: '',
@@ -70,6 +88,8 @@ document.addEventListener('alpine:init', () => {
         init() {
             this.connect();
             this.fetchInitialData();
+            this.fetchComprehensiveMetrics();
+            this.fetchClusterComparison();
         },
 
         // Connect to SSE endpoint
@@ -158,6 +178,28 @@ document.addEventListener('alpine:init', () => {
                 this.totalKeysMigrated = data.total_keys_migrated;
             } catch (err) {
                 console.error('Failed to fetch slot status:', err);
+            }
+        },
+
+        // Fetch cluster shard comparison
+        async fetchClusterComparison() {
+            try {
+                const res = await fetch('/api/multiraft/shards/compare');
+                const data = await res.json();
+                this.clusterComparison = data;
+            } catch (err) {
+                console.error('Failed to fetch cluster comparison:', err);
+            }
+        },
+
+        // Fetch comprehensive metrics
+        async fetchComprehensiveMetrics() {
+            try {
+                const res = await fetch('/api/metrics/comprehensive');
+                const data = await res.json();
+                this.comprehensiveMetrics = data;
+            } catch (err) {
+                console.error('Failed to fetch comprehensive metrics:', err);
             }
         },
 
@@ -406,6 +448,79 @@ document.addEventListener('alpine:init', () => {
                 return 'N/A';
             }
             return `N${shard.leader_id}`;
+        },
+
+        // Cluster comparison helpers
+        getShardComparisonClass(shard, nodeId) {
+            const hasDiff = this.clusterComparison.differences.some(
+                d => d.shard_id === shard.shard_id
+            );
+            const leaderId = shard.leader_id || 0;
+            const nodeClass = `shard-node-${(leaderId % 5) + 1}`;
+            const diffClass = hasDiff ? 'shard-diff' : '';
+            return `${nodeClass} ${diffClass}`.trim();
+        },
+
+        formatDiffType(diffType) {
+            const types = {
+                'missing_shard': 'Missing',
+                'leader_mismatch': 'Leader',
+                'term_mismatch': 'Term',
+                'slot_count_mismatch': 'Slots',
+                'active_state_mismatch': 'State'
+            };
+            return types[diffType] || diffType;
+        },
+
+        // Comprehensive metrics helpers
+        toggleCategory(categoryName) {
+            const idx = this.expandedCategories.indexOf(categoryName);
+            if (idx >= 0) {
+                this.expandedCategories.splice(idx, 1);
+            } else {
+                this.expandedCategories.push(categoryName);
+            }
+        },
+
+        formatTimestamp(ms) {
+            if (!ms) return '-';
+            const date = new Date(ms);
+            return date.toLocaleTimeString();
+        },
+
+        formatMetricValue(metric) {
+            const val = metric.value;
+            if (val === null || val === undefined) return '-';
+
+            // Handle special cases
+            if (metric.name.includes('rate') || metric.name.includes('ratio')) {
+                return (val * 100).toFixed(1) + '%';
+            }
+            if (metric.name.includes('is_leader')) {
+                return val > 0 ? 'Yes' : 'No';
+            }
+
+            // Format large numbers
+            if (val >= 1000000) return (val / 1000000).toFixed(2) + 'M';
+            if (val >= 1000) return (val / 1000).toFixed(2) + 'K';
+            if (Number.isInteger(val)) return val.toString();
+            return val.toFixed(2);
+        },
+
+        getMetricValueClass(metric) {
+            const name = metric.name.toLowerCase();
+            const val = metric.value;
+
+            if (name.includes('failure') || name.includes('error') || name.includes('miss')) {
+                return val > 0 ? 'metric-warning' : '';
+            }
+            if (name.includes('success') || name.includes('hit')) {
+                return val > 0 ? 'metric-success' : '';
+            }
+            if (name.includes('is_leader')) {
+                return val > 0 ? 'metric-success' : '';
+            }
+            return '';
         },
 
         // Cleanup

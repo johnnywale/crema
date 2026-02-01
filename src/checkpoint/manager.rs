@@ -4,6 +4,7 @@ use crate::cache::storage::CacheStorage;
 use crate::checkpoint::format::FormatError;
 use crate::checkpoint::reader::SnapshotReader;
 use crate::checkpoint::writer::{SnapshotMetadata, SnapshotWriter};
+use crate::metrics::facade::{counter_inc, gauge_set, histogram_record};
 use bytes::Bytes;
 use parking_lot::RwLock;
 use std::fs::{self, File};
@@ -100,6 +101,15 @@ impl CheckpointConfig {
     /// Set max snapshots to keep.
     pub fn with_max_snapshots(mut self, max: usize) -> Self {
         self.max_snapshots = max;
+        self
+    }
+
+    /// Set minimum free disk space required for snapshots (in bytes).
+    ///
+    /// Default is 100MB. For testing environments with limited disk space,
+    /// this can be lowered.
+    pub fn with_min_free_space(mut self, bytes: u64) -> Self {
+        self.min_free_space = bytes;
         self
     }
 }
@@ -383,11 +393,14 @@ impl CheckpointManager {
     ///
     /// This method runs the heavy IO work on a blocking thread pool to avoid
     /// starving Tokio worker threads during large snapshot operations.
+    #[allow(unused_variables)]
     pub async fn create_snapshot(
         &self,
         raft_index: u64,
         raft_term: u64,
     ) -> Result<SnapshotMetadata, FormatError> {
+        let start_time = Instant::now();
+
         if !self.config.enabled {
             return Err(FormatError::Io(std::io::Error::other(
                 "checkpointing disabled",
@@ -400,6 +413,7 @@ impl CheckpointManager {
             .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
             .is_err()
         {
+            counter_inc!("crema_checkpoint_backpressure_total");
             return Err(FormatError::SnapshotInProgress);
         }
 
@@ -443,6 +457,19 @@ impl CheckpointManager {
                 self.entries_since_snapshot.store(0, Ordering::Relaxed);
                 *self.last_snapshot_time.write() = Instant::now();
 
+                // Record metrics
+                counter_inc!("crema_checkpoint_created_total", "success" => "true");
+                histogram_record!(
+                    "crema_checkpoint_create_duration_seconds",
+                    start_time.elapsed().as_secs_f64()
+                );
+                gauge_set!("crema_checkpoint_size_bytes", metadata.file_size as f64);
+                gauge_set!("crema_checkpoint_entries", metadata.entry_count as f64);
+                gauge_set!(
+                    "crema_checkpoint_compression_ratio",
+                    metadata.compression_ratio()
+                );
+
                 // Update current snapshot info
                 let final_path = self.config.dir.join(format!(
                     "snapshot-{:016x}-{:016x}.{}",
@@ -462,6 +489,9 @@ impl CheckpointManager {
                 // Cleanup old snapshots
                 if let Err(e) = self.cleanup_old_snapshots() {
                     warn!(error = %e, "Failed to cleanup old snapshots");
+                    counter_inc!("crema_checkpoint_cleanup_total", "success" => "false");
+                } else {
+                    counter_inc!("crema_checkpoint_cleanup_total", "success" => "true");
                 }
 
                 info!(
@@ -475,6 +505,11 @@ impl CheckpointManager {
             Err(_) => {
                 // Record error time for backoff
                 *self.last_error_time.write() = Some(Instant::now());
+                counter_inc!("crema_checkpoint_created_total", "success" => "false");
+                histogram_record!(
+                    "crema_checkpoint_create_duration_seconds",
+                    start_time.elapsed().as_secs_f64()
+                );
             }
         }
 
@@ -601,11 +636,19 @@ impl CheckpointManager {
     }
 
     /// Load a snapshot into the cache.
+    #[allow(unused_variables)]
     pub async fn load_snapshot(&self, path: impl AsRef<Path>) -> Result<u64, FormatError> {
+        let start_time = Instant::now();
         let path = path.as_ref();
         info!(path = %path.display(), "Loading snapshot");
 
-        let mut reader = SnapshotReader::open(path)?;
+        let mut reader = match SnapshotReader::open(path) {
+            Ok(r) => r,
+            Err(e) => {
+                counter_inc!("crema_checkpoint_load_total", "success" => "false");
+                return Err(e);
+            }
+        };
 
         let raft_index = reader.raft_index();
         let raft_term = reader.raft_term();
@@ -664,6 +707,14 @@ impl CheckpointManager {
         // Update state
         self.last_snapshot_index.store(raft_index, Ordering::SeqCst);
         self.entries_since_snapshot.store(0, Ordering::Relaxed);
+
+        // Record metrics
+        counter_inc!("crema_checkpoint_load_total", "success" => "true");
+        histogram_record!(
+            "crema_checkpoint_load_duration_seconds",
+            start_time.elapsed().as_secs_f64()
+        );
+        gauge_set!("crema_checkpoint_entries", loaded as f64);
 
         info!(
             raft_index,
@@ -756,7 +807,8 @@ mod tests {
 
         let config = CheckpointConfig::new(dir.path())
             .with_log_threshold(100)
-            .with_time_interval(Duration::from_secs(60));
+            .with_time_interval(Duration::from_secs(60))
+            .with_min_free_space(1024 * 1024); // 1MB for tests
 
         let manager = Arc::new(CheckpointManager::new(config, storage.clone()).unwrap());
 

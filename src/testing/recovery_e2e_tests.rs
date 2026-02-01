@@ -408,7 +408,7 @@ async fn test_crash_during_snapshot_write() {
     cluster.crash_node(leader).await.unwrap();
 
     // Wait for new leader
-    let new_leader = cluster
+    let _new_leader = cluster
         .wait_for_leader(Duration::from_secs(15))
         .await
         .unwrap();
@@ -539,7 +539,7 @@ async fn test_crash_during_apply() {
     cluster.crash_node(leader).await.unwrap();
 
     // Wait for new leader
-    let new_leader = cluster
+    let _new_leader = cluster
         .wait_for_leader(Duration::from_secs(15))
         .await
         .unwrap();
@@ -576,7 +576,7 @@ async fn test_crash_during_compaction() {
     cluster.crash_node(leader).await.unwrap();
 
     // Wait for new leader
-    let new_leader = cluster
+    let _new_leader = cluster
         .wait_for_leader(Duration::from_secs(15))
         .await
         .unwrap();
@@ -906,7 +906,7 @@ async fn test_recovery_during_migration() {
     cluster.crash_node(leader).await.unwrap();
 
     // Wait for new leader
-    let new_leader = cluster
+    let _new_leader = cluster
         .wait_for_leader(Duration::from_secs(15))
         .await
         .unwrap();
@@ -943,7 +943,7 @@ async fn test_client_reconnect_after_leader_change() {
     cluster.crash_node(original_leader).await.unwrap();
 
     // Wait for new leader
-    let new_leader = cluster
+    let _new_leader = cluster
         .wait_for_leader(Duration::from_secs(15))
         .await
         .unwrap();
@@ -989,7 +989,7 @@ async fn test_router_update_after_recovery() {
     // Crash and recover the leader multiple times
     for i in 0..3 {
         cluster.crash_node(leader).await.unwrap();
-        let new_leader = cluster
+        let _new_leader = cluster
             .wait_for_leader(Duration::from_secs(15))
             .await
             .unwrap();
@@ -1200,7 +1200,7 @@ async fn test_random_crash_sequence() {
 
         // Try to write after each state change
         let leader = cluster.wait_for_leader(Duration::from_secs(10)).await;
-        if let Ok(leader) = leader {
+        if let Ok(_leader) = leader {
             let key = format!("after_change_{}", node);
             let _ = cluster.write(&key, "value").await;
         }
@@ -1231,7 +1231,7 @@ async fn test_crash_with_concurrent_writes() {
 
     // Start concurrent write task
     let write_count = Arc::new(AtomicUsize::new(0));
-    let write_count_clone = write_count.clone();
+    let _write_count_clone = write_count.clone();
 
     // Note: This test is simplified due to borrow checker constraints
     // In a real scenario, we'd use proper async patterns
@@ -1240,7 +1240,7 @@ async fn test_crash_with_concurrent_writes() {
     cluster.crash_node(leader).await.unwrap();
 
     // Wait for new leader
-    let new_leader = cluster
+    let _new_leader = cluster
         .wait_for_leader(Duration::from_secs(15))
         .await
         .unwrap();

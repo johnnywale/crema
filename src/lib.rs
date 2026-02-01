@@ -139,6 +139,16 @@ pub use metrics::{
     RAFT_LATENCY_BUCKETS,
 };
 
+// Re-export new metrics infrastructure
+pub use metrics::{
+    global_registry, init_global_registry, install_global_recorder, install_recorder,
+    prometheus_handle, render_prometheus, MetricsConfig, MetricsRegistry, PrometheusConfig,
+    PrometheusHandle, TimerGuard,
+};
+
+// Note: Facade macros (counter_inc!, gauge_set!, etc.) are already exported
+// at crate root via #[macro_export] in metrics/facade.rs
+
 // Re-export testing types
 pub use testing::{
     ChaosAction, ChaosConfig, ChaosController, ChaosRunner, ChaosScenario, ChaosStats,

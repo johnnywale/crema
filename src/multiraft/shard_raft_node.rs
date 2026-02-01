@@ -2,6 +2,14 @@
 //!
 //! This module provides a shard-aware wrapper around RaftNode that enables
 //! per-shard Raft consensus in a Multi-Raft setup.
+//!
+//! # Command Tagging
+//!
+//! Commands are tagged to distinguish between cache commands and migration
+//! commands in the Raft log:
+//!
+//! - `0x01`: Cache commands (Put, Delete, Clear, Get)
+//! - `0x02`: Migration commands (Claim, Prepared, Completed, Cleaned)
 
 use crate::cache::storage::CacheStorage;
 use crate::config::{ShardRaftConfig, ShardReadMode};
@@ -11,14 +19,98 @@ use crate::error::{Error, RaftError, Result};
 use crate::types::{CacheCommand, NodeId, ProposalResult};
 use parking_lot::RwLock;
 use raft::prelude::Message as RaftMessage;
+use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
 
+use super::migration_state_machine::MigrationStateMachine;
 use super::shard::ShardId;
 use super::shard_transport::{ShardRaftTransport, ShardTransportMultiplexer};
+use super::slot_migration::MigrationRaftCommand;
+
+// ==================== Command Tagging Constants ====================
+
+/// Tag byte for cache commands.
+const CACHE_COMMAND_TAG: u8 = 0x01;
+
+/// Tag byte for migration commands.
+const MIGRATION_COMMAND_TAG: u8 = 0x02;
+
+// ==================== ShardRaftCommand ====================
+
+/// Unified command type for shard Raft.
+///
+/// Commands are tagged for serialization to distinguish between
+/// cache commands and migration commands in the Raft log.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum ShardRaftCommand {
+    /// Cache operation (Put, Delete, Clear, Get).
+    Cache(CacheCommand),
+
+    /// Migration coordination command (Claim, Prepared, Completed, Cleaned).
+    Migration(MigrationRaftCommand),
+}
+
+impl ShardRaftCommand {
+    /// Serialize the command to bytes with a tag prefix.
+    ///
+    /// Format: `[tag: u8][payload: bincode bytes]`
+    pub fn to_bytes(&self) -> Result<Vec<u8>> {
+        match self {
+            ShardRaftCommand::Cache(cmd) => {
+                // Cache commands use their existing serialization
+                let payload = cmd.to_bytes()?;
+                let mut data = Vec::with_capacity(1 + payload.len());
+                data.push(CACHE_COMMAND_TAG);
+                data.extend(payload);
+                Ok(data)
+            }
+            ShardRaftCommand::Migration(cmd) => {
+                let payload = bincode::serialize(cmd)?;
+                let mut data = Vec::with_capacity(1 + payload.len());
+                data.push(MIGRATION_COMMAND_TAG);
+                data.extend(payload);
+                Ok(data)
+            }
+        }
+    }
+
+    /// Deserialize a command from bytes.
+    ///
+    /// Supports both tagged format and legacy untagged cache commands.
+    pub fn from_bytes(data: &[u8]) -> Result<Self> {
+        if data.is_empty() {
+            return Err(Error::Internal("Empty command data".into()));
+        }
+
+        match data[0] {
+            CACHE_COMMAND_TAG => {
+                let cmd = CacheCommand::from_bytes(&data[1..])?;
+                Ok(Self::Cache(cmd))
+            }
+            MIGRATION_COMMAND_TAG => {
+                let cmd: MigrationRaftCommand = bincode::deserialize(&data[1..])?;
+                Ok(Self::Migration(cmd))
+            }
+            _ => {
+                // Legacy format: untagged cache command (for backwards compatibility)
+                let cmd = CacheCommand::from_bytes(data)?;
+                Ok(Self::Cache(cmd))
+            }
+        }
+    }
+
+    /// Get the command type name for logging.
+    pub fn name(&self) -> &'static str {
+        match self {
+            ShardRaftCommand::Cache(_) => "Cache",
+            ShardRaftCommand::Migration(cmd) => cmd.name(),
+        }
+    }
+}
 
 /// A shard-aware RaftNode wrapper.
 ///
@@ -79,6 +171,10 @@ pub struct ShardRaftNode {
 
     /// Current epoch for leader tracking.
     epoch: AtomicU64,
+
+    /// Migration state machine for coordinating slot migrations.
+    /// Applied when migration commands are committed through this shard's Raft.
+    migration_state_machine: Arc<MigrationStateMachine>,
 }
 
 impl ShardRaftNode {
@@ -126,6 +222,9 @@ impl ShardRaftNode {
 
         let peer_set: HashSet<NodeId> = peers.into_iter().collect();
 
+        // Create migration state machine for this shard
+        let migration_state_machine = Arc::new(MigrationStateMachine::new());
+
         let shard_node = Arc::new(Self {
             shard_id,
             node_id,
@@ -138,6 +237,7 @@ impl ShardRaftNode {
             running: AtomicBool::new(false),
             peers: RwLock::new(peer_set),
             epoch: AtomicU64::new(0),
+            migration_state_machine,
         });
 
         tracing::info!(shard_id, node_id, "Created ShardRaftNode");
@@ -225,6 +325,11 @@ impl ShardRaftNode {
         self.peers.write().remove(&peer_id);
     }
 
+    /// Get the migration state machine.
+    pub fn migration_state_machine(&self) -> &Arc<MigrationStateMachine> {
+        &self.migration_state_machine
+    }
+
     /// Propose a cache command to this shard's Raft group.
     ///
     /// This method proposes the command and waits for it to be committed.
@@ -239,6 +344,45 @@ impl ShardRaftNode {
 
         // Propose via the underlying RaftNode
         self.raft_node.propose(command).await
+    }
+
+    /// Propose a migration command to this shard's Raft group.
+    ///
+    /// Migration commands are used to coordinate slot migrations. They are
+    /// proposed through the **target shard's Raft** to ensure the target has
+    /// the authoritative migration state (the source may be removed).
+    ///
+    /// This method proposes the command and waits for it to be committed.
+    /// If this node is not the leader, returns NotLeader error with leader hint.
+    ///
+    /// # Arguments
+    ///
+    /// * `command` - The migration command to propose (Claim, Prepared, Completed, or Cleaned)
+    ///
+    /// # Returns
+    ///
+    /// Returns the proposal result containing the commit index and term.
+    pub async fn propose_migration(&self, command: MigrationRaftCommand) -> Result<ProposalResult> {
+        if !self.is_leader() {
+            return Err(RaftError::NotLeader {
+                leader: self.leader_id(),
+            }
+            .into());
+        }
+
+        tracing::debug!(
+            shard_id = self.shard_id,
+            command = command.name(),
+            migration_id = %command.migration_id(),
+            "Proposing migration command"
+        );
+
+        // Wrap in ShardRaftCommand and serialize
+        let shard_cmd = ShardRaftCommand::Migration(command);
+        let data = shard_cmd.to_bytes()?;
+
+        // Propose raw bytes via the underlying RaftNode
+        self.raft_node.propose_raw(data).await
     }
 
     /// Step a Raft message into this shard's RaftNode.
@@ -473,6 +617,7 @@ mod tests {
     use super::*;
     use crate::config::CacheConfig;
     use crate::consensus::transport::RaftTransport;
+    use crate::multiraft::slot_migration::MigrationId;
 
     #[tokio::test]
     async fn test_shard_raft_node_creation() {
@@ -499,5 +644,140 @@ mod tests {
         assert_eq!(shard_node.shard_id(), shard_id);
         assert_eq!(shard_node.node_id(), node_id);
         assert!(!shard_node.is_running());
+    }
+
+    #[test]
+    fn test_shard_raft_command_cache_roundtrip() {
+        // Test that cache commands can be serialized and deserialized
+        let cmd = CacheCommand::put(b"test_key".to_vec(), b"test_value".to_vec());
+        let shard_cmd = ShardRaftCommand::Cache(cmd.clone());
+
+        let bytes = shard_cmd.to_bytes().unwrap();
+
+        // Verify tag prefix
+        assert_eq!(bytes[0], CACHE_COMMAND_TAG, "First byte should be cache command tag");
+
+        // Roundtrip
+        let decoded = ShardRaftCommand::from_bytes(&bytes).unwrap();
+        match decoded {
+            ShardRaftCommand::Cache(decoded_cmd) => {
+                assert_eq!(decoded_cmd, cmd);
+            }
+            ShardRaftCommand::Migration(_) => {
+                panic!("Expected Cache command, got Migration");
+            }
+        }
+    }
+
+    #[test]
+    fn test_shard_raft_command_migration_roundtrip() {
+        // Test that migration commands can be serialized and deserialized
+        let migration_id = MigrationId {
+            slot_id: 42,
+            epoch: 1,
+        };
+        let expected_slot_id = migration_id.slot_id;
+        let expected_epoch = migration_id.epoch;
+
+        let cmd = MigrationRaftCommand::Claim {
+            migration_id,
+            leader_id: 1,
+        };
+        let shard_cmd = ShardRaftCommand::Migration(cmd);
+
+        let bytes = shard_cmd.to_bytes().unwrap();
+
+        // Verify tag prefix
+        assert_eq!(
+            bytes[0], MIGRATION_COMMAND_TAG,
+            "First byte should be migration command tag"
+        );
+
+        // Roundtrip
+        let decoded = ShardRaftCommand::from_bytes(&bytes).unwrap();
+        match decoded {
+            ShardRaftCommand::Migration(decoded_cmd) => {
+                let decoded_id = decoded_cmd.migration_id();
+                assert_eq!(decoded_id.slot_id, expected_slot_id);
+                assert_eq!(decoded_id.epoch, expected_epoch);
+            }
+            ShardRaftCommand::Cache(_) => {
+                panic!("Expected Migration command, got Cache");
+            }
+        }
+    }
+
+    #[test]
+    fn test_shard_raft_command_legacy_untagged_format() {
+        // Test backwards compatibility: untagged data should be parsed as cache command
+        // Note: This only works reliably for Put commands (discriminant 0x00) because
+        // bincode uses 4-byte little-endian discriminants, and:
+        // - Put = [0x00, ...] - doesn't match any tag
+        // - Delete = [0x01, ...] - matches CACHE_COMMAND_TAG (0x01)
+        // - Clear = [0x02, ...] - matches MIGRATION_COMMAND_TAG (0x02)
+        // So we test with Put which is the most common command anyway.
+        let cmd = CacheCommand::put(b"old_key".to_vec(), b"old_value".to_vec());
+        let legacy_bytes = cmd.to_bytes().unwrap(); // No tag prefix
+
+        // Verify first byte is 0x00 (Put discriminant), not a tag
+        assert_eq!(
+            legacy_bytes[0], 0x00,
+            "Put command should start with discriminant 0x00"
+        );
+
+        // Should be parsed as cache command via legacy path
+        let decoded = ShardRaftCommand::from_bytes(&legacy_bytes).unwrap();
+        match decoded {
+            ShardRaftCommand::Cache(decoded_cmd) => {
+                assert_eq!(decoded_cmd, cmd);
+            }
+            ShardRaftCommand::Migration(_) => {
+                panic!("Expected Cache command from legacy format");
+            }
+        }
+    }
+
+    #[test]
+    fn test_migration_command_not_parsed_as_clear() {
+        // This test verifies the bug fix: migration commands should NOT be
+        // misinterpreted as CacheCommand::Clear by bincode.
+        //
+        // The bug occurred because:
+        // 1. Migration commands start with tag 0x02
+        // 2. CacheCommand enum: Put=0, Delete=1, Clear=2, Get=3
+        // 3. bincode saw 0x02 and interpreted it as Clear discriminant
+
+        let migration_id = MigrationId {
+            slot_id: 100,
+            epoch: 5,
+        };
+        let migration_cmd = MigrationRaftCommand::Claim {
+            migration_id,
+            leader_id: 3,
+        };
+        let shard_cmd = ShardRaftCommand::Migration(migration_cmd);
+        let bytes = shard_cmd.to_bytes().unwrap();
+
+        // Verify first byte is migration tag
+        assert_eq!(bytes[0], 0x02);
+
+        // ShardRaftCommand should correctly parse this as Migration
+        let decoded = ShardRaftCommand::from_bytes(&bytes).unwrap();
+        assert!(
+            matches!(decoded, ShardRaftCommand::Migration(_)),
+            "Should be parsed as Migration, not Cache"
+        );
+
+        // If we incorrectly try to parse the full bytes as CacheCommand,
+        // it would be interpreted as Clear (discriminant 2)
+        let wrong_parse = CacheCommand::from_bytes(&bytes);
+        if let Ok(cmd) = wrong_parse {
+            // This demonstrates the bug - without proper tag handling,
+            // migration commands get misinterpreted as Clear
+            assert!(
+                matches!(cmd, CacheCommand::Clear),
+                "Raw migration bytes incorrectly parse as Clear"
+            );
+        }
     }
 }

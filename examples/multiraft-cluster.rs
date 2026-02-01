@@ -169,7 +169,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         // After some time, show shard distribution
         if i == 15 && cache.is_multiraft_enabled() {
-            if let Some(coordinator) = cache.multiraft_coordinator() {
+            if let Some(_coordinator) = cache.multiraft_coordinator() {
                 println!();
                 println!("Shard Leader Distribution:");
                 // Note: In a real scenario, you would track shard leaders

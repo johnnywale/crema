@@ -2,6 +2,7 @@ use crate::error::{NetworkError, Result};
 use crate::network::rpc::{encode_message_into, Message, RaftMessageWrapper};
 use crate::types::NodeId;
 use crate::Error;
+use crate::{counter_inc, gauge_set, histogram_record_duration};
 use bytes::BytesMut;
 use futures::future::BoxFuture;
 use parking_lot::RwLock;
@@ -305,6 +306,90 @@ impl TransportMetrics {
         self.total_send_latency_us
             .fetch_add(latency.as_micros() as u64, Ordering::Relaxed);
         self.send_count_for_latency.fetch_add(1, Ordering::Relaxed);
+
+        // Also record to new metrics facade
+        histogram_record_duration!(
+            crate::metrics::descriptors::TRANSPORT_SEND_DURATION_SECONDS,
+            latency
+        );
+    }
+
+    /// Record a successful message send to the new metrics facade.
+    pub fn record_message_sent(&self, priority: MessagePriority) {
+        self.messages_sent.fetch_add(1, Ordering::Relaxed);
+        match priority {
+            MessagePriority::High => {
+                self.high_priority_sent.fetch_add(1, Ordering::Relaxed);
+                counter_inc!(
+                    crate::metrics::descriptors::TRANSPORT_MESSAGES_SENT_TOTAL,
+                    "priority" => "high"
+                );
+            }
+            MessagePriority::Normal => {
+                self.normal_priority_sent.fetch_add(1, Ordering::Relaxed);
+                counter_inc!(
+                    crate::metrics::descriptors::TRANSPORT_MESSAGES_SENT_TOTAL,
+                    "priority" => "normal"
+                );
+            }
+        }
+    }
+
+    /// Record a failed message send.
+    #[allow(unused_variables)]
+    pub fn record_message_failed(&self, reason: &str) {
+        self.messages_failed.fetch_add(1, Ordering::Relaxed);
+        let reason_owned = reason.to_string();
+        counter_inc!(
+            crate::metrics::descriptors::TRANSPORT_MESSAGES_FAILED_TOTAL,
+            "reason" => reason_owned
+        );
+    }
+
+    /// Record a connection created.
+    pub fn record_connection_created(&self) {
+        self.connections_created.fetch_add(1, Ordering::Relaxed);
+        self.active_connections.fetch_add(1, Ordering::Relaxed);
+        counter_inc!(crate::metrics::descriptors::TRANSPORT_CONNECTIONS_CREATED_TOTAL);
+        gauge_set!(
+            crate::metrics::descriptors::TRANSPORT_CONNECTIONS_ACTIVE,
+            self.active_connections.load(Ordering::Relaxed) as f64
+        );
+    }
+
+    /// Record a connection closed.
+    pub fn record_connection_closed(&self) {
+        self.active_connections.fetch_sub(1, Ordering::Relaxed);
+        gauge_set!(
+            crate::metrics::descriptors::TRANSPORT_CONNECTIONS_ACTIVE,
+            self.active_connections.load(Ordering::Relaxed) as f64
+        );
+    }
+
+    /// Record a connection failure.
+    #[allow(unused_variables)]
+    pub fn record_connection_failed(&self, reason: &str) {
+        self.connections_failed.fetch_add(1, Ordering::Relaxed);
+        let reason_owned = reason.to_string();
+        counter_inc!(
+            crate::metrics::descriptors::TRANSPORT_CONNECTIONS_FAILED_TOTAL,
+            "reason" => reason_owned
+        );
+    }
+
+    /// Record a queue full event.
+    #[allow(unused_variables)]
+    pub fn record_queue_full(&self, priority: MessagePriority) {
+        self.messages_dropped_queue_full
+            .fetch_add(1, Ordering::Relaxed);
+        let priority_str = match priority {
+            MessagePriority::High => "high",
+            MessagePriority::Normal => "normal",
+        };
+        counter_inc!(
+            crate::metrics::descriptors::TRANSPORT_QUEUE_FULL_TOTAL,
+            "priority" => priority_str
+        );
     }
 }
 

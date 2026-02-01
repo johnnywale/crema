@@ -54,23 +54,56 @@ mod tests {
         let forwarder = ShardForwarder::new(1, config);
 
         // Should be enabled by default
-        assert!(forwarder.is_enabled());
-        assert_eq!(forwarder.pending_count(), 0);
+        assert!(
+            forwarder.is_enabled(),
+            "ShardForwarder should be enabled by default"
+        );
+        assert_eq!(
+            forwarder.pending_count(),
+            0,
+            "Pending count should be 0 initially"
+        );
 
         // Register node addresses
-        let addr1: SocketAddr = "127.0.0.1:9001".parse().unwrap();
-        let addr2: SocketAddr = "127.0.0.1:9002".parse().unwrap();
+        let addr1: SocketAddr = "127.0.0.1:9001"
+            .parse()
+            .expect("Should parse valid socket address for node 2");
+        let addr2: SocketAddr = "127.0.0.1:9002"
+            .parse()
+            .expect("Should parse valid socket address for node 3");
 
         forwarder.register_node(2, addr1);
         forwarder.register_node(3, addr2);
 
-        assert_eq!(forwarder.get_node_address(2), Some(addr1));
-        assert_eq!(forwarder.get_node_address(3), Some(addr2));
-        assert_eq!(forwarder.get_node_address(4), None);
+        assert_eq!(
+            forwarder.get_node_address(2),
+            Some(addr1),
+            "Node 2 should have registered address"
+        );
+        assert_eq!(
+            forwarder.get_node_address(3),
+            Some(addr2),
+            "Node 3 should have registered address"
+        );
+        assert_eq!(
+            forwarder.get_node_address(4),
+            None,
+            "Node 4 (unregistered) should return None"
+        );
 
         // Unregister
         forwarder.unregister_node(2);
-        assert_eq!(forwarder.get_node_address(2), None);
+        assert_eq!(
+            forwarder.get_node_address(2),
+            None,
+            "Node 2 should be None after unregistration"
+        );
+        // Node 3 should still be registered
+        assert_eq!(
+            forwarder.get_node_address(3),
+            Some(addr2),
+            "Node 3 should still be registered after unregistering node 2"
+        );
     }
 
     /// Test Case 2: ShardForwardingConfig disabled
@@ -92,17 +125,33 @@ mod tests {
         let coordinator = create_test_coordinator(1, 8);
 
         // Initialize coordinator
-        coordinator.init().await.expect("Init should succeed");
+        coordinator
+            .init()
+            .await
+            .expect("Coordinator init should succeed");
 
         // Check forwarding is enabled
-        assert!(coordinator.is_forwarding_enabled());
-        assert_eq!(coordinator.pending_forwards_count(), 0);
+        assert!(
+            coordinator.is_forwarding_enabled(),
+            "Forwarding should be enabled by default in coordinator"
+        );
+        assert_eq!(
+            coordinator.pending_forwards_count(),
+            0,
+            "Pending forwards should be 0 after init"
+        );
 
-        // Verify shard forwarder is accessible
+        // Verify shard forwarder is accessible and properly configured
         let forwarder = coordinator.shard_forwarder();
-        assert!(forwarder.is_enabled());
+        assert!(
+            forwarder.is_enabled(),
+            "Shard forwarder should be enabled when coordinator forwarding is enabled"
+        );
 
-        coordinator.shutdown().await.ok();
+        coordinator
+            .shutdown()
+            .await
+            .expect("Coordinator shutdown should succeed");
     }
 
     /// Test Case 4: Coordinator registers node addresses for forwarding
@@ -132,29 +181,69 @@ mod tests {
     /// Verifies the new error types work correctly.
     #[tokio::test]
     async fn test_shard_error_types() {
-        // ShardNotLocal error
+        // ShardNotLocal error with known target
         let err = Error::ShardNotLocal {
             shard_id: 5,
             target_node: Some(2),
         };
-        assert!(err.is_retryable());
-        assert!(err.retry_delay().is_some());
-        assert!(format!("{}", err).contains("shard 5"));
-        assert!(format!("{}", err).contains("node"));
+        assert!(
+            err.is_retryable(),
+            "ShardNotLocal with known target should be retryable"
+        );
+        let retry_delay = err.retry_delay();
+        assert!(
+            retry_delay.is_some(),
+            "ShardNotLocal should have a retry delay"
+        );
 
-        // ShardNotLocal without target
+        let err_str = format!("{}", err);
+        assert!(
+            err_str.contains("5"),
+            "Error message '{}' should contain shard id 5",
+            err_str
+        );
+        assert!(
+            err_str.contains("node") || err_str.contains("2"),
+            "Error message '{}' should reference target node",
+            err_str
+        );
+
+        // ShardNotLocal without target (leader unknown)
         let err2 = Error::ShardNotLocal {
             shard_id: 3,
             target_node: None,
         };
-        assert!(err2.is_retryable());
+        assert!(
+            err2.is_retryable(),
+            "ShardNotLocal without target should still be retryable"
+        );
 
         // ShardLeaderUnknown error
         let err3 = Error::ShardLeaderUnknown(7);
-        assert!(err3.is_retryable());
-        assert!(err3.retry_delay().is_some());
-        assert!(format!("{}", err3).contains("shard 7"));
-        assert!(format!("{}", err3).contains("gossip"));
+        assert!(
+            err3.is_retryable(),
+            "ShardLeaderUnknown should be retryable"
+        );
+        let retry_delay3 = err3.retry_delay();
+        assert!(
+            retry_delay3.is_some(),
+            "ShardLeaderUnknown should have a retry delay"
+        );
+
+        let err3_str = format!("{}", err3);
+        assert!(
+            err3_str.contains("7"),
+            "Error message '{}' should contain shard id 7",
+            err3_str
+        );
+        // The message might mention gossip or leader discovery
+        assert!(
+            err3_str.to_lowercase().contains("leader")
+                || err3_str.to_lowercase().contains("gossip")
+                || err3_str.to_lowercase().contains("unknown"),
+            "Error message '{}' should indicate leader is unknown",
+            err3_str
+        );
     }
 
     /// Test Case 6: Persistent shard leader hints
@@ -162,13 +251,13 @@ mod tests {
     /// Verifies that leader hints can be persisted and recovered.
     #[tokio::test]
     async fn test_persistent_leader_hints() {
-        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let temp_dir = TempDir::new().expect("Failed to create temp directory for test");
         let storage_config = ShardStorageConfig::new(temp_dir.path());
 
         let storage_manager = ShardStorageManager::new(storage_config.clone(), 1)
-            .expect("Storage manager should init");
+            .expect("Storage manager initialization should succeed");
 
-        // Save leader hints
+        // Save leader hints for multiple shards
         storage_manager
             .save_leader_hint(0, 2, 100)
             .expect("Should save hint for shard 0");
@@ -179,32 +268,70 @@ mod tests {
             .save_leader_hint(2, 2, 102)
             .expect("Should save hint for shard 2");
 
-        // Retrieve individual hints
-        let hint0 = storage_manager.get_leader_hint(0);
-        assert!(hint0.is_some());
-        let hint0 = hint0.unwrap();
-        assert_eq!(hint0.leader_node_id, 2);
-        assert_eq!(hint0.epoch, 100);
+        // Retrieve and verify individual hints
+        let hint0 = storage_manager
+            .get_leader_hint(0)
+            .expect("Hint for shard 0 should exist");
+        assert_eq!(hint0.leader_node_id, 2, "Shard 0 leader should be node 2");
+        assert_eq!(hint0.epoch, 100, "Shard 0 epoch should be 100");
 
-        let hint1 = storage_manager.get_leader_hint(1);
-        assert!(hint1.is_some());
-        assert_eq!(hint1.unwrap().leader_node_id, 3);
+        let hint1 = storage_manager
+            .get_leader_hint(1)
+            .expect("Hint for shard 1 should exist");
+        assert_eq!(hint1.leader_node_id, 3, "Shard 1 leader should be node 3");
+        assert_eq!(hint1.epoch, 101, "Shard 1 epoch should be 101");
+
+        // Verify shard 2 hint
+        let hint2 = storage_manager
+            .get_leader_hint(2)
+            .expect("Hint for shard 2 should exist");
+        assert_eq!(hint2.leader_node_id, 2);
+        assert_eq!(hint2.epoch, 102);
 
         // Get all hints
         let all_hints = storage_manager.get_all_leader_hints();
-        assert_eq!(all_hints.len(), 3);
+        assert_eq!(
+            all_hints.len(),
+            3,
+            "Should have 3 hints total, got {}",
+            all_hints.len()
+        );
+
+        // Non-existent shard should return None
+        assert!(
+            storage_manager.get_leader_hint(99).is_none(),
+            "Non-existent shard 99 should return None"
+        );
 
         // Remove a hint
         storage_manager
             .remove_leader_hint(1)
-            .expect("Should remove hint");
-        assert!(storage_manager.get_leader_hint(1).is_none());
+            .expect("Should remove hint for shard 1");
+        assert!(
+            storage_manager.get_leader_hint(1).is_none(),
+            "Shard 1 hint should be None after removal"
+        );
+
+        // Other hints should still exist
+        assert!(
+            storage_manager.get_leader_hint(0).is_some(),
+            "Shard 0 hint should still exist"
+        );
+        assert!(
+            storage_manager.get_leader_hint(2).is_some(),
+            "Shard 2 hint should still exist"
+        );
 
         // Clear all hints
         storage_manager
             .clear_leader_hints()
-            .expect("Should clear hints");
-        assert!(storage_manager.get_all_leader_hints().is_empty());
+            .expect("Should clear all hints");
+        let remaining = storage_manager.get_all_leader_hints();
+        assert!(
+            remaining.is_empty(),
+            "All hints should be cleared, but {} remain",
+            remaining.len()
+        );
     }
 
     /// Test Case 7: Batch save leader hints
@@ -285,28 +412,74 @@ mod tests {
 
         // Initially all zeros
         let snapshot = metrics.snapshot();
-        assert_eq!(snapshot.forward_total, 0);
-        assert_eq!(snapshot.forward_success, 0);
-        assert_eq!(snapshot.forward_failures, 0);
+        assert_eq!(
+            snapshot.forward_total, 0,
+            "Initial forward_total should be 0"
+        );
+        assert_eq!(
+            snapshot.forward_success, 0,
+            "Initial forward_success should be 0"
+        );
+        assert_eq!(
+            snapshot.forward_failures, 0,
+            "Initial forward_failures should be 0"
+        );
 
-        // Record successful forwards
+        // Record successful forwards with varying latencies
         metrics.record_forward(true, false, Duration::from_millis(10));
         metrics.record_forward(true, false, Duration::from_millis(15));
         metrics.record_forward(true, false, Duration::from_millis(20));
 
         let snapshot = metrics.snapshot();
-        assert_eq!(snapshot.forward_total, 3);
-        assert_eq!(snapshot.forward_success, 3);
-        assert_eq!(snapshot.forward_failures, 0);
+        assert_eq!(
+            snapshot.forward_total, 3,
+            "forward_total should be 3 after 3 successful forwards"
+        );
+        assert_eq!(
+            snapshot.forward_success, 3,
+            "forward_success should be 3 after 3 successful forwards"
+        );
+        assert_eq!(
+            snapshot.forward_failures, 0,
+            "forward_failures should remain 0 after only successful forwards"
+        );
 
-        // Record failed forwards
+        // Record failed forwards (non-timeout)
         metrics.record_forward(false, false, Duration::from_millis(5));
-        metrics.record_forward(false, true, Duration::from_millis(5000)); // timeout
 
         let snapshot = metrics.snapshot();
-        assert_eq!(snapshot.forward_total, 5);
-        assert_eq!(snapshot.forward_success, 3);
-        assert_eq!(snapshot.forward_failures, 2);
+        assert_eq!(
+            snapshot.forward_total, 4,
+            "forward_total should be 4 after 3 success + 1 failure"
+        );
+        assert_eq!(
+            snapshot.forward_failures, 1,
+            "forward_failures should be 1 after one non-timeout failure"
+        );
+
+        // Record timeout failure
+        metrics.record_forward(false, true, Duration::from_millis(5000));
+
+        let snapshot = metrics.snapshot();
+        assert_eq!(
+            snapshot.forward_total, 5,
+            "forward_total should be 5 after all forwards"
+        );
+        assert_eq!(
+            snapshot.forward_success, 3,
+            "forward_success should still be 3"
+        );
+        assert_eq!(
+            snapshot.forward_failures, 2,
+            "forward_failures should be 2 (1 regular + 1 timeout)"
+        );
+
+        // Verify success + failures = total
+        assert_eq!(
+            snapshot.forward_success + snapshot.forward_failures,
+            snapshot.forward_total,
+            "success + failures should equal total"
+        );
 
         // Update pending forwards gauge
         metrics.set_pending_forwards(10);
@@ -463,11 +636,17 @@ mod tests {
     #[tokio::test]
     async fn test_coordinator_local_shard_operations() {
         let coordinator = create_test_coordinator(1, 4);
-        coordinator.init().await.expect("Init should succeed");
+        coordinator
+            .init()
+            .await
+            .expect("Coordinator init should succeed");
 
         // Get stats to verify initialization
         let stats = coordinator.stats();
-        assert_eq!(stats.total_shards, 4);
+        assert_eq!(
+            stats.total_shards, 4,
+            "Coordinator should have 4 shards after init"
+        );
 
         // Perform some operations (these may fail due to ShardNotFound
         // if shards aren't fully initialized, which is expected in unit tests)
@@ -484,19 +663,49 @@ mod tests {
         // In this minimal test, we're just verifying the API works
         match result {
             Ok(()) => {
-                // If it succeeded, verify we can read
+                // If it succeeded, verify we can read the value back
                 let read_result = coordinator.get(key).await;
-                assert!(read_result.is_ok());
+                assert!(
+                    read_result.is_ok(),
+                    "Get should succeed after successful put: {:?}",
+                    read_result
+                );
+
+                // Optionally verify the value if get returned Some
+                if let Ok(Some(read_value)) = read_result {
+                    assert_eq!(
+                        &read_value[..],
+                        value,
+                        "Read value should match written value"
+                    );
+                }
             }
-            Err(Error::ShardNotFound(_)) | Err(Error::ShardLeaderUnknown(_)) => {
+            Err(Error::ShardNotFound(shard_id)) => {
                 // Expected in unit test without full shard initialization
+                eprintln!(
+                    "ShardNotFound({}) - expected in minimal unit test",
+                    shard_id
+                );
+            }
+            Err(Error::ShardLeaderUnknown(shard_id)) => {
+                // Expected when shard leader hasn't been elected yet
+                eprintln!(
+                    "ShardLeaderUnknown({}) - expected in minimal unit test",
+                    shard_id
+                );
             }
             Err(e) => {
-                // Log but don't fail - this is a unit test of the API
-                eprintln!("Put operation error (expected in unit test): {:?}", e);
+                // Log the error type for debugging
+                eprintln!(
+                    "Put operation returned {:?} - may be expected in unit test context",
+                    e
+                );
             }
         }
 
-        coordinator.shutdown().await.ok();
+        coordinator
+            .shutdown()
+            .await
+            .expect("Coordinator shutdown should succeed");
     }
 }

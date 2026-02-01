@@ -171,10 +171,10 @@ mod tests {
         let num_shards = 4u32;
         let caches = create_per_shard_cluster(21001, 22001, num_shards).await;
 
-        // Wait for cluster formation and shard leader elections
-        tokio::time::sleep(Duration::from_secs(5)).await;
+        // Wait for cluster to be ready (handles shard leader elections internally)
+        let cluster_ready = wait_for_cluster_ready(&caches, Duration::from_secs(30)).await;
 
-        // Debug: Check if per-shard Raft is enabled and show leader info
+        // Debug: Show leader info after wait
         for (idx, cache) in caches.iter().enumerate() {
             let (elected, total) = cache.shard_leader_status();
             let is_ready = cache.is_ready();
@@ -187,8 +187,10 @@ mod tests {
             );
         }
 
-        let cluster_ready = wait_for_cluster_ready(&caches, Duration::from_secs(30)).await;
-        assert!(cluster_ready, "Cluster should be ready within timeout");
+        assert!(
+            cluster_ready,
+            "Cluster should be ready within timeout. Check shard leader status above."
+        );
 
         // Write test data via node 1
         let test_keys = vec![
@@ -208,43 +210,74 @@ mod tests {
             assert!(result.is_ok(), "PUT '{}' should succeed: {:?}", key, result);
         }
 
-        // Wait for replication
-        tokio::time::sleep(Duration::from_secs(3)).await;
+        // Wait for replication with polling instead of fixed sleep
+        let replication_timeout = Duration::from_secs(15);
+        let poll_interval = Duration::from_millis(500);
+        let start = std::time::Instant::now();
+        let expected_entries = test_keys.len() as u64;
+
+        // Poll until all nodes have all keys
+        while start.elapsed() < replication_timeout {
+            tokio::time::sleep(poll_interval).await;
+
+            // Check if all nodes have all keys
+            let mut all_have_all_keys = true;
+            'outer: for cache in &caches {
+                for (key, _) in &test_keys {
+                    if cache.get(key.as_bytes()).await.is_none() {
+                        all_have_all_keys = false;
+                        break 'outer;
+                    }
+                }
+            }
+
+            if all_have_all_keys {
+                break;
+            }
+        }
 
         // Verify data on all nodes
+        let mut missing_keys: Vec<(usize, String)> = Vec::new();
         for (node_idx, cache) in caches.iter().enumerate() {
             for (key, expected_value) in &test_keys {
                 let value = cache.get(key.as_bytes()).await;
-                assert!(
-                    value.is_some(),
-                    "Node {} should have key '{}'",
-                    node_idx + 1,
-                    key
-                );
+                if value.is_none() {
+                    missing_keys.push((node_idx + 1, key.to_string()));
+                    continue;
+                }
 
                 let value_bytes = value.unwrap();
                 let actual = String::from_utf8_lossy(&value_bytes);
                 assert_eq!(
                     actual,
                     *expected_value,
-                    "Node {} key '{}' value mismatch",
+                    "Node {} key '{}' value mismatch: expected '{}', got '{}'",
                     node_idx + 1,
-                    key
+                    key,
+                    expected_value,
+                    actual
                 );
             }
         }
 
+        assert!(
+            missing_keys.is_empty(),
+            "Keys missing after replication timeout: {:?}",
+            missing_keys
+        );
+
         // Verify entry counts match across all nodes
-        let expected_entries = test_keys.len() as u64;
-        for (node_idx, cache) in caches.iter().enumerate() {
-            let stats = cache.stats();
+        let entry_counts: Vec<(usize, u64)> = caches
+            .iter()
+            .enumerate()
+            .map(|(i, c)| (i + 1, c.stats().entry_count))
+            .collect();
+
+        for (node_id, count) in &entry_counts {
             assert_eq!(
-                stats.entry_count,
-                expected_entries,
-                "Node {} should have {} entries, got {}",
-                node_idx + 1,
-                expected_entries,
-                stats.entry_count
+                *count, expected_entries,
+                "Node {} should have {} entries, got {}. All counts: {:?}",
+                node_id, expected_entries, count, entry_counts
             );
         }
 
@@ -259,11 +292,12 @@ mod tests {
         let num_shards = 4u32;
         let caches = create_per_shard_cluster(21011, 22011, num_shards).await;
 
-        // Wait for cluster formation
-        tokio::time::sleep(Duration::from_secs(5)).await;
-
+        // Wait for cluster to be ready (handles leader elections)
         let cluster_ready = wait_for_cluster_ready(&caches, Duration::from_secs(30)).await;
-        assert!(cluster_ready, "Cluster should be ready within timeout");
+        assert!(
+            cluster_ready,
+            "Cluster should be ready within timeout for entry count consistency test"
+        );
 
         // Write keys that will be distributed across all shards
         // Use a variety of key patterns to ensure even distribution
@@ -404,14 +438,20 @@ mod tests {
         let num_shards = 4u32;
         let caches = create_per_shard_cluster(21021, 22021, num_shards).await;
 
-        // Wait for cluster formation
-        tokio::time::sleep(Duration::from_secs(5)).await;
-
+        // Wait for cluster to be ready (handles leader elections)
         let cluster_ready = wait_for_cluster_ready(&caches, Duration::from_secs(30)).await;
-        assert!(cluster_ready, "Cluster should be ready within timeout");
+        assert!(
+            cluster_ready,
+            "Cluster should be ready within timeout for follower write test"
+        );
 
         // Find a follower node (not the main Raft leader)
         let follower_idx = caches.iter().position(|c| !c.is_leader()).unwrap_or(1);
+        eprintln!(
+            "Using node {} as follower for writes (is_leader: {})",
+            follower_idx + 1,
+            caches[follower_idx].is_leader()
+        );
 
         let follower_cache = &caches[follower_idx];
 
@@ -424,52 +464,95 @@ mod tests {
             ("follower-key-5", "value-5"),
         ];
 
+        let mut write_failures: Vec<String> = Vec::new();
         for (key, value) in &test_keys {
             let result = follower_cache.put(*key, *value).await;
-            assert!(
-                result.is_ok(),
-                "PUT '{}' via follower should succeed: {:?}",
-                key,
-                result
-            );
-        }
-
-        // Wait for replication
-        tokio::time::sleep(Duration::from_secs(3)).await;
-
-        // Verify data on all nodes
-        for (node_idx, cache) in caches.iter().enumerate() {
-            for (key, expected_value) in &test_keys {
-                let value = cache.get(key.as_bytes()).await;
-                assert!(
-                    value.is_some(),
-                    "Node {} should have key '{}' written via follower",
-                    node_idx + 1,
-                    key
-                );
-
-                let value_bytes = value.unwrap();
-                let actual = String::from_utf8_lossy(&value_bytes);
-                assert_eq!(
-                    actual,
-                    *expected_value,
-                    "Node {} key '{}' value mismatch",
-                    node_idx + 1,
-                    key
-                );
+            if let Err(e) = result {
+                write_failures.push(format!("PUT '{}' failed: {:?}", key, e));
             }
         }
 
-        // Verify entry counts match
+        assert!(
+            write_failures.is_empty(),
+            "Some writes via follower (node {}) failed:\n{}",
+            follower_idx + 1,
+            write_failures.join("\n")
+        );
+
+        // Wait for replication with polling
+        let replication_timeout = Duration::from_secs(15);
+        let poll_interval = Duration::from_millis(500);
+        let start = std::time::Instant::now();
         let expected_entries = test_keys.len() as u64;
-        let entry_counts: Vec<u64> = caches.iter().map(|c| c.stats().entry_count).collect();
+
+        // Poll until all nodes have all keys
+        while start.elapsed() < replication_timeout {
+            tokio::time::sleep(poll_interval).await;
+
+            // Check if all nodes have all keys
+            let mut all_have_all_keys = true;
+            'outer: for cache in &caches {
+                for (key, _) in &test_keys {
+                    if cache.get(key.as_bytes()).await.is_none() {
+                        all_have_all_keys = false;
+                        break 'outer;
+                    }
+                }
+            }
+
+            if all_have_all_keys {
+                break;
+            }
+        }
+
+        // Verify data on all nodes
+        let mut verification_errors: Vec<String> = Vec::new();
+        for (node_idx, cache) in caches.iter().enumerate() {
+            for (key, expected_value) in &test_keys {
+                let value = cache.get(key.as_bytes()).await;
+                if value.is_none() {
+                    verification_errors.push(format!(
+                        "Node {} missing key '{}' written via follower",
+                        node_idx + 1,
+                        key
+                    ));
+                    continue;
+                }
+
+                let value_bytes = value.unwrap();
+                let actual = String::from_utf8_lossy(&value_bytes);
+                if actual != *expected_value {
+                    verification_errors.push(format!(
+                        "Node {} key '{}': expected '{}', got '{}'",
+                        node_idx + 1,
+                        key,
+                        expected_value,
+                        actual
+                    ));
+                }
+            }
+        }
 
         assert!(
-            entry_counts.iter().all(|c| *c == expected_entries),
-            "All nodes should have {} entries: {:?}",
-            expected_entries,
-            entry_counts
+            verification_errors.is_empty(),
+            "Verification failed after follower writes:\n{}",
+            verification_errors.join("\n")
         );
+
+        // Verify entry counts match
+        let entry_counts: Vec<(usize, u64)> = caches
+            .iter()
+            .enumerate()
+            .map(|(i, c)| (i + 1, c.stats().entry_count))
+            .collect();
+
+        for (node_id, count) in &entry_counts {
+            assert_eq!(
+                *count, expected_entries,
+                "Node {} should have {} entries after follower writes, got {}. All counts: {:?}",
+                node_id, expected_entries, count, entry_counts
+            );
+        }
 
         shutdown_cluster(caches).await;
     }
@@ -482,37 +565,54 @@ mod tests {
         let num_shards = 4u32;
         let caches = create_per_shard_cluster(21031, 22031, num_shards).await;
 
-        // Wait for cluster formation and shard leader elections
-        tokio::time::sleep(Duration::from_secs(5)).await;
-
+        // Wait for cluster to be ready (handles shard leader elections)
         let cluster_ready = wait_for_cluster_ready(&caches, Duration::from_secs(30)).await;
-        assert!(cluster_ready, "Cluster should be ready within timeout");
+        assert!(
+            cluster_ready,
+            "Cluster should be ready within timeout for leader consistency test"
+        );
 
-        // Collect shard leader info from each node
-        let mut leader_maps: Vec<HashMap<u32, Option<u64>>> = Vec::new();
+        // Poll until all nodes agree on shard leaders (eventually consistent)
+        let leader_consistency_timeout = Duration::from_secs(15);
+        let poll_interval = Duration::from_millis(500);
+        let start = std::time::Instant::now();
 
-        for cache in &caches {
-            if let Some(coordinator) = cache.multiraft_coordinator() {
-                let leaders = coordinator.shard_leaders();
-                leader_maps.push(leaders);
-            }
-        }
-
-        // Verify all nodes agree on shard leaders (eventually consistent)
-        // Note: There might be slight delays in leader info propagation
-        tokio::time::sleep(Duration::from_secs(2)).await;
-
-        // Re-collect after waiting
+        let mut all_consistent = false;
         let mut final_leader_maps: Vec<HashMap<u32, Option<u64>>> = Vec::new();
 
-        for cache in &caches {
-            if let Some(coordinator) = cache.multiraft_coordinator() {
-                let leaders = coordinator.shard_leaders();
-                final_leader_maps.push(leaders);
+        while start.elapsed() < leader_consistency_timeout && !all_consistent {
+            tokio::time::sleep(poll_interval).await;
+
+            // Collect leader info from all nodes
+            final_leader_maps.clear();
+            for cache in &caches {
+                if let Some(coordinator) = cache.multiraft_coordinator() {
+                    let leaders = coordinator.shard_leaders();
+                    final_leader_maps.push(leaders);
+                }
+            }
+
+            // Check consistency
+            all_consistent = true;
+            for shard_id in 0..num_shards {
+                let leaders: Vec<Option<u64>> = final_leader_maps
+                    .iter()
+                    .map(|m| *m.get(&shard_id).unwrap_or(&None))
+                    .collect();
+
+                // All must have a leader and agree
+                if leaders.iter().any(|l| l.is_none()) {
+                    all_consistent = false;
+                    break;
+                }
+                if !leaders.windows(2).all(|w| w[0] == w[1]) {
+                    all_consistent = false;
+                    break;
+                }
             }
         }
 
-        // Check each shard has a leader on all nodes
+        // Final verification with detailed error messages
         for shard_id in 0..num_shards {
             let leaders_for_shard: Vec<Option<u64>> = final_leader_maps
                 .iter()
@@ -520,28 +620,37 @@ mod tests {
                 .collect();
 
             // All nodes should report a leader for this shard
-            for (node_idx, leader) in leaders_for_shard.iter().enumerate() {
-                assert!(
-                    leader.is_some(),
-                    "Node {} should know leader for shard {}",
-                    node_idx + 1,
-                    shard_id
-                );
-            }
+            let missing_leader_nodes: Vec<usize> = leaders_for_shard
+                .iter()
+                .enumerate()
+                .filter(|(_, l)| l.is_none())
+                .map(|(i, _)| i + 1)
+                .collect();
+
+            assert!(
+                missing_leader_nodes.is_empty(),
+                "Shard {} has no leader on nodes: {:?}. All leader info: {:?}",
+                shard_id,
+                missing_leader_nodes,
+                leaders_for_shard
+            );
 
             // All nodes should agree on the same leader
             let first_leader = leaders_for_shard[0];
-            for (node_idx, leader) in leaders_for_shard.iter().enumerate() {
-                assert_eq!(
-                    *leader,
-                    first_leader,
-                    "Shard {} leader mismatch: Node 1 sees {:?}, Node {} sees {:?}",
-                    shard_id,
-                    first_leader,
-                    node_idx + 1,
-                    leader
-                );
-            }
+            let disagreeing_nodes: Vec<(usize, Option<u64>)> = leaders_for_shard
+                .iter()
+                .enumerate()
+                .filter(|(_, l)| **l != first_leader)
+                .map(|(i, l)| (i + 1, *l))
+                .collect();
+
+            assert!(
+                disagreeing_nodes.is_empty(),
+                "Shard {} leader inconsistency: Node 1 sees {:?}, but nodes {:?} disagree",
+                shard_id,
+                first_leader,
+                disagreeing_nodes
+            );
         }
 
         shutdown_cluster(caches).await;

@@ -1456,7 +1456,7 @@ mod tests {
         orch.set_data_transporter(Arc::new(NoOpDataTransporter));
 
         let movement = ShardMovement::new(0, 1, 2, MovementType::AddReplica);
-        let migration_id = orch.start_migration(movement, None).await.unwrap();
+        let _migration_id = orch.start_migration(movement, None).await.unwrap();
 
         assert!(orch.is_orchestrating(0));
         assert_eq!(orch.active_orchestrations().len(), 1);

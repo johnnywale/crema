@@ -190,6 +190,64 @@
             </div>
         </div>
 
+        <!-- Cluster Shard Comparison (shown only if multiraft enabled) -->
+        <div class="card" x-show="multiraftEnabled && clusterComparison.nodes.length > 0">
+            <div class="card-header">
+                <span class="card-title">Cluster Shard Comparison</span>
+                <div class="shard-header-right">
+                    <span class="badge" :class="clusterComparison.is_consistent ? 'badge-success' : 'badge-warning'"
+                          x-text="clusterComparison.is_consistent ? 'Consistent' : 'Differences Found'"></span>
+                    <button class="btn btn-sm btn-secondary" @click="fetchClusterComparison()">Refresh</button>
+                </div>
+            </div>
+            <div class="comparison-summary" x-text="clusterComparison.summary"></div>
+
+            <!-- Node-by-node shard view -->
+            <div class="cluster-nodes-grid">
+                <template x-for="node in clusterComparison.nodes" :key="'node-' + node.node_id">
+                    <div class="cluster-node-card" :class="{ 'node-unreachable': !node.reachable, 'node-local': node.node_id === nodeId }">
+                        <div class="cluster-node-header">
+                            <span class="node-label">
+                                Node <span x-text="node.node_id"></span>
+                                <span x-show="node.node_id === nodeId" class="badge badge-info" style="margin-left: 0.5rem;">Local</span>
+                            </span>
+                            <span class="badge" :class="node.reachable ? 'badge-success' : 'badge-danger'"
+                                  x-text="node.reachable ? 'Reachable' : 'Unreachable'"></span>
+                        </div>
+                        <div class="cluster-node-error" x-show="node.error" x-text="node.error"></div>
+                        <div class="cluster-node-shards" x-show="node.shards.length > 0">
+                            <template x-for="shard in node.shards" :key="'node-' + node.node_id + '-shard-' + shard.shard_id">
+                                <div class="mini-shard" :class="getShardComparisonClass(shard, node.node_id)">
+                                    <span class="mini-shard-id" x-text="'S' + shard.shard_id"></span>
+                                    <span class="mini-shard-leader" x-text="shard.leader_id !== null ? 'L:' + shard.leader_id : 'N/A'"></span>
+                                    <span class="mini-shard-slots" x-text="shard.slot_count + ' slots'"></span>
+                                </div>
+                            </template>
+                        </div>
+                    </div>
+                </template>
+            </div>
+
+            <!-- Differences list -->
+            <div class="differences-section" x-show="clusterComparison.differences.length > 0">
+                <div class="differences-header">Detected Differences</div>
+                <div class="differences-list">
+                    <template x-for="(diff, idx) in clusterComparison.differences" :key="'diff-' + idx">
+                        <div class="difference-item" :class="'diff-' + diff.diff_type">
+                            <span class="diff-shard">S<span x-text="diff.shard_id"></span></span>
+                            <span class="diff-type" x-text="formatDiffType(diff.diff_type)"></span>
+                            <span class="diff-desc" x-text="diff.description"></span>
+                            <div class="diff-values" x-show="diff.node_a_value || diff.node_b_value">
+                                <span x-show="diff.node_a_value" x-text="diff.node_a_value"></span>
+                                <span x-show="diff.node_a_value && diff.node_b_value"> vs </span>
+                                <span x-show="diff.node_b_value" x-text="diff.node_b_value"></span>
+                            </div>
+                        </div>
+                    </template>
+                </div>
+            </div>
+        </div>
+
         <!-- Remove Shard Dialog -->
         <div class="modal-overlay" x-show="showRemoveDialog" @click.self="showRemoveDialog = false">
             <div class="modal-dialog">
@@ -307,6 +365,71 @@
                               x-text="multiraftEnabled ? 'Enabled' : 'Disabled'"></span>
                     </div>
                 </div>
+            </div>
+        </div>
+
+        <!-- Comprehensive Metrics -->
+        <div class="card">
+            <div class="card-header">
+                <span class="card-title">All Metrics</span>
+                <div class="shard-header-right">
+                    <span class="badge badge-info" x-text="comprehensiveMetrics.total_metrics + ' metrics'"></span>
+                    <button class="btn btn-sm btn-secondary" @click="fetchComprehensiveMetrics()">Refresh</button>
+                </div>
+            </div>
+            <div class="metrics-timestamp" x-show="comprehensiveMetrics.timestamp_ms > 0">
+                Last updated: <span x-text="formatTimestamp(comprehensiveMetrics.timestamp_ms)"></span>
+            </div>
+            <div class="metrics-categories">
+                <template x-for="category in comprehensiveMetrics.categories" :key="category.name">
+                    <div class="metric-category">
+                        <div class="category-header" @click="toggleCategory(category.name)">
+                            <span class="category-name" x-text="category.name"></span>
+                            <span class="category-count" x-text="category.metrics.length + ' metrics'"></span>
+                            <span class="category-toggle" x-text="expandedCategories.includes(category.name) ? '▼' : '▶'"></span>
+                        </div>
+                        <div class="category-metrics" x-show="expandedCategories.includes(category.name)">
+                            <template x-for="metric in category.metrics" :key="metric.name">
+                                <div class="metric-row">
+                                    <div class="metric-info">
+                                        <span class="metric-name" x-text="metric.name"></span>
+                                        <span class="metric-desc" x-text="metric.description"></span>
+                                    </div>
+                                    <div class="metric-value-container">
+                                        <!-- Counter/Gauge value -->
+                                        <template x-if="metric.value !== null && metric.value !== undefined">
+                                            <span class="metric-value" :class="getMetricValueClass(metric)"
+                                                  x-text="formatMetricValue(metric)"></span>
+                                        </template>
+                                        <!-- Histogram value -->
+                                        <template x-if="metric.histogram">
+                                            <div class="histogram-values">
+                                                <span class="histogram-stat">
+                                                    <span class="stat-name">mean:</span>
+                                                    <span x-text="formatLatency(metric.histogram.mean)"></span>
+                                                </span>
+                                                <span class="histogram-stat">
+                                                    <span class="stat-name">p50:</span>
+                                                    <span x-text="formatLatency(metric.histogram.p50)"></span>
+                                                </span>
+                                                <span class="histogram-stat">
+                                                    <span class="stat-name">p90:</span>
+                                                    <span x-text="formatLatency(metric.histogram.p90)"></span>
+                                                </span>
+                                                <span class="histogram-stat">
+                                                    <span class="stat-name">p99:</span>
+                                                    <span x-text="formatLatency(metric.histogram.p99)"></span>
+                                                </span>
+                                            </div>
+                                        </template>
+                                    </div>
+                                    <span class="metric-type badge" :class="'badge-' + metric.metric_type"
+                                          x-text="metric.metric_type"></span>
+                                </div>
+                            </template>
+                        </div>
+                    </div>
+                </template>
             </div>
         </div>
 

@@ -16,6 +16,7 @@ use crate::consensus::transport::{
 use crate::error::{RaftError, Result};
 use crate::network::rpc::Message;
 use crate::types::{CacheCommand, NodeId, ProposalResult};
+use crate::{counter_inc, gauge_set, histogram_record_duration};
 use parking_lot::{Mutex, RwLock};
 use protobuf::Message as ProtobufMessage;
 use raft::prelude::{ConfChange, EntryType, Message as RaftMessage};
@@ -676,6 +677,8 @@ impl RaftNode {
     ///
     /// This will return when the command is committed (not just proposed).
     pub async fn propose(&self, command: CacheCommand) -> Result<ProposalResult> {
+        let start = Instant::now();
+        let node_id_str = self.id.to_string();
         debug!("PROPOSE: Starting proposal, is_leader={}", self.is_leader());
 
         // Check if accepting proposals (for graceful shutdown)
@@ -722,6 +725,18 @@ impl RaftNode {
                 // Remove pending proposal
                 self.pending.lock().remove(&proposal_id);
                 debug!("PROPOSE: node.propose() failed: {}", e);
+                // Record failure metrics
+                counter_inc!(
+                    crate::metrics::descriptors::RAFT_PROPOSALS_TOTAL,
+                    "node_id" => node_id_str.clone(),
+                    "success" => "false"
+                );
+                histogram_record_duration!(
+                    crate::metrics::descriptors::RAFT_PROPOSAL_DURATION_SECONDS,
+                    start.elapsed(),
+                    "node_id" => node_id_str,
+                    "success" => "false"
+                );
                 return Err(RaftError::Internal(e.to_string()).into());
             }
             debug!("PROPOSE: node.propose() succeeded");
@@ -739,7 +754,7 @@ impl RaftNode {
             proposal_id, timeout_ms
         );
 
-        tokio::select! {
+        let result = tokio::select! {
             result = rx => {
                 match result {
                     Ok(res) => {
@@ -758,7 +773,147 @@ impl RaftNode {
                 warn!("PROPOSE: Timeout waiting for proposal_id={} after {}ms", proposal_id, timeout_ms);
                 Err(RaftError::Internal("proposal timeout".to_string()).into())
             }
+        };
+
+        // Record metrics
+        let duration = start.elapsed();
+        let success = result.is_ok();
+        let success_str = if success { "true" } else { "false" };
+
+        counter_inc!(
+            crate::metrics::descriptors::RAFT_PROPOSALS_TOTAL,
+            "node_id" => node_id_str.clone(),
+            "success" => success_str
+        );
+        histogram_record_duration!(
+            crate::metrics::descriptors::RAFT_PROPOSAL_DURATION_SECONDS,
+            duration,
+            "node_id" => node_id_str,
+            "success" => success_str
+        );
+
+        result
+    }
+
+    /// Propose raw bytes to the Raft cluster.
+    ///
+    /// This is a lower-level version of `propose` that takes pre-serialized data.
+    /// Used by ShardRaftNode to propose migration commands alongside cache commands.
+    ///
+    /// This will return when the data is committed (not just proposed).
+    pub async fn propose_raw(&self, data: Vec<u8>) -> Result<ProposalResult> {
+        let start = Instant::now();
+        let node_id_str = self.id.to_string();
+        debug!(
+            "PROPOSE_RAW: Starting proposal, is_leader={}, data_len={}",
+            self.is_leader(),
+            data.len()
+        );
+
+        // Check if accepting proposals (for graceful shutdown)
+        if !self.accepting_proposals.load(Ordering::SeqCst) {
+            return Err(RaftError::NotReady.into());
         }
+
+        // Check rate limit
+        self.flow_control.check_propose_rate().await?;
+
+        if !self.is_leader() {
+            return Err(RaftError::NotLeader {
+                leader: self.leader_id(),
+            }
+            .into());
+        }
+
+        // Generate proposal ID
+        let proposal_id = self.next_proposal_id.fetch_add(1, Ordering::SeqCst);
+        debug!("PROPOSE_RAW: Generated proposal_id={}", proposal_id);
+
+        // Create completion channel
+        let (tx, rx) = oneshot::channel();
+
+        // Store pending proposal
+        {
+            let mut pending = self.pending.lock();
+            pending.insert(proposal_id, PendingProposal { tx });
+        }
+
+        // Propose to Raft
+        {
+            let mut node = self.node.lock();
+            // Use proposal_id as context for tracking
+            let context = proposal_id.to_le_bytes().to_vec();
+            debug!("PROPOSE_RAW: Calling node.propose()");
+            if let Err(e) = node.propose(context, data) {
+                // Remove pending proposal
+                self.pending.lock().remove(&proposal_id);
+                debug!("PROPOSE_RAW: node.propose() failed: {}", e);
+                // Record failure metrics
+                counter_inc!(
+                    crate::metrics::descriptors::RAFT_PROPOSALS_TOTAL,
+                    "node_id" => node_id_str.clone(),
+                    "success" => "false"
+                );
+                histogram_record_duration!(
+                    crate::metrics::descriptors::RAFT_PROPOSAL_DURATION_SECONDS,
+                    start.elapsed(),
+                    "node_id" => node_id_str,
+                    "success" => "false"
+                );
+                return Err(RaftError::Internal(e.to_string()).into());
+            }
+            debug!("PROPOSE_RAW: node.propose() succeeded");
+        }
+
+        // Wait for commit with timeout to prevent indefinite hangs
+        let election_timeout_ms = self.config.election_tick as u64 * self.config.tick_interval_ms;
+        let min_timeout_ms = 5000u64;
+        let timeout_ms = std::cmp::max(election_timeout_ms * 3, min_timeout_ms);
+        let timeout_duration = Duration::from_millis(timeout_ms);
+        debug!(
+            "PROPOSE_RAW: Waiting for commit on proposal_id={} (timeout={}ms)",
+            proposal_id, timeout_ms
+        );
+
+        let result = tokio::select! {
+            result = rx => {
+                match result {
+                    Ok(res) => {
+                        debug!("PROPOSE_RAW: Commit received for proposal_id={}", proposal_id);
+                        res
+                    }
+                    Err(_) => {
+                        debug!("PROPOSE_RAW: Proposal dropped for proposal_id={}", proposal_id);
+                        Err(RaftError::ProposalDropped.into())
+                    }
+                }
+            }
+            _ = tokio::time::sleep(timeout_duration) => {
+                // Timeout: clean up pending mapping to prevent memory leak
+                self.pending.lock().remove(&proposal_id);
+                warn!("PROPOSE_RAW: Timeout waiting for proposal_id={} after {}ms", proposal_id, timeout_ms);
+                Err(RaftError::Internal("proposal timeout".to_string()).into())
+            }
+        };
+
+        // Record metrics
+        let duration = start.elapsed();
+        let success = result.is_ok();
+        let success_str = if success { "true" } else { "false" };
+
+        counter_inc!(
+            crate::metrics::descriptors::RAFT_PROPOSALS_TOTAL,
+            "node_id" => node_id_str.clone(),
+            "success" => success_str
+        );
+        histogram_record_duration!(
+            crate::metrics::descriptors::RAFT_PROPOSAL_DURATION_SECONDS,
+            duration,
+            "node_id" => node_id_str,
+            "success" => success_str
+        );
+
+        result
     }
 
     /// Propose a configuration change to add or remove a node from the Raft cluster.
@@ -1517,18 +1672,32 @@ impl RaftNode {
             match deserialize_snapshot_data(&data) {
                 Ok(entries) => {
                     let total_entries = entries.len();
+                    let entries_before = self.state_machine.storage().entry_count();
 
-                    // Clear current cache and restore from snapshot
-                    self.state_machine.storage().invalidate_all();
+                    // Track the snapshot boundary - entries applied AFTER this index
+                    // should not be overwritten by this snapshot installation.
+                    // This prevents data loss during migrations when followers lag behind.
+                    self.state_machine.set_snapshot_index(index);
+
+                    // IMPORTANT: DO NOT call invalidate_all() here!
+                    // Calling invalidate_all() causes data loss during migration because:
+                    // 1. Per-shard Raft is enabled, heavy activity causes followers to lag
+                    // 2. Leader creates a snapshot for catch-up
+                    // 3. Follower installs snapshot: invalidate_all() clears ALL data
+                    // 4. Snapshot data is restored, but excludes writes made after snapshot
+                    // 5. Data written via shard.put() after snapshot was taken is lost
+                    //
+                    // Instead, we just overwrite with snapshot entries. Post-snapshot log
+                    // replay will handle any deletes that occurred after the snapshot.
 
                     // Insert entries from snapshot, filtering expired ones
                     let mut inserted_count = 0;
-                    let mut expired_count = 0;
+                    let mut skipped_expired = 0;
 
                     for entry in entries {
                         // Skip expired entries
                         if entry.is_expired() {
-                            expired_count += 1;
+                            skipped_expired += 1;
                             debug!(
                                 node_id = self.id,
                                 key_len = entry.key.len(),
@@ -1539,6 +1708,7 @@ impl RaftNode {
                         }
 
                         // Insert with expiration if present, otherwise just insert
+                        // This overwrites existing entries if present
                         if let Some(expires_at_ms) = entry.expires_at_ms {
                             self.state_machine
                                 .storage()
@@ -1555,7 +1725,22 @@ impl RaftNode {
 
                     // Update state machine applied index/term
                     // Note: The state machine will skip applying entries <= this index
+                    self.state_machine.set_recovered_state(index, term);
                     self.state_machine.storage().run_pending_tasks().await;
+
+                    let entries_after = self.state_machine.storage().entry_count();
+
+                    // Safety invariant check - warn if significant data loss detected
+                    // This can indicate a problem with the snapshot or migration process
+                    if entries_after < inserted_count / 2 && inserted_count > 10 {
+                        warn!(
+                            node_id = self.id,
+                            snapshot_index = index,
+                            expected = inserted_count,
+                            actual = entries_after,
+                            "SNAPSHOT WARNING: Entry count significantly lower than expected after install"
+                        );
+                    }
 
                     debug!(
                         node_id = self.id,
@@ -1563,8 +1748,10 @@ impl RaftNode {
                         term,
                         total_entries,
                         inserted_count,
-                        expired_count,
-                        "PROCESS_READY: State machine restored from snapshot"
+                        skipped_expired,
+                        entries_before,
+                        entries_after,
+                        "PROCESS_READY: State machine restored from snapshot (incremental merge)"
                     );
                 }
                 Err(e) => {
@@ -1591,9 +1778,17 @@ impl RaftNode {
             self.transport.send_messages(persisted_messages_to_send);
         }
 
-        // 9. Update leader tracking
+        // 9. Update leader tracking and Raft state metrics
         let old_leader = self.leader_id.load(Ordering::Relaxed);
         let had_leader = self.has_leader.load(Ordering::Relaxed);
+        let node_id_str = self.id.to_string();
+
+        // Update Raft state metrics
+        gauge_set!(
+            crate::metrics::descriptors::RAFT_TERM,
+            new_term as f64,
+            "node_id" => node_id_str.clone()
+        );
 
         if new_leader != raft::INVALID_ID {
             if new_leader != old_leader || !had_leader {
@@ -1603,6 +1798,12 @@ impl RaftNode {
                         term = new_term,
                         previous_leader = old_leader,
                         "LEADER_ELECTION: This node is now the LEADER"
+                    );
+                    // Record election won
+                    counter_inc!(
+                        crate::metrics::descriptors::RAFT_ELECTIONS_TOTAL,
+                        "node_id" => node_id_str.clone(),
+                        "result" => "won"
                     );
                 } else {
                     debug!(
@@ -1616,6 +1817,18 @@ impl RaftNode {
             }
             self.leader_id.store(new_leader, Ordering::Relaxed);
             self.has_leader.store(true, Ordering::Relaxed);
+
+            // Update leader metrics
+            gauge_set!(
+                crate::metrics::descriptors::RAFT_IS_LEADER,
+                if new_leader == self.id { 1.0 } else { 0.0 },
+                "node_id" => node_id_str.clone()
+            );
+            gauge_set!(
+                crate::metrics::descriptors::RAFT_LEADER_ID,
+                new_leader as f64,
+                "node_id" => node_id_str.clone()
+            );
         } else if had_leader {
             debug!(
                 node_id = self.id,
@@ -1624,6 +1837,11 @@ impl RaftNode {
                 "LEADER_ELECTION: No leader currently (election in progress)"
             );
             self.has_leader.store(false, Ordering::Relaxed);
+            gauge_set!(
+                crate::metrics::descriptors::RAFT_IS_LEADER,
+                0.0,
+                "node_id" => node_id_str.clone()
+            );
         }
 
         // 10. Apply committed entries to state machine (outside of lock)
@@ -2020,6 +2238,7 @@ mod tests {
     use crate::cache::storage::CacheStorage;
     use crate::config::CacheConfig;
 
+    #[allow(dead_code)]
     fn create_state_machine() -> Arc<CacheStateMachine> {
         let config = CacheConfig::default();
         let storage = Arc::new(CacheStorage::new(&config));

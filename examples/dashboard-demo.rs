@@ -209,7 +209,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!();
     println!("Enabling slot-based routing...");
     for cache in &caches {
-        if let Err(e) = cache.enable_slot_routing() {
+        if let Err(e) = cache.enable_slot_routing().await {
             eprintln!("Warning: Failed to enable slot routing: {}", e);
         }
     }

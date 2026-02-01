@@ -659,6 +659,7 @@ mod integration_tests {
             ControlPlaneConfig::default(),
         ));
         let migrator = Arc::new(SlotMigrator::new(
+            1, // node_id
             slot_table.clone(),
             SlotMigratorConfig::default(),
         ));
@@ -695,6 +696,7 @@ mod integration_tests {
             ControlPlaneConfig::default(),
         ));
         let migrator = Arc::new(SlotMigrator::new(
+            1, // node_id
             slot_table.clone(),
             SlotMigratorConfig::default(),
         ));

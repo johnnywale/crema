@@ -319,15 +319,21 @@ impl SlotControlPlane {
         }
 
         // Check we'd have at least one active shard remaining
-        let active_count = states.values().filter(|i| i.state.is_active()).count();
-        if active_count <= 1 {
+        let active_shards: Vec<ShardId> = states
+            .iter()
+            .filter(|(id, info)| info.state.is_active() && **id != shard_id)
+            .map(|(id, _)| *id)
+            .collect();
+        if active_shards.is_empty() {
             return Err(Error::Internal(
                 "Cannot remove the last active shard".to_string(),
             ));
         }
 
-        // Compute drain plan
-        let drain_plan = self.slot_table.compute_drain_for_shard(shard_id);
+        // Compute drain plan - only distribute to ACTIVE shards
+        let drain_plan = self
+            .slot_table
+            .compute_drain_for_shard_to_targets(shard_id, &active_shards);
         let total_slots: usize = drain_plan.values().map(|v| v.len()).sum();
 
         // Apply reassignments

@@ -172,6 +172,7 @@ mod migration_cleanup;
 mod migration_metrics;
 mod migration_orchestrator;
 mod migration_routing;
+pub mod migration_state_machine;
 mod migration_transport;
 mod persistent_migration_store;
 mod raft_migration;
@@ -213,6 +214,7 @@ pub use migration_routing::{
     MigrationRoutingStrategy, ReadTargets, RoutingDecision as MigrationRoutingDecision,
     WriteTarget,
 };
+pub use migration_state_machine::MigrationStateMachine;
 pub use migration_transport::{RpcDataTransporter, RpcMigrationRaftProposer, ShardAccessor};
 pub use persistent_migration_store::{
     FileMigrationStore, InMemoryRaftMigrationStore, MigrationCheckpointData,
@@ -230,7 +232,7 @@ pub use shard_forwarder::{
 };
 pub use shard_placement::{MovementType, PlacementConfig, ShardMovement, ShardPlacement};
 pub use shard_raft_manager::{ShardRaftManager, ShardRaftManagerBuilder, ShardRaftManagerStats};
-pub use shard_raft_node::{ShardRaftNode, ShardRaftNodeBuilder};
+pub use shard_raft_node::{ShardRaftCommand, ShardRaftNode, ShardRaftNodeBuilder};
 pub use shard_recovery::{
     RecoveredShard, RecoveryCoordinatorBuilder, RecoveryStats, ShardRecoveryCoordinator,
     ShardRecoveryDetail,

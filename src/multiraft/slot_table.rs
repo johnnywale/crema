@@ -503,8 +503,26 @@ impl SlotTable {
     ///
     /// Redistributes all slots from the removed shard to remaining shards.
     pub fn compute_drain_for_shard(&self, shard_id: ShardId) -> HashMap<ShardId, Vec<SlotId>> {
-        let slots = self.slots.read();
         let num_shards = *self.num_shards.read();
+        // Default: use all shard IDs except the one being removed
+        // NOTE: This may include shards that are draining/removed - use
+        // compute_drain_for_shard_to_targets() for precise control.
+        let remaining_shards: Vec<ShardId> = (0..num_shards as ShardId)
+            .filter(|&id| id != shard_id)
+            .collect();
+        self.compute_drain_for_shard_to_targets(shard_id, &remaining_shards)
+    }
+
+    /// Compute a drain plan for redistributing slots from a shard to specific target shards.
+    ///
+    /// Unlike `compute_drain_for_shard`, this method explicitly specifies which shards
+    /// can receive the slots. Use this when you need to exclude draining/removed shards.
+    pub fn compute_drain_for_shard_to_targets(
+        &self,
+        shard_id: ShardId,
+        target_shards: &[ShardId],
+    ) -> HashMap<ShardId, Vec<SlotId>> {
+        let slots = self.slots.read();
 
         // Get all slots owned by the shard being removed
         let owned_slots: Vec<SlotId> = slots
@@ -519,8 +537,10 @@ impl SlotTable {
             })
             .collect();
 
-        // Distribute among remaining shards
-        let remaining_shards: Vec<ShardId> = (0..num_shards as ShardId)
+        // Filter out the shard being removed from targets (in case caller included it)
+        let remaining_shards: Vec<ShardId> = target_shards
+            .iter()
+            .copied()
             .filter(|&id| id != shard_id)
             .collect();
 

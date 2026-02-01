@@ -28,12 +28,15 @@ use super::shard_registry::{ShardLifecycleState, ShardRegistry};
 use super::shard_storage::{PersistedShardMetadata, ShardStorageConfig, ShardStorageManager};
 use super::shard_transport::ShardTransportMultiplexer;
 use super::slot_control_plane::SlotControlPlane;
-use super::slot_migration::SlotMigrator;
-use super::slot_table::{Epoch, SlotId, SlotTable};
+use super::slot_migration::{ShardMigrationDataAccessor, SlotMigrator};
+use super::slot_table::{Epoch, SlotId, SlotTable, TOTAL_SLOTS};
 use crate::consensus::transport::RaftTransport;
 use crate::error::{Error, Result};
 use crate::metrics::CacheMetrics;
 use crate::network::router::NodeMessageRouter;
+use crate::network::rpc::{
+    GetTopologyRequest, ShardCreationAck, ShardCreationBroadcast, TopologyResponse,
+};
 use crate::types::CacheCommand;
 use crate::types::NodeId;
 use bytes::Bytes;
@@ -260,7 +263,7 @@ pub struct MultiRaftCoordinator {
     running: AtomicBool,
 
     /// Epoch-based shard leader tracker for handling out-of-order gossip.
-    leader_tracker: ShardLeaderTracker,
+    leader_tracker: Arc<ShardLeaderTracker>,
 
     /// Debounced shard leader broadcaster.
     leader_broadcaster: ShardLeaderBroadcaster,
@@ -290,14 +293,14 @@ pub struct MultiRaftCoordinator {
     last_recovery_stats: RwLock<Option<RecoveryStats>>,
 
     /// Shard forwarder for cross-node request forwarding.
-    shard_forwarder: ShardForwarder,
+    shard_forwarder: Arc<ShardForwarder>,
 
     /// Whether shard forwarding is enabled.
     forwarding_enabled: bool,
 
     /// Per-shard Raft manager (Phase 2, optional).
     /// Manages all ShardRaftNodes when per_shard_raft_enabled is true.
-    shard_raft_manager: RwLock<Option<Arc<ShardRaftManager>>>,
+    shard_raft_manager: Arc<RwLock<Option<Arc<ShardRaftManager>>>>,
 
     /// Shard transport multiplexer for per-shard Raft messages (Phase 2).
     shard_transport: RwLock<Option<Arc<ShardTransportMultiplexer>>>,
@@ -318,6 +321,9 @@ pub struct MultiRaftCoordinator {
 
     /// Slot migrator for background data migration (optional).
     slot_migrator: RwLock<Option<Arc<SlotMigrator>>>,
+
+    /// Request ID counter for RPC messages.
+    next_request_id: AtomicU64,
 }
 
 impl MultiRaftCoordinator {
@@ -335,7 +341,7 @@ impl MultiRaftCoordinator {
     ) -> Self {
         let router_config = RouterConfig::new(config.num_shards);
         let router = Arc::new(ShardRouter::new(router_config));
-        let leader_tracker = ShardLeaderTracker::new(node_id);
+        let leader_tracker = Arc::new(ShardLeaderTracker::new(node_id));
         let leader_broadcaster = ShardLeaderBroadcaster::new(config.tick_interval);
 
         // Create shard registry for stable shard metadata
@@ -347,7 +353,10 @@ impl MultiRaftCoordinator {
         let shard_placement = Arc::new(ShardPlacement::new(config.num_shards, placement_config));
 
         // Create shard forwarder for cross-node request forwarding
-        let shard_forwarder = ShardForwarder::new(node_id, ShardForwardingConfig::default());
+        let shard_forwarder = Arc::new(ShardForwarder::new(
+            node_id,
+            ShardForwardingConfig::default(),
+        ));
 
         Self {
             node_id,
@@ -371,13 +380,14 @@ impl MultiRaftCoordinator {
             last_recovery_stats: RwLock::new(None),
             shard_forwarder,
             forwarding_enabled: true,
-            shard_raft_manager: RwLock::new(None),
+            shard_raft_manager: Arc::new(RwLock::new(None)),
             shard_transport: RwLock::new(None),
             local_raft_addr,
             node_router: RwLock::new(None),
             slot_table: RwLock::new(None),
             slot_control_plane: RwLock::new(None),
             slot_migrator: RwLock::new(None),
+            next_request_id: AtomicU64::new(1),
         }
     }
 
@@ -390,7 +400,7 @@ impl MultiRaftCoordinator {
     ) -> Self {
         let router_config = RouterConfig::new(config.num_shards);
         let router = Arc::new(ShardRouter::new(router_config));
-        let leader_tracker = ShardLeaderTracker::new(node_id);
+        let leader_tracker = Arc::new(ShardLeaderTracker::new(node_id));
         let leader_broadcaster = ShardLeaderBroadcaster::new(debounce);
 
         // Create shard registry for stable shard metadata
@@ -402,7 +412,10 @@ impl MultiRaftCoordinator {
         let shard_placement = Arc::new(ShardPlacement::new(config.num_shards, placement_config));
 
         // Create shard forwarder for cross-node request forwarding
-        let shard_forwarder = ShardForwarder::new(node_id, ShardForwardingConfig::default());
+        let shard_forwarder = Arc::new(ShardForwarder::new(
+            node_id,
+            ShardForwardingConfig::default(),
+        ));
 
         Self {
             node_id,
@@ -426,13 +439,14 @@ impl MultiRaftCoordinator {
             last_recovery_stats: RwLock::new(None),
             shard_forwarder,
             forwarding_enabled: true,
-            shard_raft_manager: RwLock::new(None),
+            shard_raft_manager: Arc::new(RwLock::new(None)),
             shard_transport: RwLock::new(None),
             local_raft_addr: "127.0.0.1:9000".to_string(),
             node_router: RwLock::new(None),
             slot_table: RwLock::new(None),
             slot_control_plane: RwLock::new(None),
             slot_migrator: RwLock::new(None),
+            next_request_id: AtomicU64::new(1),
         }
     }
 
@@ -606,11 +620,164 @@ impl MultiRaftCoordinator {
     ///
     /// If the shard is not local but the leader is known on another node,
     /// the request is automatically forwarded.
+    ///
+    /// When slot-based routing is enabled, uses the slot table to determine
+    /// the correct shard, which supports dynamic shard changes.
+    ///
+    /// During migration, if data isn't found in the new owner, falls back to
+    /// the old owner (source shard) to maintain read availability.
     pub async fn get(&self, key: &[u8]) -> Result<Option<Bytes>> {
         self.operations_total.fetch_add(1, Ordering::Relaxed);
 
         let start = Instant::now();
-        let result = self.router.get(key).await;
+
+        // Use slot-based routing if enabled
+        let route_info = self.slot_table.read().as_ref().map(|t| t.route(key));
+
+        // Route to the correct shard
+        let result = if let Some(route) = route_info {
+            // Slot-based routing: get from the new owner first
+            let value = if let Some(shard) = self.router.get_shard(route.shard_id) {
+                // If shard is active, use normal get()
+                // If shard is inactive (e.g., being removed), read directly from storage
+                if shard.is_active() {
+                    shard.get(key).await
+                } else {
+                    // Shard is inactive but still has data - read directly from storage
+                    shard.storage().get(key).await
+                }
+            } else {
+                None
+            };
+
+            // If slot is migrating and value not found, try the source shard
+            if value.is_none() {
+                // First try the immediate source shard
+                if let Some(source_shard_id) = route.state.source_shard() {
+                    if source_shard_id != route.shard_id {
+                        // Try reading from source shard (data might not have migrated yet)
+                        if let Some(source_shard) = self.router.get_shard(source_shard_id) {
+                            // Read directly from storage to bypass active check
+                            let storage = source_shard.storage();
+                            let source_value = storage.get(key).await;
+                            if source_value.is_some() {
+                                return Ok(source_value);
+                            }
+                        }
+                    }
+                }
+
+                // Second fallback: search ALL inactive shards for the data.
+                // This handles two-hop migrations where data was at shard A,
+                // A was removed (data should go to B), B was removed (should go to C),
+                // but migration didn't complete. The source_shard only tracks the
+                // immediate predecessor, not the original data location.
+                for shard in self.router.all_shards() {
+                    if shard.id() != route.shard_id && !shard.is_active() {
+                        let storage = shard.storage();
+                        let fallback_value = storage.get(key).await;
+                        if fallback_value.is_some() {
+                            tracing::debug!(
+                                key = ?String::from_utf8_lossy(key),
+                                found_on_shard = shard.id(),
+                                expected_source = ?route.state.source_shard(),
+                                "Found data on unexpected shard during two-hop fallback"
+                            );
+                            return Ok(fallback_value);
+                        }
+                    }
+                }
+
+                // Third fallback: forward to shard leader if this node isn't the leader.
+                // This handles the case where data exists on the leader but hasn't
+                // replicated to this follower yet (Raft replication visibility issue).
+                if self.forwarding_enabled {
+                    let shard_id = route.shard_id;
+                    // Check if this node is the leader for this shard
+                    let is_local_leader = self
+                        .shard_raft_manager
+                        .read()
+                        .as_ref()
+                        .and_then(|m| m.get_shard(shard_id))
+                        .map(|n| n.is_leader())
+                        .unwrap_or(true); // Assume leader if no Raft manager
+
+                    // Get the actual leader for logging
+                    let leader_node = self
+                        .shard_raft_manager
+                        .read()
+                        .as_ref()
+                        .and_then(|m| m.get_shard(shard_id))
+                        .and_then(|n| n.leader_id())
+                        .or_else(|| self.leader_tracker.get_leader(shard_id));
+
+                    // Debug: Log read forwarding decisions
+                    static READ_FWD_LOG: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+                    let log_count = READ_FWD_LOG.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    if log_count < 20 {
+                        eprintln!(
+                            "[READ-FWD] #{} shard={} key={} local_leader={} leader={:?} self={}",
+                            log_count,
+                            shard_id,
+                            String::from_utf8_lossy(&key[..key.len().min(20)]),
+                            is_local_leader,
+                            leader_node,
+                            self.node_id
+                        );
+                    }
+
+                    if !is_local_leader {
+                        if let Some(leader_node) = leader_node {
+                            if leader_node != self.node_id {
+                                // Forward to the leader node
+                                let command = CacheCommand::get(key.to_vec());
+                                match self
+                                    .shard_forwarder
+                                    .forward_to_node(leader_node, shard_id, command)
+                                    .await
+                                {
+                                    Ok(forward_result) => {
+                                        if log_count < 20 {
+                                            eprintln!(
+                                                "[READ-FWD] #{} RESULT success={} has_value={}",
+                                                log_count,
+                                                forward_result.success,
+                                                forward_result.value.is_some()
+                                            );
+                                        }
+                                        if forward_result.value.is_some() {
+                                            self.metrics
+                                                .record_get(true, start.elapsed());
+                                            return Ok(forward_result.value);
+                                        }
+                                    }
+                                    Err(e) => {
+                                        if log_count < 20 {
+                                            eprintln!(
+                                                "[READ-FWD] #{} ERROR: {}",
+                                                log_count,
+                                                e
+                                            );
+                                        }
+                                        tracing::debug!(
+                                            shard_id,
+                                            leader_node,
+                                            error = %e,
+                                            "Leader forward failed for GET (follower read)"
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            Ok(value)
+        } else {
+            // Fall back to hash-based routing
+            self.router.get(key).await
+        };
 
         // If successful or error other than ShardNotFound, return directly
         match &result {
@@ -659,6 +826,29 @@ impl MultiRaftCoordinator {
         }
     }
 
+    /// Wait for a key to be visible in local storage after a forwarded write.
+    ///
+    /// Returns true if the key became visible within the timeout, false otherwise.
+    /// This is used to ensure read-your-writes consistency after forwarding a write
+    /// to the shard leader.
+    async fn wait_for_local_visibility(
+        &self,
+        shard_id: ShardId,
+        key: &Bytes,
+        timeout: Duration,
+    ) -> bool {
+        let start = Instant::now();
+        while start.elapsed() < timeout {
+            if let Some(shard) = self.router.get_shard(shard_id) {
+                if shard.storage().get(key).await.is_some() {
+                    return true;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        false
+    }
+
     /// Put a value in the cache.
     ///
     /// If the shard is not local but the leader is known on another node,
@@ -673,7 +863,29 @@ impl MultiRaftCoordinator {
         let value = value.into();
 
         let start = Instant::now();
-        let result = self.router.put(key.clone(), value.clone()).await;
+
+        // Use slot-based routing if enabled
+        let target_shard_id = self
+            .slot_table
+            .read()
+            .as_ref()
+            .map(|t| t.route(&key).shard_id);
+
+        // Route to the correct shard
+        let result = if let Some(shard_id) = target_shard_id {
+            // Slot-based routing: put to the specific shard
+            if let Some(shard) = self.router.get_shard(shard_id) {
+                shard.put(key.clone(), value.clone()).await
+            } else {
+                Err(Error::ShardNotFound(shard_id))
+            }
+        } else {
+            // Fall back to hash-based routing
+            self.router
+                .put(key.clone(), value.clone())
+                .await
+                .map(|_| ())
+        };
 
         match &result {
             Ok(_) => {
@@ -695,6 +907,15 @@ impl MultiRaftCoordinator {
                                 self.metrics
                                     .record_put(forward_result.success, start.elapsed());
                                 if forward_result.success {
+                                    // Wait for replication to local storage (max 1 second)
+                                    // This ensures read-your-writes consistency for the calling node
+                                    let _ = self
+                                        .wait_for_local_visibility(
+                                            *shard_id,
+                                            &key,
+                                            Duration::from_secs(1),
+                                        )
+                                        .await;
                                     return Ok(());
                                 } else {
                                     return Err(Error::RemoteError(
@@ -725,8 +946,13 @@ impl MultiRaftCoordinator {
             Err(Error::Raft(crate::error::RaftError::NotLeader { leader }))
                 if self.forwarding_enabled =>
             {
-                // Compute the shard_id for this key
-                let shard_id = self.router.shard_for_key(&key);
+                // Compute the shard_id for this key (use slot-based routing if enabled)
+                let shard_id = self
+                    .slot_table
+                    .read()
+                    .as_ref()
+                    .map(|t| t.route(&key).shard_id)
+                    .unwrap_or_else(|| self.router.shard_for_key(&key));
 
                 // Determine leader to forward to
                 let leader_node = leader
@@ -760,6 +986,15 @@ impl MultiRaftCoordinator {
                                 self.metrics
                                     .record_put(forward_result.success, start.elapsed());
                                 if forward_result.success {
+                                    // Wait for replication to local storage (max 1 second)
+                                    // This ensures read-your-writes consistency for the calling node
+                                    let _ = self
+                                        .wait_for_local_visibility(
+                                            shard_id,
+                                            &key,
+                                            Duration::from_secs(1),
+                                        )
+                                        .await;
                                     return Ok(());
                                 } else {
                                     return Err(Error::RemoteError(
@@ -835,6 +1070,15 @@ impl MultiRaftCoordinator {
                                 self.metrics
                                     .record_put(forward_result.success, start.elapsed());
                                 if forward_result.success {
+                                    // Wait for replication to local storage (max 1 second)
+                                    // This ensures read-your-writes consistency for the calling node
+                                    let _ = self
+                                        .wait_for_local_visibility(
+                                            *shard_id,
+                                            &key,
+                                            Duration::from_secs(1),
+                                        )
+                                        .await;
                                     return Ok(());
                                 } else {
                                     return Err(Error::RemoteError(
@@ -865,8 +1109,13 @@ impl MultiRaftCoordinator {
             Err(Error::Raft(crate::error::RaftError::NotLeader { leader }))
                 if self.forwarding_enabled =>
             {
-                // Compute the shard_id for this key
-                let shard_id = self.router.shard_for_key(&key);
+                // Compute the shard_id for this key (use slot-based routing if enabled)
+                let shard_id = self
+                    .slot_table
+                    .read()
+                    .as_ref()
+                    .map(|t| t.route(&key).shard_id)
+                    .unwrap_or_else(|| self.router.shard_for_key(&key));
 
                 // Determine leader to forward to
                 let leader_node = leader
@@ -898,6 +1147,15 @@ impl MultiRaftCoordinator {
                                 self.metrics
                                     .record_put(forward_result.success, start.elapsed());
                                 if forward_result.success {
+                                    // Wait for replication to local storage (max 1 second)
+                                    // This ensures read-your-writes consistency for the calling node
+                                    let _ = self
+                                        .wait_for_local_visibility(
+                                            shard_id,
+                                            &key,
+                                            Duration::from_secs(1),
+                                        )
+                                        .await;
                                     return Ok(());
                                 } else {
                                     return Err(Error::RemoteError(
@@ -1259,6 +1517,12 @@ impl MultiRaftCoordinator {
 
         if let Some(shard) = self.router.get_shard(shard_id) {
             shard.set_is_leader(leader == self.node_id);
+        }
+
+        // Also update leader_tracker (used by migration)
+        let tracker_current = self.leader_tracker.get_leader(shard_id);
+        if tracker_current != Some(leader) {
+            self.leader_tracker.set_local_leader(shard_id, leader);
         }
     }
 
@@ -1826,7 +2090,7 @@ impl MultiRaftCoordinator {
     }
 
     /// Get the shard forwarder for handling incoming messages.
-    pub fn shard_forwarder(&self) -> &ShardForwarder {
+    pub fn shard_forwarder(&self) -> &Arc<ShardForwarder> {
         &self.shard_forwarder
     }
 
@@ -1917,11 +2181,12 @@ impl MultiRaftCoordinator {
     }
 
     /// Start a background task that periodically syncs shard leader info
-    /// from ShardRaftNodes to the router.
+    /// from ShardRaftNodes to the router and leader_tracker.
     fn start_leader_sync_task(&self) {
         let node_id = self.node_id;
         let num_shards = self.config.num_shards;
         let router = self.router.clone();
+        let leader_tracker = self.leader_tracker.clone();
         let shard_raft_manager = self.shard_raft_manager.read().clone();
 
         // Only start if we have a shard raft manager
@@ -1955,6 +2220,20 @@ impl MultiRaftCoordinator {
                                     "Synced shard leader to router"
                                 );
                             }
+
+                            // Also update leader_tracker (used by migration)
+                            // Use set_local_leader which auto-increments epoch
+                            let tracker_current = leader_tracker.get_leader(shard_id);
+                            if tracker_current != Some(leader_id) {
+                                leader_tracker.set_local_leader(shard_id, leader_id);
+                                tracing::debug!(
+                                    node_id,
+                                    shard_id,
+                                    leader_id,
+                                    "Synced shard leader to leader_tracker"
+                                );
+                            }
+
                             synced_count += 1;
                         }
                     }
@@ -1966,7 +2245,7 @@ impl MultiRaftCoordinator {
                     tracing::info!(
                         node_id,
                         num_shards,
-                        "All shard leaders synced to router, slowing sync interval"
+                        "All shard leaders synced to router and leader_tracker, slowing sync interval"
                     );
                     interval = tokio::time::interval(Duration::from_secs(5));
                 }
@@ -2381,7 +2660,10 @@ impl MultiRaftCoordinator {
     /// - Epoch-based routing ensures consistency
     ///
     /// Call this before `init()` if you want slot-based routing from the start.
-    pub fn enable_slot_routing(&self) -> Result<()> {
+    ///
+    /// This method will automatically sync cluster state from peers to catch up
+    /// on any shard creations that happened before this node joined.
+    pub async fn enable_slot_routing(&self) -> Result<()> {
         use super::slot_control_plane::{ControlPlaneConfig, SlotControlPlane};
         use super::slot_migration::{SlotMigrator, SlotMigratorConfig};
         use super::slot_table::SlotTable;
@@ -2395,8 +2677,9 @@ impl MultiRaftCoordinator {
             ControlPlaneConfig::default(),
         ));
 
-        // Create migrator
+        // Create migrator with node_id for claim ownership
         let migrator = Arc::new(SlotMigrator::new(
+            self.node_id,
             slot_table.clone(),
             SlotMigratorConfig::default(),
         ));
@@ -2411,6 +2694,15 @@ impl MultiRaftCoordinator {
             num_shards = self.config.num_shards,
             "Slot-based routing enabled"
         );
+
+        // Sync cluster state from peers to catch up on any missed shard creations
+        if let Err(e) = self.sync_cluster_state().await {
+            tracing::warn!(
+                node_id = self.node_id,
+                error = %e,
+                "Failed to sync cluster state on slot routing enable (will retry on next opportunity)"
+            );
+        }
 
         Ok(())
     }
@@ -2451,7 +2743,8 @@ impl MultiRaftCoordinator {
     /// 1. Creates a new empty shard
     /// 2. Computes a rebalance plan (steals slots from existing shards)
     /// 3. Updates the slot table with new ownership
-    /// 4. Starts background migration of data
+    /// 4. Broadcasts to all peers to synchronize topology
+    /// 5. Starts background migration of data
     ///
     /// # Returns
     ///
@@ -2474,12 +2767,33 @@ impl MultiRaftCoordinator {
             migrator.register_from_reassignment(&result.reassignment.moves);
         }
 
+        // Broadcast to all peers
+        let slot_assignments: Vec<(SlotId, ShardId)> = result
+            .reassignment
+            .moves
+            .iter()
+            .map(|(slot, _from, to)| (*slot, *to))
+            .collect();
+
+        if let Err(e) = self
+            .broadcast_shard_creation(result.shard_id, slot_assignments, result.new_epoch.value())
+            .await
+        {
+            // Log but don't fail - peers can catch up later
+            tracing::warn!(
+                node_id = self.node_id,
+                shard_id = result.shard_id,
+                error = %e,
+                "Failed to broadcast shard creation (peers can catch up later)"
+            );
+        }
+
         tracing::info!(
             node_id = self.node_id,
             new_shard_id = result.shard_id,
             slots_assigned = result.slots_assigned,
             new_epoch = result.new_epoch.value(),
-            "Added new shard dynamically"
+            "Added new shard dynamically and broadcast to cluster"
         );
 
         Ok(result)
@@ -2509,6 +2823,12 @@ impl MultiRaftCoordinator {
 
         // Remove shard via control plane
         let result = control_plane.remove_shard(shard_id)?;
+
+        // Synchronize shard state with control plane
+        if let Some(shard) = self.router.get_shard(shard_id) {
+            shard.set_state(ShardState::Removing);
+            tracing::info!(node_id = self.node_id, shard_id, "Marked shard as Removing");
+        }
 
         // Register migrations for each target shard
         if let Some(migrator) = self.slot_migrator.read().as_ref() {
@@ -2606,7 +2926,7 @@ impl MultiRaftCoordinator {
     /// Start the slot migration background loop.
     ///
     /// This should be called after enabling slot routing to start
-    /// background data migration.
+    /// background data migration using the real ShardMigrationDataAccessor.
     pub fn start_slot_migration_loop(&self) {
         let migrator = match self.slot_migrator.read().clone() {
             Some(m) => m,
@@ -2614,10 +2934,16 @@ impl MultiRaftCoordinator {
         };
 
         let control_plane = self.slot_control_plane.read().clone();
-        let accessor = Arc::new(super::slot_migration::NoOpDataAccessor);
 
-        // In a real implementation, you would create a proper data accessor
-        // that interacts with the actual shard storage
+        // Use real data accessor that interacts with actual shard storage.
+        // Pass forwarding dependencies to enable migration with per-shard Raft.
+        let accessor = Arc::new(ShardMigrationDataAccessor::new(
+            self.router.clone(),
+            self.node_id,
+            self.shard_forwarder.clone(),
+            self.leader_tracker.clone(),
+            self.shard_raft_manager.clone(),
+        ));
 
         tokio::spawn(async move {
             migrator.run(accessor, control_plane).await;
@@ -2625,7 +2951,7 @@ impl MultiRaftCoordinator {
 
         tracing::info!(
             node_id = self.node_id,
-            "Started slot migration background loop"
+            "Started slot migration background loop with real data accessor"
         );
     }
 
@@ -2635,6 +2961,359 @@ impl MultiRaftCoordinator {
             migrator.stop();
         }
     }
+
+    // ==================== Shard Coordination Broadcast ====================
+
+    /// Generate the next request ID.
+    pub fn next_request_id(&self) -> u64 {
+        self.next_request_id.fetch_add(1, Ordering::SeqCst)
+    }
+
+    /// Get the current slot table epoch.
+    pub fn get_slot_table_epoch(&self) -> u64 {
+        self.slot_table
+            .read()
+            .as_ref()
+            .map(|t| t.epoch().value())
+            .unwrap_or(0)
+    }
+
+    /// Get all known peer node IDs.
+    pub fn get_known_peers(&self) -> Vec<NodeId> {
+        self.node_addresses
+            .read()
+            .keys()
+            .copied()
+            .filter(|&id| id != self.node_id)
+            .collect()
+    }
+
+    /// Get all slot assignments from the slot table.
+    pub fn get_all_slot_assignments(&self) -> Vec<(SlotId, ShardId)> {
+        self.slot_table
+            .read()
+            .as_ref()
+            .map(|table| {
+                (0..TOTAL_SLOTS as SlotId)
+                    .map(|slot_id| (slot_id, table.slot_owner(slot_id)))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Get all shard IDs currently registered.
+    pub fn get_all_shard_ids(&self) -> Vec<ShardId> {
+        self.router.shard_ids()
+    }
+
+    /// Handle incoming shard creation broadcast from another node.
+    ///
+    /// IMPORTANT: This handler is idempotent - safe to call multiple times.
+    /// Uses epoch-based consistency to prevent stale updates.
+    pub async fn handle_shard_creation_broadcast(
+        &self,
+        broadcast: ShardCreationBroadcast,
+    ) -> Result<ShardCreationAck> {
+        // Epoch protection: reject stale broadcasts
+        let current_epoch = self.get_slot_table_epoch();
+        if broadcast.new_epoch <= current_epoch {
+            tracing::info!(
+                broadcast_epoch = broadcast.new_epoch,
+                current_epoch = current_epoch,
+                "Ignoring stale shard creation broadcast (already have this or newer epoch)"
+            );
+            return Ok(ShardCreationAck::success(
+                broadcast.request_id,
+                current_epoch,
+            ));
+        }
+
+        tracing::info!(
+            node_id = self.node_id,
+            shard_id = broadcast.shard_id,
+            new_epoch = broadcast.new_epoch,
+            originator = broadcast.originator_node,
+            slots_assigned = broadcast.slot_assignments.len(),
+            "Received shard creation broadcast"
+        );
+
+        // Create shard locally if not exists (idempotent)
+        if self.router.get_shard(broadcast.shard_id).is_none() {
+            if let Err(e) = self.create_shard(broadcast.shard_id).await {
+                // If shard already exists, that's fine (idempotent)
+                if !matches!(e, Error::ShardAlreadyExists(_)) {
+                    tracing::error!(
+                        shard_id = broadcast.shard_id,
+                        error = %e,
+                        "Failed to create shard from broadcast"
+                    );
+                    return Ok(ShardCreationAck::error(
+                        broadcast.request_id,
+                        current_epoch,
+                        format!("Failed to create shard: {}", e),
+                    ));
+                }
+            }
+        }
+
+        // Update slot table with new assignments
+        if let Some(slot_table) = self.slot_table.read().as_ref() {
+            // Apply slot reassignments
+            let slots_to_reassign: Vec<SlotId> = broadcast
+                .slot_assignments
+                .iter()
+                .map(|(slot_id, _)| *slot_id)
+                .collect();
+
+            if !slots_to_reassign.is_empty() {
+                let reassignment =
+                    slot_table.reassign_slots(&slots_to_reassign, broadcast.shard_id);
+
+                // Register migrations for affected slots
+                if let Some(migrator) = self.slot_migrator.read().as_ref() {
+                    migrator.register_from_reassignment(&reassignment.moves);
+                }
+            }
+        }
+
+        // Update control plane if present
+        if let Some(control_plane) = self.slot_control_plane.read().as_ref() {
+            // Ensure the shard is registered in control plane
+            let info = control_plane.get_shard_info(broadcast.shard_id);
+            if info.is_none() {
+                // The control plane may need to be updated separately
+                // For now, the slot table update handles the core routing
+            }
+        }
+
+        let new_epoch = self.get_slot_table_epoch();
+        tracing::info!(
+            node_id = self.node_id,
+            shard_id = broadcast.shard_id,
+            new_epoch = new_epoch,
+            "Applied shard creation broadcast"
+        );
+
+        Ok(ShardCreationAck::success(broadcast.request_id, new_epoch))
+    }
+
+    /// Broadcast shard creation to all peers.
+    ///
+    /// Called after creating a shard locally to notify all cluster nodes.
+    /// Best-effort: failures are logged but don't block the operation.
+    /// Peers can catch up later via sync_cluster_state().
+    pub async fn broadcast_shard_creation(
+        &self,
+        shard_id: ShardId,
+        slot_assignments: Vec<(SlotId, ShardId)>,
+        new_epoch: u64,
+    ) -> Result<()> {
+        let peers = self.get_known_peers();
+        if peers.is_empty() {
+            tracing::debug!(
+                node_id = self.node_id,
+                shard_id,
+                "No peers to broadcast shard creation to"
+            );
+            return Ok(());
+        }
+
+        let request_id = self.next_request_id();
+        let broadcast = ShardCreationBroadcast::new(
+            request_id,
+            shard_id,
+            slot_assignments,
+            new_epoch,
+            self.node_id,
+        );
+
+        let msg = crate::network::rpc::Message::ShardCreationBroadcast(broadcast);
+
+        // Fan-out to all peers using shard forwarder's transport
+        let mut success_count = 0;
+        for peer_id in &peers {
+            if let Some(peer_addr) = self.get_node_address(*peer_id) {
+                match self
+                    .shard_forwarder
+                    .send_raw_message(*peer_id, peer_addr, msg.clone())
+                    .await
+                {
+                    Ok(_) => success_count += 1,
+                    Err(e) => {
+                        tracing::warn!(
+                            peer = peer_id,
+                            error = %e,
+                            "Failed to send shard creation broadcast"
+                        );
+                    }
+                }
+            } else {
+                tracing::warn!(
+                    peer = peer_id,
+                    "No address known for peer, skipping broadcast"
+                );
+            }
+        }
+
+        tracing::info!(
+            node_id = self.node_id,
+            shard_id,
+            new_epoch,
+            peers_notified = success_count,
+            total_peers = peers.len(),
+            "Broadcast shard creation"
+        );
+
+        Ok(())
+    }
+
+    /// Handle topology request from another node.
+    ///
+    /// Returns the current topology state so the requesting node can catch up.
+    pub fn handle_get_topology(&self, request: GetTopologyRequest) -> TopologyResponse {
+        let current_epoch = self.get_slot_table_epoch();
+        let shard_ids = self.get_all_shard_ids();
+        let slot_assignments = self.get_all_slot_assignments();
+
+        tracing::debug!(
+            node_id = self.node_id,
+            requesting_node = request.requesting_node,
+            request_epoch = request.current_epoch,
+            our_epoch = current_epoch,
+            "Responding to topology request"
+        );
+
+        TopologyResponse::new(
+            request.request_id,
+            current_epoch,
+            shard_ids,
+            slot_assignments,
+        )
+    }
+
+    /// Synchronize cluster state on startup or when detecting epoch mismatch.
+    ///
+    /// This pulls the latest topology from a peer node to catch up on any
+    /// shard creation broadcasts that were missed.
+    pub async fn sync_cluster_state(&self) -> Result<()> {
+        let current_epoch = self.get_slot_table_epoch();
+        let peers = self.get_known_peers();
+
+        if peers.is_empty() {
+            tracing::debug!(
+                node_id = self.node_id,
+                "No peers available for cluster state sync"
+            );
+            return Ok(());
+        }
+
+        for peer_id in peers {
+            let request =
+                GetTopologyRequest::new(self.next_request_id(), self.node_id, current_epoch);
+
+            // Send topology request to peer
+            if let Some(peer_addr) = self.get_node_address(peer_id) {
+                let msg = crate::network::rpc::Message::GetTopology(request);
+
+                match self
+                    .shard_forwarder
+                    .send_raw_message_with_response(peer_id, peer_addr, msg)
+                    .await
+                {
+                    Ok(crate::network::rpc::Message::TopologyResponse(response)) => {
+                        // Re-check epoch under consideration of potential concurrent updates
+                        let local_epoch = self.get_slot_table_epoch();
+                        if response.current_epoch > local_epoch {
+                            tracing::info!(
+                                node_id = self.node_id,
+                                peer = peer_id,
+                                peer_epoch = response.current_epoch,
+                                local_epoch,
+                                shards = response.shard_ids.len(),
+                                "Catching up from peer with newer epoch"
+                            );
+
+                            // Create any missing shards
+                            for &shard_id in &response.shard_ids {
+                                if self.router.get_shard(shard_id).is_none() {
+                                    if let Err(e) = self.create_shard(shard_id).await {
+                                        if !matches!(e, Error::ShardAlreadyExists(_)) {
+                                            tracing::warn!(
+                                                shard_id,
+                                                error = %e,
+                                                "Failed to create shard during sync"
+                                            );
+                                        }
+                                    }
+                                }
+                            }
+
+                            // Apply slot assignments if we have a slot table
+                            if let Some(slot_table) = self.slot_table.read().as_ref() {
+                                // Build reassignment from the response
+                                let mut moves = Vec::new();
+                                for (slot_id, new_owner) in &response.slot_assignments {
+                                    let current_owner = slot_table.slot_owner(*slot_id);
+                                    if current_owner != *new_owner {
+                                        moves.push((*slot_id, current_owner, *new_owner));
+                                    }
+                                }
+
+                                if !moves.is_empty() {
+                                    // Group by target shard and apply
+                                    let mut by_target: HashMap<ShardId, Vec<SlotId>> =
+                                        HashMap::new();
+                                    for (slot_id, _from, to) in &moves {
+                                        by_target.entry(*to).or_default().push(*slot_id);
+                                    }
+
+                                    for (target, slots) in by_target {
+                                        let reassignment =
+                                            slot_table.reassign_slots(&slots, target);
+
+                                        // Register migrations
+                                        if let Some(migrator) = self.slot_migrator.read().as_ref() {
+                                            migrator
+                                                .register_from_reassignment(&reassignment.moves);
+                                        }
+                                    }
+
+                                    tracing::info!(
+                                        node_id = self.node_id,
+                                        slots_updated = moves.len(),
+                                        "Applied topology updates from sync"
+                                    );
+                                }
+                            }
+
+                            return Ok(());
+                        }
+                    }
+                    Ok(other) => {
+                        tracing::warn!(
+                            peer = peer_id,
+                            msg_type = ?other,
+                            "Unexpected response to topology request"
+                        );
+                        continue;
+                    }
+                    Err(e) => {
+                        tracing::warn!(peer = peer_id, error = %e, "Failed to get topology from peer");
+                        continue;
+                    }
+                }
+            }
+        }
+
+        tracing::debug!(
+            node_id = self.node_id,
+            "Cluster state sync complete (no updates needed or available)"
+        );
+
+        Ok(())
+    }
+
+    // ==================== End Shard Coordination Broadcast ====================
 
     // ==================== End Slot-Based Routing ====================
 }

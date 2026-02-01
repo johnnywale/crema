@@ -292,10 +292,12 @@ impl RecoveryTestCluster {
         };
 
         // Checkpoint configuration
+        // Use lower min_free_space for tests (1MB instead of 100MB default)
         let checkpoint_config = CheckpointConfig::new(checkpoint_dir.to_path_buf())
             .with_log_threshold(self.config.checkpoint_log_threshold)
             .with_max_snapshots(self.config.checkpoint_max_snapshots)
-            .with_compression(true);
+            .with_compression(true)
+            .with_min_free_space(1024 * 1024); // 1MB for tests
 
         // Create memberlist discovery
         let memberlist_addr: SocketAddr = format!("127.0.0.1:{}", memberlist_port).parse().unwrap();

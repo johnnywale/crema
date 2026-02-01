@@ -5,6 +5,7 @@
 
 use crate::consensus::transport::RaftMessageSender;
 use crate::error::{Error, Result};
+use crate::metrics::facade::{counter_inc, gauge_set, histogram_record};
 use crate::network::rpc::{Message, ShardForwardResponse, ShardForwardedCommand, ShardId};
 use crate::types::{CacheCommand, NodeId};
 use bytes::Bytes;
@@ -160,14 +161,23 @@ impl ShardForwarder {
     }
 
     /// Forward a command to a specific node for a shard.
+    #[allow(unused_variables)]
     pub async fn forward_to_node(
         &self,
         target_node: NodeId,
         shard_id: ShardId,
         command: CacheCommand,
     ) -> Result<ForwardResult> {
+        let start_time = Instant::now();
+        let node_id_str = self.node_id.to_string();
+        let shard_id_str = shard_id.to_string();
+
+        // Record forward attempt
+        counter_inc!("crema_shard_forwards_total", "node_id" => node_id_str.clone(), "shard_id" => shard_id_str.clone(), "success" => "attempt");
+
         // Check if forwarding is enabled
         if !self.config.enabled {
+            counter_inc!("crema_shard_forward_failures_total", "node_id" => node_id_str.clone(), "reason" => "disabled");
             return Err(Error::ShardNotLocal {
                 shard_id,
                 target_node: Some(target_node),
@@ -176,6 +186,7 @@ impl ShardForwarder {
 
         // Backpressure check
         if self.pending_forwards.len() >= self.config.max_pending_forwards {
+            counter_inc!("crema_shard_forward_failures_total", "node_id" => node_id_str.clone(), "reason" => "backpressure");
             return Err(Error::ServerBusy {
                 pending: self.pending_forwards.len(),
             });
@@ -216,23 +227,36 @@ impl ShardForwarder {
         // NetworkServer -> CacheMessageHandler -> handle_response())
         if let Err(e) = transport.send_message(target_node, msg).await {
             self.pending_forwards.remove(&request_id);
+            counter_inc!("crema_shard_forward_failures_total", "node_id" => node_id_str.clone(), "reason" => "send_failed");
+            histogram_record!("crema_shard_forward_duration_seconds", start_time.elapsed().as_secs_f64(), "node_id" => node_id_str, "shard_id" => shard_id_str);
             return Err(Error::ForwardFailed(format!(
                 "Failed to send to node {}: {}",
                 target_node, e
             )));
         }
 
+        // Update pending gauge
+        gauge_set!("crema_shard_forward_pending", self.pending_forwards.len() as f64, "node_id" => node_id_str.clone());
+
         // Wait for response with timeout
         match tokio::time::timeout(self.config.timeout, rx).await {
-            Ok(Ok(result)) => Ok(result),
+            Ok(Ok(result)) => {
+                counter_inc!("crema_shard_forwards_total", "node_id" => node_id_str.clone(), "shard_id" => shard_id_str.clone(), "success" => if result.success { "true" } else { "false" });
+                histogram_record!("crema_shard_forward_duration_seconds", start_time.elapsed().as_secs_f64(), "node_id" => node_id_str, "shard_id" => shard_id_str);
+                Ok(result)
+            }
             Ok(Err(_)) => {
                 // Channel closed
                 self.pending_forwards.remove(&request_id);
+                counter_inc!("crema_shard_forward_failures_total", "node_id" => node_id_str.clone(), "reason" => "channel_closed");
+                histogram_record!("crema_shard_forward_duration_seconds", start_time.elapsed().as_secs_f64(), "node_id" => node_id_str, "shard_id" => shard_id_str);
                 Err(Error::Internal("forward channel closed".into()))
             }
             Err(_) => {
                 // Timeout
                 self.pending_forwards.remove(&request_id);
+                counter_inc!("crema_shard_forward_failures_total", "node_id" => node_id_str.clone(), "reason" => "timeout");
+                histogram_record!("crema_shard_forward_duration_seconds", start_time.elapsed().as_secs_f64(), "node_id" => node_id_str, "shard_id" => shard_id_str);
                 Err(Error::Timeout)
             }
         }
@@ -290,6 +314,90 @@ impl ShardForwarder {
     /// Get the configured timeout for forwarded requests.
     pub fn timeout(&self) -> Duration {
         self.config.timeout
+    }
+
+    /// Send a raw message to a node without expecting a specific response format.
+    ///
+    /// This is used for broadcasts and other messages where we don't need to track
+    /// the response in the pending_forwards map.
+    pub async fn send_raw_message(
+        &self,
+        target_node: NodeId,
+        _target_addr: SocketAddr,
+        msg: Message,
+    ) -> Result<()> {
+        // Get transport (required for sending)
+        let transport =
+            self.transport.read().clone().ok_or_else(|| {
+                Error::Internal("ShardForwarder transport not initialized".into())
+            })?;
+
+        // Send the message via transport
+        transport.send_message(target_node, msg).await?;
+        Ok(())
+    }
+
+    /// Send a raw message and wait for a response.
+    ///
+    /// This is used for request-response patterns like GetTopology where we need
+    /// to wait for a specific response.
+    pub async fn send_raw_message_with_response(
+        &self,
+        target_node: NodeId,
+        target_addr: SocketAddr,
+        msg: Message,
+    ) -> Result<Message> {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpStream;
+
+        // For request-response patterns, we need to establish a direct connection
+        // and wait for the response, since the regular transport is fire-and-forget
+        // for some message types.
+
+        let mut stream = TcpStream::connect(target_addr).await.map_err(|e| {
+            Error::Network(crate::error::NetworkError::ConnectionFailed {
+                addr: target_addr.to_string(),
+                reason: e.to_string(),
+            })
+        })?;
+
+        // Serialize and send the message
+        let framed = crate::network::rpc::frame_message(&msg).map_err(|e| {
+            Error::Network(crate::error::NetworkError::Serialization(e.to_string()))
+        })?;
+
+        stream
+            .write_all(&framed)
+            .await
+            .map_err(|e| Error::Network(crate::error::NetworkError::SendFailed(e.to_string())))?;
+
+        // Read response with timeout
+        let timeout_duration = self.config.timeout;
+        let response = tokio::time::timeout(timeout_duration, async {
+            // Read length prefix
+            let mut len_buf = [0u8; 4];
+            stream.read_exact(&mut len_buf).await?;
+            let len = u32::from_be_bytes(len_buf) as usize;
+
+            // Read message body
+            let mut buf = vec![0u8; len];
+            stream.read_exact(&mut buf).await?;
+
+            // Deserialize
+            crate::network::rpc::decode_message(&buf)
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))
+        })
+        .await
+        .map_err(|_| Error::Timeout)?
+        .map_err(|e| Error::Network(crate::error::NetworkError::ReceiveFailed(e.to_string())))?;
+
+        tracing::debug!(
+            node_id = self.node_id,
+            target_node,
+            "Received response to raw message"
+        );
+
+        Ok(response)
     }
 }
 
