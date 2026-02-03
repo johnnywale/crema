@@ -459,6 +459,9 @@ impl MultiRaftCoordinator {
         *self.state.write() = CoordinatorState::Running;
         self.running.store(true, Ordering::Relaxed);
 
+        // Start the shard forwarder cleanup loop to prevent memory leaks
+        self.shard_forwarder.start_cleanup_loop();
+
         tracing::info!(
             node_id = self.node_id,
             num_shards = self.config.num_shards,
@@ -507,12 +510,16 @@ impl MultiRaftCoordinator {
         // Drop the lock before async operation to avoid holding across await
         drop(shard_configs_guard);
 
+        // Helper to rollback on failure - removes config entry
+        let rollback = || {
+            self.shard_configs.write().remove(&shard_id);
+        };
+
         // Create the shard (this is async and might fail)
         let shard = match Shard::new(shard_config.clone()).await {
             Ok(s) => Arc::new(s),
             Err(e) => {
-                // Rollback: remove the config we just inserted
-                self.shard_configs.write().remove(&shard_id);
+                rollback();
                 return Err(e);
             }
         };
@@ -548,11 +555,21 @@ impl MultiRaftCoordinator {
                     );
                 }
                 Err(e) => {
-                    tracing::warn!(
+                    // ROLLBACK HAZARD FIX: If ShardRaftNode creation fails and per-shard
+                    // Raft was explicitly requested, we should fail the entire operation
+                    // rather than silently falling back. The caller can decide to retry
+                    // or handle the failure appropriately.
+                    tracing::error!(
                         shard_id,
                         error = %e,
-                        "Failed to create per-shard Raft node, falling back to Phase 1"
+                        "Failed to create per-shard Raft node"
                     );
+                    // Rollback the config entry since shard creation failed
+                    rollback();
+                    return Err(Error::Internal(format!(
+                        "Failed to create per-shard Raft node for shard {}: {}",
+                        shard_id, e
+                    )));
                 }
             }
         }
@@ -712,7 +729,8 @@ impl MultiRaftCoordinator {
                         .or_else(|| self.leader_tracker.get_leader(shard_id));
 
                     // Debug: Log read forwarding decisions
-                    static READ_FWD_LOG: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+                    static READ_FWD_LOG: std::sync::atomic::AtomicU64 =
+                        std::sync::atomic::AtomicU64::new(0);
                     let log_count = READ_FWD_LOG.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     if log_count < 20 {
                         eprintln!(
@@ -746,18 +764,13 @@ impl MultiRaftCoordinator {
                                             );
                                         }
                                         if forward_result.value.is_some() {
-                                            self.metrics
-                                                .record_get(true, start.elapsed());
+                                            self.metrics.record_get(true, start.elapsed());
                                             return Ok(forward_result.value);
                                         }
                                     }
                                     Err(e) => {
                                         if log_count < 20 {
-                                            eprintln!(
-                                                "[READ-FWD] #{} ERROR: {}",
-                                                log_count,
-                                                e
-                                            );
+                                            eprintln!("[READ-FWD] #{} ERROR: {}", log_count, e);
                                         }
                                         tracing::debug!(
                                             shard_id,
@@ -831,22 +844,57 @@ impl MultiRaftCoordinator {
     /// Returns true if the key became visible within the timeout, false otherwise.
     /// This is used to ensure read-your-writes consistency after forwarding a write
     /// to the shard leader.
+    ///
+    /// Uses exponential backoff to balance responsiveness with CPU efficiency:
+    /// - Starts at 1ms for quick responses when Raft replication is fast
+    /// - Doubles each iteration up to 50ms cap to reduce polling overhead
+    ///
+    /// # Read-Your-Writes Consistency
+    ///
+    /// When `expected_value_hash` is provided, this method checks that the specific
+    /// value has been replicated (not just that any value exists for the key).
+    /// This prevents false positives when overwriting existing keys.
     async fn wait_for_local_visibility(
         &self,
         shard_id: ShardId,
         key: &Bytes,
+        expected_value_hash: Option<u64>,
         timeout: Duration,
     ) -> bool {
         let start = Instant::now();
+        // Exponential backoff: 1ms, 2ms, 4ms, 8ms, 16ms, 32ms, 50ms (capped)
+        let mut sleep_ms = 1u64;
+        const MAX_SLEEP_MS: u64 = 50;
+
         while start.elapsed() < timeout {
             if let Some(shard) = self.router.get_shard(shard_id) {
-                if shard.storage().get(key).await.is_some() {
-                    return true;
+                if let Some(stored_value) = shard.storage().get(key).await {
+                    // If we have an expected hash, verify it matches
+                    if let Some(expected_hash) = expected_value_hash {
+                        let actual_hash = Self::hash_value(&stored_value);
+                        if actual_hash == expected_hash {
+                            return true;
+                        }
+                        // Value exists but hash doesn't match - old value, keep waiting
+                    } else {
+                        // No hash check requested, key existence is sufficient
+                        return true;
+                    }
                 }
             }
-            tokio::time::sleep(Duration::from_millis(5)).await;
+            tokio::time::sleep(Duration::from_millis(sleep_ms)).await;
+            sleep_ms = (sleep_ms * 2).min(MAX_SLEEP_MS);
         }
         false
+    }
+
+    /// Compute a hash of a value for read-your-writes verification.
+    #[inline]
+    fn hash_value(value: &[u8]) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        value.hash(&mut hasher);
+        hasher.finish()
     }
 
     /// Put a value in the cache.
@@ -909,10 +957,12 @@ impl MultiRaftCoordinator {
                                 if forward_result.success {
                                     // Wait for replication to local storage (max 1 second)
                                     // This ensures read-your-writes consistency for the calling node
+                                    // Pass expected value hash to verify the correct value is replicated
                                     let _ = self
                                         .wait_for_local_visibility(
                                             *shard_id,
                                             &key,
+                                            Some(Self::hash_value(&value)),
                                             Duration::from_secs(1),
                                         )
                                         .await;
@@ -988,10 +1038,12 @@ impl MultiRaftCoordinator {
                                 if forward_result.success {
                                     // Wait for replication to local storage (max 1 second)
                                     // This ensures read-your-writes consistency for the calling node
+                                    // Pass expected value hash to verify the correct value is replicated
                                     let _ = self
                                         .wait_for_local_visibility(
                                             shard_id,
                                             &key,
+                                            Some(Self::hash_value(&value)),
                                             Duration::from_secs(1),
                                         )
                                         .await;
@@ -1072,10 +1124,12 @@ impl MultiRaftCoordinator {
                                 if forward_result.success {
                                     // Wait for replication to local storage (max 1 second)
                                     // This ensures read-your-writes consistency for the calling node
+                                    // Pass expected value hash to verify the correct value is replicated
                                     let _ = self
                                         .wait_for_local_visibility(
                                             *shard_id,
                                             &key,
+                                            Some(Self::hash_value(&value)),
                                             Duration::from_secs(1),
                                         )
                                         .await;
@@ -1149,10 +1203,12 @@ impl MultiRaftCoordinator {
                                 if forward_result.success {
                                     // Wait for replication to local storage (max 1 second)
                                     // This ensures read-your-writes consistency for the calling node
+                                    // Pass expected value hash to verify the correct value is replicated
                                     let _ = self
                                         .wait_for_local_visibility(
                                             shard_id,
                                             &key,
+                                            Some(Self::hash_value(&value)),
                                             Duration::from_secs(1),
                                         )
                                         .await;
@@ -1512,17 +1568,22 @@ impl MultiRaftCoordinator {
     // ==================== End Storage Integration ====================
 
     /// Update the leader for a shard.
+    ///
+    /// Updates leader_tracker first for consistent ordering with other methods.
+    /// This ensures both router and tracker see consistent state.
     pub fn set_shard_leader(&self, shard_id: ShardId, leader: NodeId) {
+        // Update leader_tracker first (consistent ordering with set_shard_leader_if_newer
+        // and set_local_shard_leader)
+        let tracker_current = self.leader_tracker.get_leader(shard_id);
+        if tracker_current != Some(leader) {
+            self.leader_tracker.set_local_leader(shard_id, leader);
+        }
+
+        // Then update router
         self.router.set_shard_leader(shard_id, leader);
 
         if let Some(shard) = self.router.get_shard(shard_id) {
             shard.set_is_leader(leader == self.node_id);
-        }
-
-        // Also update leader_tracker (used by migration)
-        let tracker_current = self.leader_tracker.get_leader(shard_id);
-        if tracker_current != Some(leader) {
-            self.leader_tracker.set_local_leader(shard_id, leader);
         }
     }
 
@@ -1588,14 +1649,15 @@ impl MultiRaftCoordinator {
             }
         }
 
-        // Clear router cache to ensure routing decisions are recalculated
-        // This is critical: stale cache could route to wrong nodes after topology change
-        self.router.clear_cache();
+        // Invalidate only affected shards in router cache, not the entire cache
+        // This preserves cached routing for unaffected shards (performance optimization)
+        let cache_entries_removed = self.router.invalidate_for_shards(&invalidated);
 
         tracing::debug!(
             node_id,
             invalidated_shards = invalidated.len(),
-            "Invalidated leaders and cleared router cache for node failure"
+            cache_entries_removed,
+            "Invalidated leaders and targeted router cache entries for node failure"
         );
 
         invalidated
@@ -2209,20 +2271,8 @@ impl MultiRaftCoordinator {
                 for shard_id in 0..num_shards {
                     if let Some(shard_node) = manager.get_shard(shard_id) {
                         if let Some(leader_id) = shard_node.leader_id() {
-                            // Check if router already has this leader
-                            let current = router.get_shard_leader(shard_id);
-                            if current != Some(leader_id) {
-                                router.set_shard_leader(shard_id, leader_id);
-                                tracing::debug!(
-                                    node_id,
-                                    shard_id,
-                                    leader_id,
-                                    "Synced shard leader to router"
-                                );
-                            }
-
-                            // Also update leader_tracker (used by migration)
-                            // Use set_local_leader which auto-increments epoch
+                            // Update leader_tracker first (consistent ordering with set_shard_leader)
+                            // This ensures both structures see consistent state
                             let tracker_current = leader_tracker.get_leader(shard_id);
                             if tracker_current != Some(leader_id) {
                                 leader_tracker.set_local_leader(shard_id, leader_id);
@@ -2231,6 +2281,18 @@ impl MultiRaftCoordinator {
                                     shard_id,
                                     leader_id,
                                     "Synced shard leader to leader_tracker"
+                                );
+                            }
+
+                            // Then update router
+                            let current = router.get_shard_leader(shard_id);
+                            if current != Some(leader_id) {
+                                router.set_shard_leader(shard_id, leader_id);
+                                tracing::debug!(
+                                    node_id,
+                                    shard_id,
+                                    leader_id,
+                                    "Synced shard leader to router"
                                 );
                             }
 
@@ -2581,6 +2643,9 @@ impl MultiRaftCoordinator {
         *self.state.write() = CoordinatorState::ShuttingDown;
         self.running.store(false, Ordering::Relaxed);
 
+        // Stop the shard forwarder cleanup loop
+        self.shard_forwarder.shutdown();
+
         // Pause any ongoing migrations
         if let Some(ref coordinator) = *self.migration_coordinator.read() {
             coordinator.pause();
@@ -2671,10 +2736,10 @@ impl MultiRaftCoordinator {
         // Create slot table with current shard count
         let slot_table = Arc::new(SlotTable::new(self.config.num_shards as usize));
 
-        // Create control plane
+        // Create control plane with node_id for globally unique shard IDs
         let control_plane = Arc::new(SlotControlPlane::new(
             slot_table.clone(),
-            ControlPlaneConfig::default(),
+            ControlPlaneConfig::new(self.node_id),
         ));
 
         // Create migrator with node_id for claim ownership

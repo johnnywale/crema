@@ -103,24 +103,45 @@ impl MigrationProgress {
         }
     }
 
-    /// Get progress percentage.
+    /// Get progress percentage (0.0 to 100.0, clamped).
     pub fn percentage(&self) -> f64 {
         if self.total_entries == 0 {
             return 100.0;
         }
-        (self.transferred_entries as f64 / self.total_entries as f64) * 100.0
+        let pct = (self.transferred_entries as f64 / self.total_entries as f64) * 100.0;
+        // Clamp to valid range and handle NaN (shouldn't happen but defensive)
+        if pct.is_finite() {
+            pct.clamp(0.0, 100.0)
+        } else {
+            0.0
+        }
     }
 
     /// Update progress.
     pub fn update(&mut self, entries: u64, bytes: u64, rate: f64) {
         self.transferred_entries += entries;
         self.transferred_bytes += bytes;
-        self.transfer_rate = rate;
+        // Sanitize rate: replace NaN/negative with 0
+        self.transfer_rate = if rate.is_finite() && rate >= 0.0 {
+            rate
+        } else {
+            0.0
+        };
 
-        // Calculate ETA
-        if rate > 0.0 {
+        // Calculate ETA with overflow protection
+        if self.transfer_rate > 0.0 {
             let remaining_bytes = self.total_bytes.saturating_sub(self.transferred_bytes);
-            self.eta_seconds = Some((remaining_bytes as f64 / rate) as u64);
+            let eta_secs = remaining_bytes as f64 / self.transfer_rate;
+            // Cap ETA at u64::MAX and handle NaN/Inf
+            if eta_secs.is_finite() && eta_secs >= 0.0 {
+                // Cap at ~1 year (reasonable maximum ETA)
+                const MAX_ETA_SECONDS: u64 = 365 * 24 * 60 * 60;
+                self.eta_seconds = Some((eta_secs as u64).min(MAX_ETA_SECONDS));
+            } else {
+                self.eta_seconds = None;
+            }
+        } else {
+            self.eta_seconds = None;
         }
     }
 
@@ -355,8 +376,19 @@ impl TokenBucketRateLimiter {
     /// Acquire tokens, waiting if necessary.
     ///
     /// Returns the duration waited, if any.
+    ///
+    /// # Sleep Resolution
+    ///
+    /// tokio::time::sleep has poor resolution on some platforms (~15ms on Windows).
+    /// For very small waits (< 5ms), we allow the request to proceed without sleeping
+    /// to avoid severe throughput throttling. This enables natural burstiness while
+    /// still rate-limiting larger requests.
     pub async fn acquire(&self, bytes: u64) -> Duration {
         let start = Instant::now();
+
+        // Minimum sleep threshold - below this, allow burst instead of sleeping
+        // Windows has ~15ms resolution, so sleeping for 1ms actually sleeps ~15ms
+        const MIN_SLEEP_THRESHOLD: Duration = Duration::from_millis(5);
 
         // Fast path: try to acquire immediately
         if self.try_acquire(bytes) {
@@ -375,7 +407,16 @@ impl TokenBucketRateLimiter {
             // Calculate wait time
             let needed = bytes.saturating_sub(current);
             let wait_secs = needed as f64 / self.refill_rate as f64;
-            let wait_duration = Duration::from_secs_f64(wait_secs.max(0.001)); // Min 1ms
+            let wait_duration = Duration::from_secs_f64(wait_secs);
+
+            // For very small waits, allow burst instead of sleeping
+            // This prevents severe throughput throttling due to sleep resolution
+            if wait_duration < MIN_SLEEP_THRESHOLD {
+                // Allow the request through by consuming tokens (may go negative briefly)
+                // The bucket will recover naturally through refills
+                self.tokens.fetch_sub(bytes.min(current), Ordering::AcqRel);
+                break;
+            }
 
             tokio::time::sleep(wait_duration).await;
         }
@@ -615,22 +656,75 @@ pub struct TransferBatch {
     pub entries: Vec<TransferEntry>,
     /// Whether this is the final batch.
     pub is_final: bool,
+    /// CRC32 checksum for data integrity verification.
+    /// Computed over entries when created, verified when received.
+    #[serde(default)]
+    pub checksum: u32,
 }
 
 impl TransferBatch {
-    /// Create a new batch.
+    /// Create a new batch with automatic checksum computation.
     pub fn new(
         migration_id: Uuid,
         sequence: u64,
         entries: Vec<TransferEntry>,
         is_final: bool,
     ) -> Self {
+        let checksum = Self::compute_checksum(&entries);
         Self {
             migration_id,
             sequence,
             entries,
             is_final,
+            checksum,
         }
+    }
+
+    /// Compute CRC32 checksum over all entries in the batch.
+    fn compute_checksum(entries: &[TransferEntry]) -> u32 {
+        use crc::{Crc, CRC_32_ISCSI};
+        const CRC: Crc<u32> = Crc::<u32>::new(&CRC_32_ISCSI);
+        let mut digest = CRC.digest();
+        for entry in entries {
+            // Hash key, value, and expiration
+            digest.update(&entry.key);
+            digest.update(&entry.value);
+            if let Some(expires) = entry.expires_at_nanos {
+                digest.update(&expires.to_le_bytes());
+            }
+        }
+        digest.finalize()
+    }
+
+    /// Verify the checksum matches the entries.
+    /// Returns true if checksum is valid or if checksum is 0 (legacy batches).
+    pub fn verify_checksum(&self) -> bool {
+        // Allow legacy batches without checksum (checksum == 0 from default)
+        if self.checksum == 0 && !self.entries.is_empty() {
+            tracing::debug!(
+                migration_id = %self.migration_id,
+                sequence = self.sequence,
+                "Legacy batch without checksum"
+            );
+            return true;
+        }
+        let computed = Self::compute_checksum(&self.entries);
+        if computed != self.checksum {
+            tracing::error!(
+                migration_id = %self.migration_id,
+                sequence = self.sequence,
+                expected = self.checksum,
+                actual = computed,
+                "TransferBatch checksum mismatch - data corruption detected"
+            );
+            return false;
+        }
+        true
+    }
+
+    /// Recompute and update the checksum (call after modifying entries).
+    pub fn update_checksum(&mut self) {
+        self.checksum = Self::compute_checksum(&self.entries);
     }
 
     /// Get total size of the batch.
@@ -648,9 +742,14 @@ impl TransferBatch {
         self.entries.is_empty()
     }
 
-    /// Filter out expired entries.
+    /// Filter out expired entries and update checksum.
     pub fn filter_expired(mut self) -> Self {
+        let original_len = self.entries.len();
         self.entries.retain(|e| !e.is_expired());
+        // Recompute checksum if entries were filtered
+        if self.entries.len() != original_len {
+            self.update_checksum();
+        }
         self
     }
 }

@@ -6,9 +6,9 @@
 
 use crate::error::{Error, Result};
 use crate::types::NodeId;
+use dashmap::DashMap;
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -22,6 +22,7 @@ use super::migration_metrics::MigrationMetrics;
 use super::migration_routing::{
     DualWriteTracker, MigrationRouter, MigrationRoutingStrategy, RoutingDecision,
 };
+use super::persistent_migration_store::PersistentMigrationStore;
 use super::shard::ShardId;
 use super::shard_placement::{ShardMovement, ShardPlacement};
 use super::shard_registry::{ShardLifecycleState, ShardRegistry};
@@ -220,7 +221,11 @@ pub struct MigrationOrchestrator {
     #[allow(dead_code)]
     running: AtomicBool,
     /// Active orchestrations by shard.
-    active_orchestrations: RwLock<HashMap<ShardId, OrchestrationState>>,
+    ///
+    /// Uses DashMap instead of RwLock<HashMap> for per-shard lock granularity.
+    /// This avoids a global lock bottleneck when multiple shards are being
+    /// migrated concurrently.
+    active_orchestrations: DashMap<ShardId, OrchestrationState>,
     /// Shared rate limiter for bandwidth control.
     rate_limiter: Arc<SharedRateLimiter>,
     /// Pipeline configuration.
@@ -230,6 +235,9 @@ pub struct MigrationOrchestrator {
     /// Current coordinator term for zombie fencing.
     /// Commands from old coordinators (stale terms) are rejected.
     coordinator_term: AtomicU64,
+    /// Optional persistent store for crash recovery.
+    /// Used to persist coordinator term across restarts.
+    persistent_store: RwLock<Option<Arc<dyn PersistentMigrationStore>>>,
 }
 
 /// State of an ongoing orchestration.
@@ -268,11 +276,12 @@ impl MigrationOrchestrator {
             raft_proposer: RwLock::new(None),
             data_transporter: RwLock::new(None),
             running: AtomicBool::new(false),
-            active_orchestrations: RwLock::new(HashMap::new()),
+            active_orchestrations: DashMap::new(),
             rate_limiter,
             pipeline_config: PipelineConfig::default(),
             dual_write_tracker: Arc::new(DualWriteTracker::new()),
             coordinator_term: AtomicU64::new(0),
+            persistent_store: RwLock::new(None),
         }
     }
 
@@ -285,6 +294,52 @@ impl MigrationOrchestrator {
     /// Set the Raft proposer for atomic commits.
     pub fn set_raft_proposer(&self, proposer: Arc<dyn MigrationRaftProposer>) {
         *self.raft_proposer.write() = Some(proposer);
+    }
+
+    /// Set the persistent store for crash recovery.
+    ///
+    /// When set, the coordinator term is persisted across restarts to prevent
+    /// zombie coordinators from interfering with the new coordinator.
+    pub fn set_persistent_store(&self, store: Arc<dyn PersistentMigrationStore>) {
+        *self.persistent_store.write() = Some(store);
+    }
+
+    /// Initialize the coordinator term from persistent storage.
+    ///
+    /// This should be called during startup to restore the coordinator term
+    /// and increment it to ensure this instance has a higher term than any
+    /// previous instance (including potential zombies).
+    ///
+    /// # Returns
+    ///
+    /// The new coordinator term, or 1 if no previous term was persisted.
+    pub async fn initialize_coordinator_term(&self) -> Result<u64> {
+        let store = self.persistent_store.read().clone();
+
+        let new_term = if let Some(store) = store {
+            // Load persisted term and increment
+            let persisted_term = store.load_coordinator_term().await?.unwrap_or(0);
+            let new_term = persisted_term + 1;
+
+            // Persist the new term BEFORE using it (crash safety)
+            store.save_coordinator_term(new_term).await?;
+
+            tracing::info!(
+                persisted_term,
+                new_term,
+                "Initialized coordinator term from persistent storage"
+            );
+            new_term
+        } else {
+            // No persistent store, start at 1
+            tracing::warn!(
+                "No persistent store configured, coordinator term will not survive restarts"
+            );
+            1
+        };
+
+        self.coordinator_term.store(new_term, Ordering::SeqCst);
+        Ok(new_term)
     }
 
     /// Set the data transporter.
@@ -311,6 +366,9 @@ impl MigrationOrchestrator {
     ///
     /// The term should be monotonically increasing. This is typically tied to
     /// the Raft term or a similar epoch counter.
+    ///
+    /// Note: This method does NOT persist the term. Use `set_coordinator_term_persistent`
+    /// for crash-safe term updates.
     pub fn set_coordinator_term(&self, term: u64) {
         let old_term = self.coordinator_term.swap(term, Ordering::SeqCst);
         if term != old_term {
@@ -318,11 +376,53 @@ impl MigrationOrchestrator {
         }
     }
 
+    /// Set the coordinator term and persist it to storage.
+    ///
+    /// This is the crash-safe version of `set_coordinator_term`. The term is
+    /// persisted to durable storage BEFORE being applied in memory, ensuring
+    /// that after a restart the new coordinator will have a higher term.
+    pub async fn set_coordinator_term_persistent(&self, term: u64) -> Result<()> {
+        // Persist BEFORE applying in memory (crash safety)
+        if let Some(store) = self.persistent_store.read().clone() {
+            store.save_coordinator_term(term).await?;
+        }
+
+        let old_term = self.coordinator_term.swap(term, Ordering::SeqCst);
+        if term != old_term {
+            tracing::info!(
+                old_term,
+                new_term = term,
+                "Coordinator term updated and persisted"
+            );
+        }
+        Ok(())
+    }
+
     /// Increment the coordinator term and return the new value.
+    ///
+    /// Note: This method does NOT persist the term. Use `increment_coordinator_term_persistent`
+    /// for crash-safe term updates.
     pub fn increment_coordinator_term(&self) -> u64 {
         let new_term = self.coordinator_term.fetch_add(1, Ordering::SeqCst) + 1;
         tracing::info!(new_term, "Coordinator term incremented");
         new_term
+    }
+
+    /// Increment the coordinator term and persist it to storage.
+    ///
+    /// This is the crash-safe version of `increment_coordinator_term`. The term is
+    /// persisted to durable storage BEFORE being applied in memory.
+    pub async fn increment_coordinator_term_persistent(&self) -> Result<u64> {
+        let new_term = self.coordinator_term.load(Ordering::SeqCst) + 1;
+
+        // Persist BEFORE applying in memory (crash safety)
+        if let Some(store) = self.persistent_store.read().clone() {
+            store.save_coordinator_term(new_term).await?;
+        }
+
+        self.coordinator_term.store(new_term, Ordering::SeqCst);
+        tracing::info!(new_term, "Coordinator term incremented and persisted");
+        Ok(new_term)
     }
 
     /// Validate that a command's term is not stale.
@@ -392,7 +492,6 @@ impl MigrationOrchestrator {
             routing_strategy: strategy.unwrap_or_else(|| self.router.default_strategy()),
         };
         self.active_orchestrations
-            .write()
             .insert(migration.shard_id, orch_state);
 
         self.metrics.record_migration_start();
@@ -493,6 +592,11 @@ impl MigrationOrchestrator {
         // Channel for passing batches from reader to writer
         let (tx, mut rx) = mpsc::channel::<TransferBatch>(self.pipeline_config.channel_buffer);
 
+        // Cancellation flag for backpressure - writer can signal reader to abort early
+        // This prevents the reader from wasting resources fetching batches when the writer has errored.
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let cancelled_reader = Arc::clone(&cancelled);
+
         // Spawn reader task
         let reader_transporter = Arc::clone(&transporter);
         let reader_paused = Arc::new(AtomicBool::new(false));
@@ -504,6 +608,12 @@ impl MigrationOrchestrator {
             let mut sequence = 0u64;
 
             loop {
+                // Check for cancellation from writer (backpressure fix)
+                if cancelled_reader.load(Ordering::SeqCst) {
+                    tracing::debug!(shard_id, "Reader cancelled by writer");
+                    break;
+                }
+
                 // Check for pause
                 if coordinator_for_pause.is_paused() {
                     reader_paused_check.store(true, Ordering::SeqCst);
@@ -527,10 +637,28 @@ impl MigrationOrchestrator {
                             last_key = Some(last_entry.key.clone());
                         }
 
-                        // Send to writer
-                        if tx.send(batch).await.is_err() {
-                            // Writer dropped, stop reading
-                            break;
+                        // Send to writer (or abort if cancelled)
+                        // Use try_send first to check if channel is full, then check cancellation
+                        loop {
+                            match tx.try_send(batch.clone()) {
+                                Ok(()) => break,
+                                Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                                    // Channel full - check cancellation before blocking
+                                    if cancelled_reader.load(Ordering::SeqCst) {
+                                        tracing::debug!(
+                                            shard_id,
+                                            "Reader cancelled while waiting to send"
+                                        );
+                                        return;
+                                    }
+                                    // Yield briefly then retry
+                                    tokio::task::yield_now().await;
+                                }
+                                Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                                    // Writer dropped, stop reading
+                                    return;
+                                }
+                            }
                         }
 
                         if is_final {
@@ -549,15 +677,23 @@ impl MigrationOrchestrator {
         let mut last_key_for_checkpoint: Option<Vec<u8>> = None;
         let mut writer_error: Option<Error> = None;
 
+        // Batched progress tracking to reduce lock contention
+        const PROGRESS_UPDATE_INTERVAL: u64 = 10;
+        let mut batches_since_progress_update: u64 = 0;
+        let mut pending_entries: u64 = 0;
+        let mut pending_bytes: u64 = 0;
+
         while let Some(batch) = rx.recv().await {
             // Check if reader detected pause
             if reader_paused.load(Ordering::SeqCst) {
+                cancelled.store(true, Ordering::SeqCst); // Signal reader to stop
                 writer_error = Some(Error::MigrationPaused);
                 break;
             }
 
             let batch_entries = batch.len() as u64;
             let batch_bytes = batch.size() as u64;
+            let is_final = batch.is_final;
 
             if !batch.is_empty() {
                 // Update last key for checkpoint
@@ -570,6 +706,7 @@ impl MigrationOrchestrator {
 
                 // Apply batch to target
                 if let Err(e) = transporter.apply_batch(shard_id, batch).await {
+                    cancelled.store(true, Ordering::SeqCst); // Signal reader to stop
                     writer_error = Some(e);
                     break;
                 }
@@ -577,6 +714,9 @@ impl MigrationOrchestrator {
                 // Update counters
                 total_transferred.fetch_add(batch_entries, Ordering::Relaxed);
                 bytes_transferred.fetch_add(batch_bytes, Ordering::Relaxed);
+                pending_entries += batch_entries;
+                pending_bytes += batch_bytes;
+                batches_since_progress_update += 1;
 
                 // Calculate rate
                 let elapsed = start_time.elapsed().as_secs_f64();
@@ -587,20 +727,27 @@ impl MigrationOrchestrator {
                     0.0
                 };
 
-                // Update progress
-                if let Err(e) = self
-                    .coordinator
-                    .update_progress(
-                        shard_id,
-                        batch_entries,
-                        batch_bytes,
-                        rate,
-                        last_key_for_checkpoint.clone(),
-                    )
-                    .await
-                {
-                    writer_error = Some(e);
-                    break;
+                // Batch progress updates to reduce lock contention
+                if batches_since_progress_update >= PROGRESS_UPDATE_INTERVAL || is_final {
+                    if let Err(e) = self
+                        .coordinator
+                        .update_progress(
+                            shard_id,
+                            pending_entries,
+                            pending_bytes,
+                            rate,
+                            last_key_for_checkpoint.clone(),
+                        )
+                        .await
+                    {
+                        cancelled.store(true, Ordering::SeqCst); // Signal reader to stop
+                        writer_error = Some(e);
+                        break;
+                    }
+
+                    pending_entries = 0;
+                    pending_bytes = 0;
+                    batches_since_progress_update = 0;
                 }
 
                 self.metrics
@@ -654,6 +801,13 @@ impl MigrationOrchestrator {
         let mut bytes_transferred: u64 = 0;
         let start_time = Instant::now();
 
+        // Batched progress tracking to reduce lock contention
+        // Only update coordinator every N batches or on final batch
+        const PROGRESS_UPDATE_INTERVAL: u64 = 10;
+        let mut batches_since_progress_update: u64 = 0;
+        let mut pending_entries: u64 = 0;
+        let mut pending_bytes: u64 = 0;
+
         loop {
             // Check for pause
             if self.coordinator.is_paused() {
@@ -689,6 +843,9 @@ impl MigrationOrchestrator {
 
                 total_transferred += batch_entries;
                 bytes_transferred += batch_bytes;
+                pending_entries += batch_entries;
+                pending_bytes += batch_bytes;
+                batches_since_progress_update += 1;
 
                 // Calculate rate
                 let elapsed = start_time.elapsed().as_secs_f64();
@@ -698,10 +855,23 @@ impl MigrationOrchestrator {
                     0.0
                 };
 
-                // Update progress
-                self.coordinator
-                    .update_progress(shard_id, batch_entries, batch_bytes, rate, last_key.clone())
-                    .await?;
+                // Batch progress updates to reduce lock contention
+                // Update every N batches or on final batch
+                if batches_since_progress_update >= PROGRESS_UPDATE_INTERVAL || is_final {
+                    self.coordinator
+                        .update_progress(
+                            shard_id,
+                            pending_entries,
+                            pending_bytes,
+                            rate,
+                            last_key.clone(),
+                        )
+                        .await?;
+
+                    pending_entries = 0;
+                    pending_bytes = 0;
+                    batches_since_progress_update = 0;
+                }
 
                 self.metrics
                     .record_transfer(batch_entries, batch_bytes, rate);
@@ -764,6 +934,11 @@ impl MigrationOrchestrator {
     /// while primary writes succeed. This method retries those failed writes
     /// to ensure data consistency before ownership transfer.
     ///
+    /// # Performance
+    ///
+    /// Failures are batched together for efficient network transfer. If a batch
+    /// fails, individual entries are retried to identify specific failures.
+    ///
     /// # Returns
     ///
     /// Returns Ok(()) if all failures were reconciled successfully, or an error
@@ -795,39 +970,74 @@ impl MigrationOrchestrator {
             .get_migration(shard_id)
             .ok_or(Error::MigrationNotFound(shard_id))?;
 
+        // Batch all failures together for efficient network transfer
+        let batch_size = self.coordinator.config().batch_size;
         let mut reconciled_keys = Vec::new();
         let mut failed_reconciliation = Vec::new();
 
-        for failure in failures {
-            // Create a single-entry batch for this failed write
-            let entry = super::migration::TransferEntry {
-                key: failure.key.clone(),
-                value: failure.value.clone(),
-                expires_at_nanos: None, // We don't track TTL for dual-writes
-                version: 0,
-            };
+        // Process in batches for better performance
+        for chunk in failures.chunks(batch_size) {
+            let entries: Vec<_> = chunk
+                .iter()
+                .map(|failure| super::migration::TransferEntry {
+                    key: failure.key.clone(),
+                    value: failure.value.clone(),
+                    expires_at_nanos: None, // We don't track TTL for dual-writes
+                    version: 0,
+                })
+                .collect();
 
             let batch = TransferBatch::new(
                 migration.id,
                 0, // sequence doesn't matter for reconciliation
-                vec![entry],
+                entries.clone(),
                 false,
             );
 
-            // Try to apply this batch to the target
+            // Try to apply the batch
             match transporter.apply_batch(shard_id, batch).await {
                 Ok(()) => {
-                    reconciled_keys.push(failure.key);
-                    tracing::debug!(shard_id, "Reconciled dual-write failure");
+                    // All entries in this batch succeeded
+                    for failure in chunk {
+                        reconciled_keys.push(failure.key.clone());
+                    }
+                    tracing::debug!(
+                        shard_id,
+                        batch_size = chunk.len(),
+                        "Reconciled batch of dual-write failures"
+                    );
                 }
-                Err(e) => {
+                Err(batch_err) => {
+                    // Batch failed - fall back to individual processing to identify failures
                     tracing::warn!(
                         shard_id,
-                        error = %e,
-                        retry_count = failure.retry_count,
-                        "Failed to reconcile dual-write"
+                        batch_size = chunk.len(),
+                        error = %batch_err,
+                        "Batch reconciliation failed, retrying individually"
                     );
-                    failed_reconciliation.push((failure, e));
+
+                    for (failure, entry) in chunk.iter().zip(entries.into_iter()) {
+                        let single_batch = TransferBatch::new(migration.id, 0, vec![entry], false);
+
+                        match transporter.apply_batch(shard_id, single_batch).await {
+                            Ok(()) => {
+                                reconciled_keys.push(failure.key.clone());
+                                tracing::debug!(
+                                    shard_id,
+                                    "Reconciled individual dual-write failure"
+                                );
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    shard_id,
+                                    error = %e,
+                                    retry_count = failure.retry_count,
+                                    "Failed to reconcile dual-write"
+                                );
+                                failed_reconciliation.push((failure.clone(), e));
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -988,16 +1198,13 @@ impl MigrationOrchestrator {
         );
 
         // If we have an active orchestration for this shard, cancel it
-        {
-            let mut orchestrations = self.active_orchestrations.write();
-            if let Some(state) = orchestrations.remove(&shard_id) {
-                if state.migration_id == migration_id {
-                    tracing::info!(
-                        %migration_id,
-                        shard_id,
-                        "Cancelled active orchestration due to abort command"
-                    );
-                }
+        if let Some((_, state)) = self.active_orchestrations.remove(&shard_id) {
+            if state.migration_id == migration_id {
+                tracing::info!(
+                    %migration_id,
+                    shard_id,
+                    "Cancelled active orchestration due to abort command"
+                );
             }
         }
 
@@ -1067,9 +1274,9 @@ impl MigrationOrchestrator {
 
         // CRITICAL: Atomically read original strategy and set BlockWrites in one lock acquisition
         // This prevents TOCTOU race where strategy could change between read and write.
-        let original_strategy = {
-            let mut orchestrations = self.active_orchestrations.write();
-            if let Some(state) = orchestrations.get_mut(&shard_id) {
+        // DashMap's get_mut provides per-key exclusive access without global locking.
+        let original_strategy =
+            if let Some(mut state) = self.active_orchestrations.get_mut(&shard_id) {
                 let original = state.routing_strategy;
                 state.routing_strategy = MigrationRoutingStrategy::BlockWrites;
                 state.last_update = Instant::now();
@@ -1082,8 +1289,7 @@ impl MigrationOrchestrator {
                 original
             } else {
                 self.router.default_strategy()
-            }
-        };
+            };
 
         tracing::info!(
             migration_id = %migration_id,
@@ -1159,7 +1365,7 @@ impl MigrationOrchestrator {
 
     /// Update the routing strategy for an active orchestration.
     fn set_orchestration_strategy(&self, shard_id: ShardId, strategy: MigrationRoutingStrategy) {
-        if let Some(state) = self.active_orchestrations.write().get_mut(&shard_id) {
+        if let Some(mut state) = self.active_orchestrations.get_mut(&shard_id) {
             let old_strategy = state.routing_strategy;
             state.routing_strategy = strategy;
             state.last_update = Instant::now();
@@ -1208,7 +1414,7 @@ impl MigrationOrchestrator {
             .set_state(shard_id, ShardLifecycleState::Active);
 
         // Remove from active orchestrations
-        self.active_orchestrations.write().remove(&shard_id);
+        self.active_orchestrations.remove(&shard_id);
 
         // Record metrics
         self.metrics.record_migration_complete(migration.duration());
@@ -1225,7 +1431,7 @@ impl MigrationOrchestrator {
 
     /// Update orchestration phase tracking.
     fn update_orchestration_phase(&self, shard_id: ShardId, phase: MigrationPhase) {
-        if let Some(state) = self.active_orchestrations.write().get_mut(&shard_id) {
+        if let Some(mut state) = self.active_orchestrations.get_mut(&shard_id) {
             state.phase = phase;
             state.last_update = Instant::now();
         }
@@ -1243,7 +1449,7 @@ impl MigrationOrchestrator {
         self.placement.abort();
 
         // Remove from active orchestrations
-        self.active_orchestrations.write().remove(&shard_id);
+        self.active_orchestrations.remove(&shard_id);
 
         self.metrics.record_migration_cancelled();
 
@@ -1262,7 +1468,6 @@ impl MigrationOrchestrator {
         if let Some(migration) = self.coordinator.get_migration(shard_id) {
             let strategy = self
                 .active_orchestrations
-                .read()
                 .get(&shard_id)
                 .map(|s| s.routing_strategy);
             self.router.route_write(shard_id, &migration, strategy)
@@ -1286,7 +1491,6 @@ impl MigrationOrchestrator {
         if let Some(migration) = self.coordinator.get_migration(shard_id) {
             let strategy = self
                 .active_orchestrations
-                .read()
                 .get(&shard_id)
                 .map(|s| s.routing_strategy);
             self.router.route_read(shard_id, &migration, strategy)
@@ -1343,15 +1547,14 @@ impl MigrationOrchestrator {
     /// Get the current state of all active orchestrations.
     pub fn active_orchestrations(&self) -> Vec<OrchestrationState> {
         self.active_orchestrations
-            .read()
-            .values()
-            .cloned()
+            .iter()
+            .map(|r| r.value().clone())
             .collect()
     }
 
     /// Check if a shard is being orchestrated.
     pub fn is_orchestrating(&self, shard_id: ShardId) -> bool {
-        self.active_orchestrations.read().contains_key(&shard_id)
+        self.active_orchestrations.contains_key(&shard_id)
     }
 }
 

@@ -32,7 +32,6 @@
 use parking_lot::RwLock;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use super::slot_migration::{
     MigrationId, MigrationPhase, MigrationRaftCommand, SlotMigrationRecord,
@@ -120,21 +119,34 @@ impl MigrationStateMachine {
             MigrationRaftCommand::Claim {
                 migration_id,
                 leader_id,
+                proposed_at,
             } => {
-                self.apply_claim(migration_id, leader_id);
+                self.apply_claim(migration_id, leader_id, proposed_at);
             }
             MigrationRaftCommand::Prepared {
                 migration_id,
                 target_commit_index,
                 validation_checksum,
+                proposed_at,
             } => {
-                self.apply_prepared(migration_id, target_commit_index, validation_checksum);
+                self.apply_prepared(
+                    migration_id,
+                    target_commit_index,
+                    validation_checksum,
+                    proposed_at,
+                );
             }
-            MigrationRaftCommand::Completed { migration_id } => {
-                self.apply_completed(migration_id);
+            MigrationRaftCommand::Completed {
+                migration_id,
+                proposed_at,
+            } => {
+                self.apply_completed(migration_id, proposed_at);
             }
-            MigrationRaftCommand::Cleaned { migration_id } => {
-                self.apply_cleaned(migration_id);
+            MigrationRaftCommand::Cleaned {
+                migration_id,
+                proposed_at,
+            } => {
+                self.apply_cleaned(migration_id, proposed_at);
             }
         }
 
@@ -149,22 +161,26 @@ impl MigrationStateMachine {
     ///
     /// Transitions the migration to CLAIMED state with the specified owner.
     /// Only accepts the claim if the epoch is >= the current epoch.
-    fn apply_claim(&self, migration_id: MigrationId, leader_id: NodeId) {
+    ///
+    /// # Determinism
+    ///
+    /// Uses `proposed_at` timestamp from the Raft command rather than system time
+    /// to ensure deterministic state machine replay across all replicas.
+    fn apply_claim(&self, migration_id: MigrationId, leader_id: NodeId, proposed_at: u64) {
         let slot_id = migration_id.slot_id;
         let mut migrations = self.migrations.write();
 
         if let Some(record) = migrations.get_mut(&slot_id) {
             // Validate epoch - only accept if same or higher
             if migration_id.epoch >= record.id.epoch {
-                let now = now_ms();
                 record.id.epoch = migration_id.epoch;
                 record.phase = MigrationPhase::Claimed {
                     owner_node: leader_id,
                     claim_epoch: migration_id.epoch,
-                    claimed_at: now,
+                    claimed_at: proposed_at,
                 };
-                record.updated_at = now;
-                record.last_progress_at = now;
+                record.updated_at = proposed_at;
+                record.last_progress_at = proposed_at;
 
                 tracing::info!(
                     slot_id,
@@ -184,7 +200,6 @@ impl MigrationStateMachine {
             // Migration not registered - this can happen if the target shard
             // received the claim before registering the migration locally.
             // Create a new record in CLAIMED state.
-            let now = now_ms();
             let record = SlotMigrationRecord {
                 id: migration_id.clone(),
                 slot_id,
@@ -193,11 +208,11 @@ impl MigrationStateMachine {
                 phase: MigrationPhase::Claimed {
                     owner_node: leader_id,
                     claim_epoch: migration_id.epoch,
-                    claimed_at: now,
+                    claimed_at: proposed_at,
                 },
-                created_at: now,
-                updated_at: now,
-                last_progress_at: now,
+                created_at: proposed_at,
+                updated_at: proposed_at,
+                last_progress_at: proposed_at,
             };
             // We'll need the shard info, but for now just mark as claimed
             migrations.insert(slot_id, record);
@@ -215,11 +230,17 @@ impl MigrationStateMachine {
     ///
     /// Transitions the migration to PREPARED state, recording validation info.
     /// This commits the validation result before source cleanup is allowed.
+    ///
+    /// # Determinism
+    ///
+    /// Uses `proposed_at` timestamp from the Raft command rather than system time
+    /// to ensure deterministic state machine replay across all replicas.
     fn apply_prepared(
         &self,
         migration_id: MigrationId,
         target_commit_index: u64,
         validation_checksum: u64,
+        proposed_at: u64,
     ) {
         let slot_id = migration_id.slot_id;
         let mut migrations = self.migrations.write();
@@ -236,14 +257,13 @@ impl MigrationStateMachine {
                 return;
             }
 
-            let now = now_ms();
             record.phase = MigrationPhase::Prepared {
-                prepared_at: now,
+                prepared_at: proposed_at,
                 target_commit_index,
                 validation_checksum,
             };
-            record.updated_at = now;
-            record.last_progress_at = now;
+            record.updated_at = proposed_at;
+            record.last_progress_at = proposed_at;
 
             tracing::info!(
                 slot_id,
@@ -265,7 +285,12 @@ impl MigrationStateMachine {
     ///
     /// Transitions the migration to COMPLETED state.
     /// Source data has been deleted and verified empty.
-    fn apply_completed(&self, migration_id: MigrationId) {
+    ///
+    /// # Determinism
+    ///
+    /// Uses `proposed_at` timestamp from the Raft command rather than system time
+    /// to ensure deterministic state machine replay across all replicas.
+    fn apply_completed(&self, migration_id: MigrationId, proposed_at: u64) {
         let slot_id = migration_id.slot_id;
         let mut migrations = self.migrations.write();
 
@@ -281,10 +306,11 @@ impl MigrationStateMachine {
                 return;
             }
 
-            let now = now_ms();
-            record.phase = MigrationPhase::Completed { completed_at: now };
-            record.updated_at = now;
-            record.last_progress_at = now;
+            record.phase = MigrationPhase::Completed {
+                completed_at: proposed_at,
+            };
+            record.updated_at = proposed_at;
+            record.last_progress_at = proposed_at;
 
             tracing::info!(
                 slot_id,
@@ -303,7 +329,12 @@ impl MigrationStateMachine {
     /// Apply a Cleaned command.
     ///
     /// Transitions the migration to CLEANED state (optional final state).
-    fn apply_cleaned(&self, migration_id: MigrationId) {
+    ///
+    /// # Determinism
+    ///
+    /// Uses `proposed_at` timestamp from the Raft command rather than system time
+    /// to ensure deterministic state machine replay across all replicas.
+    fn apply_cleaned(&self, migration_id: MigrationId, proposed_at: u64) {
         let slot_id = migration_id.slot_id;
         let mut migrations = self.migrations.write();
 
@@ -319,10 +350,11 @@ impl MigrationStateMachine {
                 return;
             }
 
-            let now = now_ms();
-            record.phase = MigrationPhase::Cleaned { cleaned_at: now };
-            record.updated_at = now;
-            record.last_progress_at = now;
+            record.phase = MigrationPhase::Cleaned {
+                cleaned_at: proposed_at,
+            };
+            record.updated_at = proposed_at;
+            record.last_progress_at = proposed_at;
 
             tracing::info!(
                 slot_id,
@@ -447,20 +479,17 @@ impl MigrationStateMachine {
     }
 }
 
-/// Get current time in milliseconds since Unix epoch.
-fn now_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn create_state_machine() -> MigrationStateMachine {
         MigrationStateMachine::new()
+    }
+
+    /// Test timestamp - in production this would be proposed by the Raft leader
+    fn test_timestamp() -> u64 {
+        1000000000000 // Fixed timestamp for deterministic tests
     }
 
     #[test]
@@ -475,6 +504,7 @@ mod tests {
         let command = MigrationRaftCommand::Claim {
             migration_id: migration_id.clone(),
             leader_id: 5,
+            proposed_at: test_timestamp(),
         };
 
         let applied = sm.apply(1, 1, command);
@@ -495,6 +525,7 @@ mod tests {
         let command = MigrationRaftCommand::Claim {
             migration_id: migration_id.clone(),
             leader_id: 5,
+            proposed_at: test_timestamp(),
         };
 
         let applied = sm.apply(1, 1, command);
@@ -514,6 +545,7 @@ mod tests {
         let command1 = MigrationRaftCommand::Claim {
             migration_id: MigrationId::new(42, 2),
             leader_id: 5,
+            proposed_at: test_timestamp(),
         };
         sm.apply(1, 1, command1);
 
@@ -521,6 +553,7 @@ mod tests {
         let command2 = MigrationRaftCommand::Claim {
             migration_id: MigrationId::new(42, 1),
             leader_id: 6,
+            proposed_at: test_timestamp() + 1000,
         };
         sm.apply(2, 1, command2);
 
@@ -542,6 +575,7 @@ mod tests {
             MigrationRaftCommand::Claim {
                 migration_id: MigrationId::new(42, 1),
                 leader_id: 5,
+                proposed_at: test_timestamp(),
             },
         );
 
@@ -550,6 +584,7 @@ mod tests {
             migration_id: MigrationId::new(42, 1),
             target_commit_index: 100,
             validation_checksum: 12345,
+            proposed_at: test_timestamp() + 1000,
         };
         sm.apply(2, 1, command);
 
@@ -579,6 +614,7 @@ mod tests {
             MigrationRaftCommand::Claim {
                 migration_id: MigrationId::new(42, 1),
                 leader_id: 5,
+                proposed_at: test_timestamp(),
             },
         );
         sm.apply(
@@ -588,6 +624,7 @@ mod tests {
                 migration_id: MigrationId::new(42, 1),
                 target_commit_index: 100,
                 validation_checksum: 12345,
+                proposed_at: test_timestamp() + 1000,
             },
         );
 
@@ -597,6 +634,7 @@ mod tests {
             1,
             MigrationRaftCommand::Completed {
                 migration_id: MigrationId::new(42, 1),
+                proposed_at: test_timestamp() + 2000,
             },
         );
 
@@ -613,6 +651,7 @@ mod tests {
         let command = MigrationRaftCommand::Claim {
             migration_id: MigrationId::new(42, 1),
             leader_id: 5,
+            proposed_at: test_timestamp(),
         };
 
         // First apply
@@ -626,6 +665,7 @@ mod tests {
             migration_id: MigrationId::new(42, 1),
             target_commit_index: 100,
             validation_checksum: 0,
+            proposed_at: test_timestamp() + 1000,
         };
         assert!(sm.apply(2, 1, command2));
     }
@@ -646,6 +686,7 @@ mod tests {
             MigrationRaftCommand::Claim {
                 migration_id: MigrationId::new(1, 1),
                 leader_id: 5,
+                proposed_at: test_timestamp(),
             },
         );
         sm.apply(
@@ -654,6 +695,7 @@ mod tests {
             MigrationRaftCommand::Claim {
                 migration_id: MigrationId::new(2, 1),
                 leader_id: 5,
+                proposed_at: test_timestamp() + 1000,
             },
         );
         sm.apply(
@@ -663,6 +705,7 @@ mod tests {
                 migration_id: MigrationId::new(2, 1),
                 target_commit_index: 100,
                 validation_checksum: 0,
+                proposed_at: test_timestamp() + 2000,
             },
         );
         sm.apply(
@@ -670,6 +713,7 @@ mod tests {
             1,
             MigrationRaftCommand::Completed {
                 migration_id: MigrationId::new(2, 1),
+                proposed_at: test_timestamp() + 3000,
             },
         );
 
@@ -690,6 +734,7 @@ mod tests {
             MigrationRaftCommand::Claim {
                 migration_id: MigrationId::new(1, 1),
                 leader_id: 5,
+                proposed_at: test_timestamp(),
             },
         );
 

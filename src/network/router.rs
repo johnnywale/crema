@@ -240,6 +240,17 @@ impl NodeMessageRouter {
         self.peers.read().len()
     }
 
+    /// Check if the router is healthy and ready to send messages.
+    pub fn is_healthy(&self) -> bool {
+        // Router is healthy if the command channel is not closed
+        !self.command_tx.is_closed()
+    }
+
+    /// Check if a peer is registered in the router.
+    pub fn has_peer(&self, id: NodeId) -> bool {
+        self.peers.read().contains_key(&id)
+    }
+
     /// Send a main Raft message (wrapped as Message::Raft).
     pub fn send_raft_message(&self, msg: RaftMessage) -> Result<()> {
         let to = msg.to;
@@ -1315,6 +1326,14 @@ impl RaftMessageSender for MainRaftAdapter {
         self.router.metrics()
     }
 
+    fn is_healthy(&self) -> bool {
+        self.router.is_healthy()
+    }
+
+    fn has_peer(&self, id: NodeId) -> bool {
+        self.router.has_peer(id)
+    }
+
     fn shutdown(&self) -> BoxFuture<'_, ()> {
         // MainRaftAdapter doesn't own the router, so shutdown is a no-op.
         // The router is shut down by its owner (usually DistributedCache).
@@ -1387,6 +1406,14 @@ impl RaftMessageSender for ShardRaftAdapter {
 
     fn metrics(&self) -> TransportMetricsSnapshot {
         self.router.metrics()
+    }
+
+    fn is_healthy(&self) -> bool {
+        self.router.is_healthy()
+    }
+
+    fn has_peer(&self, id: NodeId) -> bool {
+        self.router.has_peer(id)
     }
 
     fn shutdown(&self) -> BoxFuture<'_, ()> {

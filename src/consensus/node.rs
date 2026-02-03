@@ -13,7 +13,7 @@ use crate::consensus::storage::RaftStorage;
 use crate::consensus::transport::{
     BackpressureCallback, RaftMessageSender, RaftTransport, TransportConfig,
 };
-use crate::error::{RaftError, Result};
+use crate::error::{Error, RaftError, Result};
 use crate::network::rpc::Message;
 use crate::types::{CacheCommand, NodeId, ProposalResult};
 use crate::{counter_inc, gauge_set, histogram_record_duration};
@@ -78,6 +78,16 @@ pub struct RaftNode {
 
     /// Whether this node is accepting new proposals.
     accepting_proposals: AtomicBool,
+
+    /// Whether this node is fenced due to unknown proposal state.
+    ///
+    /// When a proposal times out, we don't know if it was committed or not.
+    /// To prevent split-brain scenarios, we enter a fenced state where:
+    /// - New write proposals are rejected
+    /// - Read operations may still be allowed via read-index
+    /// - The fence is cleared when a subsequent proposal succeeds or
+    ///   when a leader change is confirmed
+    fenced: AtomicBool,
 
     /// Health checker for monitoring.
     health_checker: HealthChecker,
@@ -267,6 +277,7 @@ impl RaftNode {
             checkpoint_manager: RwLock::new(None),
             flow_control,
             accepting_proposals: AtomicBool::new(true),
+            fenced: AtomicBool::new(false),
             health_checker: HealthChecker::new(),
         });
 
@@ -338,10 +349,31 @@ impl RaftNode {
         // Also create a Raft snapshot for InstallSnapshot RPC
         self.create_raft_snapshot_internal(index, term)?;
 
-        manager
+        let metadata = manager
             .create_snapshot(index, term)
             .await
-            .map_err(|e| RaftError::Internal(e.to_string()).into())
+            .map_err(|e| Error::from(RaftError::Internal(e.to_string())))?;
+
+        // Compact the Raft log to free memory
+        // This removes all log entries up to the snapshot index
+        if let Err(e) = self.storage.compact(index) {
+            // Log compaction failure is not fatal - snapshot is still valid
+            // The log will be compacted on the next successful snapshot
+            warn!(
+                node_id = self.id,
+                snapshot_index = index,
+                error = %e,
+                "Failed to compact Raft log after snapshot"
+            );
+        } else {
+            debug!(
+                node_id = self.id,
+                compacted_to = index,
+                "Compacted Raft log after snapshot"
+            );
+        }
+
+        Ok(metadata)
     }
 
     /// Create a Raft snapshot for InstallSnapshot RPC.
@@ -499,6 +531,27 @@ impl RaftNode {
     /// Check if this node is the leader.
     pub fn is_leader(&self) -> bool {
         self.leader_id() == Some(self.id)
+    }
+
+    /// Check if this node is fenced due to unknown proposal state.
+    ///
+    /// When fenced, the node will reject new write proposals to prevent
+    /// split-brain scenarios.
+    pub fn is_fenced(&self) -> bool {
+        self.fenced.load(Ordering::SeqCst)
+    }
+
+    /// Clear the fenced state.
+    ///
+    /// This should be called when the node confirms it can safely accept
+    /// new proposals, such as:
+    /// - After confirming a leader change
+    /// - After successfully rejoining the cluster
+    /// - After operator intervention
+    pub fn clear_fenced(&self) {
+        if self.fenced.swap(false, Ordering::SeqCst) {
+            debug!(node_id = self.id, "Fenced state manually cleared");
+        }
     }
 
     /// Get the transport for adding peers and sending messages.
@@ -686,6 +739,19 @@ impl RaftNode {
             return Err(RaftError::NotReady.into());
         }
 
+        // Check if node is fenced due to unknown proposal state
+        // This prevents split-brain scenarios when proposal outcome is unknown
+        if self.fenced.load(Ordering::SeqCst) {
+            warn!(
+                node_id = self.id,
+                "Node is fenced due to unknown proposal state, rejecting new proposals"
+            );
+            return Err(RaftError::Internal(
+                "node is fenced due to unknown proposal state".to_string(),
+            )
+            .into());
+        }
+
         // Check rate limit
         self.flow_control.check_propose_rate().await?;
 
@@ -770,10 +836,32 @@ impl RaftNode {
             _ = tokio::time::sleep(timeout_duration) => {
                 // Timeout: clean up pending mapping to prevent memory leak
                 self.pending.lock().remove(&proposal_id);
-                warn!("PROPOSE: Timeout waiting for proposal_id={} after {}ms", proposal_id, timeout_ms);
-                Err(RaftError::Internal("proposal timeout".to_string()).into())
+
+                // CRITICAL: Set fenced state to prevent split-brain scenarios
+                // The proposal might have been committed on other nodes even though
+                // we timed out waiting for confirmation. Accepting new writes could
+                // lead to inconsistent state.
+                self.fenced.store(true, Ordering::SeqCst);
+
+                warn!(
+                    node_id = self.id,
+                    proposal_id,
+                    timeout_ms,
+                    "PROPOSE: Timeout waiting for proposal - node is now FENCED"
+                );
+                Err(RaftError::Internal("proposal timeout - node fenced".to_string()).into())
             }
         };
+
+        // If proposal succeeded, clear any fenced state
+        // A successful proposal confirms the node can communicate properly
+        if result.is_ok() && self.fenced.load(Ordering::SeqCst) {
+            self.fenced.store(false, Ordering::SeqCst);
+            debug!(
+                node_id = self.id,
+                "Fenced state cleared after successful proposal"
+            );
+        }
 
         // Record metrics
         let duration = start.elapsed();
@@ -813,6 +901,18 @@ impl RaftNode {
         // Check if accepting proposals (for graceful shutdown)
         if !self.accepting_proposals.load(Ordering::SeqCst) {
             return Err(RaftError::NotReady.into());
+        }
+
+        // Check if node is fenced due to unknown proposal state
+        if self.fenced.load(Ordering::SeqCst) {
+            warn!(
+                node_id = self.id,
+                "Node is fenced due to unknown proposal state, rejecting new proposals"
+            );
+            return Err(RaftError::Internal(
+                "node is fenced due to unknown proposal state".to_string(),
+            )
+            .into());
         }
 
         // Check rate limit
@@ -891,10 +991,28 @@ impl RaftNode {
             _ = tokio::time::sleep(timeout_duration) => {
                 // Timeout: clean up pending mapping to prevent memory leak
                 self.pending.lock().remove(&proposal_id);
-                warn!("PROPOSE_RAW: Timeout waiting for proposal_id={} after {}ms", proposal_id, timeout_ms);
-                Err(RaftError::Internal("proposal timeout".to_string()).into())
+
+                // CRITICAL: Set fenced state to prevent split-brain scenarios
+                self.fenced.store(true, Ordering::SeqCst);
+
+                warn!(
+                    node_id = self.id,
+                    proposal_id,
+                    timeout_ms,
+                    "PROPOSE_RAW: Timeout waiting for proposal - node is now FENCED"
+                );
+                Err(RaftError::Internal("proposal timeout - node fenced".to_string()).into())
             }
         };
+
+        // If proposal succeeded, clear any fenced state
+        if result.is_ok() && self.fenced.load(Ordering::SeqCst) {
+            self.fenced.store(false, Ordering::SeqCst);
+            debug!(
+                node_id = self.id,
+                "Fenced state cleared after successful proposal"
+            );
+        }
 
         // Record metrics
         let duration = start.elapsed();
@@ -1845,8 +1963,15 @@ impl RaftNode {
         }
 
         // 10. Apply committed entries to state machine (outside of lock)
-        for entry in committed_entries_to_apply {
-            self.apply_entry(&entry).await;
+        // Yield periodically to prevent stalling the Raft tick loop when
+        // processing many entries. This allows heartbeats and other critical
+        // Raft messages to be processed, preventing election timeouts.
+        const YIELD_INTERVAL: usize = 10;
+        for (i, entry) in committed_entries_to_apply.iter().enumerate() {
+            self.apply_entry(entry).await;
+            if (i + 1) % YIELD_INTERVAL == 0 {
+                tokio::task::yield_now().await;
+            }
         }
 
         // 11. Process light_ready messages (outside of lock)
@@ -1859,7 +1984,7 @@ impl RaftNode {
             self.transport.send_messages(light_ready_messages);
         }
 
-        // 12. Apply light_ready committed entries
+        // 12. Apply light_ready committed entries (with same yield pattern)
         if !light_ready_entries.is_empty() {
             debug!(
                 node_id = self.id,
@@ -1867,8 +1992,11 @@ impl RaftNode {
                 light_ready_entries.len()
             );
         }
-        for entry in light_ready_entries {
-            self.apply_entry(&entry).await;
+        for (i, entry) in light_ready_entries.iter().enumerate() {
+            self.apply_entry(entry).await;
+            if (i + 1) % YIELD_INTERVAL == 0 {
+                tokio::task::yield_now().await;
+            }
         }
     }
 
@@ -2159,16 +2287,22 @@ impl RaftNode {
         // Step 5: Optionally create final snapshot
         if let Some(checkpoint_mgr) = self.checkpoint_manager.read().as_ref() {
             if self.should_create_snapshot() {
-                match checkpoint_mgr
-                    .create_snapshot(self.applied_index(), self.term())
-                    .await
-                {
+                let index = self.applied_index();
+                match checkpoint_mgr.create_snapshot(index, self.term()).await {
                     Ok(metadata) => {
                         debug!(
                             node_id = self.id,
                             index = metadata.raft_index,
                             "Created shutdown snapshot"
                         );
+                        // Compact the log after shutdown snapshot
+                        if let Err(e) = self.storage.compact(index) {
+                            debug!(
+                                node_id = self.id,
+                                error = %e,
+                                "Failed to compact log during shutdown (non-fatal)"
+                            );
+                        }
                     }
                     Err(e) => {
                         warn!(

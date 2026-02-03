@@ -326,6 +326,18 @@ impl SlotTable {
         }
     }
 
+    /// Create a slot table from a snapshot.
+    ///
+    /// This restores the slot table state from a previously taken snapshot,
+    /// preserving the epoch, slot assignments, and shard count.
+    pub fn from_snapshot(snapshot: SlotTableSnapshot) -> Self {
+        Self {
+            epoch: AtomicU64::new(snapshot.epoch.value()),
+            slots: RwLock::new(snapshot.slots),
+            num_shards: RwLock::new(snapshot.num_shards),
+        }
+    }
+
     /// Get the current epoch (lock-free).
     pub fn epoch(&self) -> Epoch {
         Epoch(self.epoch.load(AtomicOrdering::SeqCst))
@@ -502,15 +514,48 @@ impl SlotTable {
     /// Compute a drain plan for removing a shard.
     ///
     /// Redistributes all slots from the removed shard to remaining shards.
+    ///
+    /// LOCK ORDERING: Always acquire slots before num_shards to prevent deadlocks
+    /// with compute_rebalance_for_new_shard and snapshot().
     pub fn compute_drain_for_shard(&self, shard_id: ShardId) -> HashMap<ShardId, Vec<SlotId>> {
+        // Get slots first to maintain consistent lock ordering
+        let slots = self.slots.read();
         let num_shards = *self.num_shards.read();
+
         // Default: use all shard IDs except the one being removed
         // NOTE: This may include shards that are draining/removed - use
         // compute_drain_for_shard_to_targets() for precise control.
         let remaining_shards: Vec<ShardId> = (0..num_shards as ShardId)
             .filter(|&id| id != shard_id)
             .collect();
-        self.compute_drain_for_shard_to_targets(shard_id, &remaining_shards)
+
+        // Get all slots owned by the shard being removed
+        let owned_slots: Vec<SlotId> = slots
+            .iter()
+            .enumerate()
+            .filter_map(|(i, a)| {
+                if a.owner == shard_id {
+                    Some(i as SlotId)
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        // Drop locks before building result
+        drop(slots);
+
+        if remaining_shards.is_empty() {
+            return HashMap::new();
+        }
+
+        let mut result: HashMap<ShardId, Vec<SlotId>> = HashMap::new();
+        for (i, slot) in owned_slots.into_iter().enumerate() {
+            let target = remaining_shards[i % remaining_shards.len()];
+            result.entry(target).or_default().push(slot);
+        }
+
+        result
     }
 
     /// Compute a drain plan for redistributing slots from a shard to specific target shards.

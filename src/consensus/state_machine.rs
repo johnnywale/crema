@@ -399,14 +399,15 @@ mod tests {
 
         // Now apply a migration command (starts with 0x02, length > 4)
         // This simulates what happens in multi-raft mode when a MigrationRaftCommand
-        // is committed to the Raft log. Real migration commands are 15+ bytes.
+        // is committed to the Raft log. Real migration commands are 23+ bytes.
         let migration_data = vec![
             0x02, // MIGRATION_COMMAND_TAG
             // Simulated bincode payload (MigrationRaftCommand::Claim structure)
             0x00, 0x00, 0x00, 0x00, // enum discriminant (Claim = 0)
-            0x2A, 0x00,             // slot_id: u16 = 42
+            0x2A, 0x00, // slot_id: u16 = 42
             0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // epoch: u64 = 1
             0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // leader_id: u64 = 1
+            0xE8, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // proposed_at: u64 = 1000
         ];
 
         // Verify this is > 4 bytes (will be treated as migration, not Clear)
@@ -451,10 +452,20 @@ mod tests {
         for i in 0..10 {
             let migration_data = vec![
                 0x02, // MIGRATION_COMMAND_TAG
-                0x00, 0x00, 0x00, 0x00,
-                (i as u8), 0x00, // Varying payload
-                0x01, 0x00, 0x00, 0x00,
-                0x00, 0x00, 0x00, 0x00,
+                0x00,
+                0x00,
+                0x00,
+                0x00,
+                (i as u8),
+                0x00, // Varying payload
+                0x01,
+                0x00,
+                0x00,
+                0x00,
+                0x00,
+                0x00,
+                0x00,
+                0x00,
             ];
             sm.apply(6 + i, 1, &migration_data).await;
         }

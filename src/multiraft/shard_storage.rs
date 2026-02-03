@@ -32,11 +32,11 @@ use bytes::Bytes;
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use tokio::fs as tokio_fs;
 use tracing::{debug, error, info, warn};
 
 /// Configuration for shard storage.
@@ -67,6 +67,53 @@ impl Default for ShardStorageConfig {
             min_free_space: 100 * 1024 * 1024, // 100MB
         }
     }
+}
+
+/// Create a directory durably, ensuring the directory entry is persisted to disk.
+///
+/// This function creates the directory with `create_dir_all` and then fsyncs
+/// the parent directory to ensure the directory entry is durably stored.
+/// This prevents data loss on systems where directory entries are not immediately
+/// persisted (ext4 with delayed allocation, etc.).
+///
+/// # Errors
+///
+/// Returns an error if directory creation or parent fsync fails.
+pub fn create_dir_all_durable(path: impl AsRef<Path>) -> std::io::Result<()> {
+    let path = path.as_ref();
+    std::fs::create_dir_all(path)?;
+
+    // Fsync the parent directory to ensure the new directory entry is persisted
+    if let Some(parent) = path.parent() {
+        // Open the parent directory for fsync
+        // Note: On Windows, directory fsync is not supported the same way as Unix
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            let dir = std::fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_DIRECTORY)
+                .open(parent)?;
+            dir.sync_all()?;
+        }
+
+        // On non-Unix systems (Windows), we rely on the filesystem's guarantees
+        // Windows NTFS provides strong metadata guarantees without explicit fsync
+        #[cfg(not(unix))]
+        {
+            let _ = parent; // Suppress unused variable warning
+        }
+    }
+
+    Ok(())
+}
+
+/// Async version of durable directory creation.
+pub async fn create_dir_all_durable_async(path: impl AsRef<Path>) -> std::io::Result<()> {
+    let path = path.as_ref().to_path_buf();
+    tokio::task::spawn_blocking(move || create_dir_all_durable(&path))
+        .await
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?
 }
 
 impl ShardStorageConfig {
@@ -208,8 +255,61 @@ pub struct ShardStorageManager {
 }
 
 impl ShardStorageManager {
-    /// Create a new shard storage manager.
+    /// Create a new shard storage manager (async version).
+    ///
+    /// This is the preferred method as it uses non-blocking I/O.
+    pub async fn new_async(config: ShardStorageConfig, node_id: NodeId) -> Result<Self> {
+        // Create base directory structure using async I/O
+        let snapshots_dir = config.base_dir.join("snapshots");
+        let metadata_dir = config.base_dir.join("metadata");
+
+        tokio_fs::create_dir_all(&snapshots_dir)
+            .await
+            .map_err(|e| Error::Internal(format!("Failed to create snapshots directory: {}", e)))?;
+        tokio_fs::create_dir_all(&metadata_dir)
+            .await
+            .map_err(|e| Error::Internal(format!("Failed to create metadata directory: {}", e)))?;
+
+        let mut registry = PersistedShardRegistry {
+            node_id,
+            ..Default::default()
+        };
+
+        // Try to load existing registry using async I/O
+        let registry_path = metadata_dir.join("shard_registry.bin");
+        match tokio_fs::metadata(&registry_path).await {
+            Ok(_) => match tokio_fs::read(&registry_path).await {
+                Ok(data) => match bincode::deserialize(&data) {
+                    Ok(loaded) => {
+                        info!("Loaded existing shard registry from disk");
+                        registry = loaded;
+                    }
+                    Err(e) => {
+                        warn!("Failed to parse shard registry, starting fresh: {}", e);
+                    }
+                },
+                Err(e) => {
+                    warn!("Failed to read shard registry, starting fresh: {}", e);
+                }
+            },
+            Err(_) => {
+                // File doesn't exist, use fresh registry
+            }
+        }
+
+        Ok(Self {
+            config,
+            shard_states: RwLock::new(HashMap::new()),
+            registry: RwLock::new(registry),
+        })
+    }
+
+    /// Create a new shard storage manager (sync version for backwards compatibility).
+    ///
+    /// Note: This uses blocking I/O. Prefer `new_async()` in async contexts.
     pub fn new(config: ShardStorageConfig, node_id: NodeId) -> Result<Self> {
+        use std::fs;
+
         // Create base directory structure
         let snapshots_dir = config.base_dir.join("snapshots");
         let metadata_dir = config.base_dir.join("metadata");
@@ -266,8 +366,32 @@ impl ShardStorageManager {
             .join("shard_registry.bin")
     }
 
-    /// Register a shard for storage management.
+    /// Register a shard for storage management (async version).
+    ///
+    /// This is the preferred method as it uses non-blocking I/O.
+    pub async fn register_shard_async(&self, config: &ShardConfig) {
+        let mut states = self.shard_states.write();
+        states
+            .entry(config.shard_id)
+            .or_insert_with(|| Arc::new(ShardStorageState::new()));
+        drop(states); // Release lock before async operation
+
+        // Ensure shard snapshot directory exists using async I/O
+        let shard_dir = self.shard_snapshots_dir(config.shard_id);
+        if let Err(e) = tokio_fs::create_dir_all(&shard_dir).await {
+            error!(
+                "Failed to create shard snapshot directory {:?}: {}",
+                shard_dir, e
+            );
+        }
+    }
+
+    /// Register a shard for storage management (sync version for backwards compatibility).
+    ///
+    /// Note: This uses blocking I/O. Prefer `register_shard_async()` in async contexts.
     pub fn register_shard(&self, config: &ShardConfig) {
+        use std::fs;
+
         let mut states = self.shard_states.write();
         states
             .entry(config.shard_id)
@@ -320,7 +444,8 @@ impl ShardStorageManager {
         raft_term: u64,
     ) -> Result<ShardSnapshotInfo> {
         let shard_dir = self.shard_snapshots_dir(shard_id);
-        fs::create_dir_all(&shard_dir)
+        tokio_fs::create_dir_all(&shard_dir)
+            .await
             .map_err(|e| Error::Internal(format!("Failed to create shard directory: {}", e)))?;
 
         // Generate snapshot filename
@@ -355,8 +480,9 @@ impl ShardStorageManager {
             .finalize()
             .map_err(|e| Error::Internal(format!("Failed to finalize snapshot: {}", e)))?;
 
-        // Atomic rename
-        fs::rename(&temp_path, &path)
+        // Atomic rename using async I/O
+        tokio_fs::rename(&temp_path, &path)
+            .await
             .map_err(|e| Error::Internal(format!("Failed to rename snapshot: {}", e)))?;
 
         // Update state
@@ -369,7 +495,10 @@ impl ShardStorageManager {
             state.last_snapshot_term.store(raft_term, Ordering::Relaxed);
         }
 
-        let file_size = fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+        let file_size = tokio_fs::metadata(&path)
+            .await
+            .map(|m| m.len())
+            .unwrap_or(0);
 
         let info = ShardSnapshotInfo {
             shard_id,
@@ -385,7 +514,7 @@ impl ShardStorageManager {
         };
 
         // Cleanup old snapshots
-        self.cleanup_old_snapshots(shard_id)?;
+        self.cleanup_old_snapshots_async(shard_id).await?;
 
         info!(
             shard_id = shard_id,
@@ -407,7 +536,8 @@ impl ShardStorageManager {
         raft_term: u64,
     ) -> Result<ShardSnapshotInfo> {
         let shard_dir = self.shard_snapshots_dir(shard_id);
-        fs::create_dir_all(&shard_dir)
+        tokio_fs::create_dir_all(&shard_dir)
+            .await
             .map_err(|e| Error::Internal(format!("Failed to create shard directory: {}", e)))?;
 
         let filename = format!("snapshot-{:010}-{:010}.snap", raft_index, raft_term);
@@ -437,8 +567,9 @@ impl ShardStorageManager {
             .finalize()
             .map_err(|e| Error::Internal(format!("Failed to finalize snapshot: {}", e)))?;
 
-        // Atomic rename
-        fs::rename(&temp_path, &path)
+        // Atomic rename using async I/O
+        tokio_fs::rename(&temp_path, &path)
+            .await
             .map_err(|e| Error::Internal(format!("Failed to rename snapshot: {}", e)))?;
 
         // Update state
@@ -451,7 +582,10 @@ impl ShardStorageManager {
             state.last_snapshot_term.store(raft_term, Ordering::Relaxed);
         }
 
-        let file_size = fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+        let file_size = tokio_fs::metadata(&path)
+            .await
+            .map(|m| m.len())
+            .unwrap_or(0);
 
         let info = ShardSnapshotInfo {
             shard_id,
@@ -466,13 +600,54 @@ impl ShardStorageManager {
             file_size,
         };
 
-        self.cleanup_old_snapshots(shard_id)?;
+        self.cleanup_old_snapshots_async(shard_id).await?;
 
         Ok(info)
     }
 
-    /// Find the latest snapshot for a shard.
+    /// Find the latest snapshot for a shard (async version).
+    ///
+    /// This is the preferred method as it uses non-blocking I/O.
+    pub async fn find_latest_snapshot_async(
+        &self,
+        shard_id: ShardId,
+    ) -> Result<Option<ShardSnapshotInfo>> {
+        let shard_dir = self.shard_snapshots_dir(shard_id);
+
+        match tokio_fs::metadata(&shard_dir).await {
+            Ok(_) => {}
+            Err(_) => return Ok(None),
+        }
+
+        let mut snapshots: Vec<ShardSnapshotInfo> = Vec::new();
+        let mut entries = tokio_fs::read_dir(&shard_dir)
+            .await
+            .map_err(|e| Error::Internal(format!("Failed to read shard directory: {}", e)))?;
+
+        while let Some(entry) = entries
+            .next_entry()
+            .await
+            .map_err(|e| Error::Internal(format!("Failed to read directory entry: {}", e)))?
+        {
+            let path = entry.path();
+            if path.extension().map(|e| e == "snap").unwrap_or(false) {
+                // Parse snapshot info from filename and header
+                if let Ok(info) = self.read_snapshot_info(shard_id, &path) {
+                    snapshots.push(info);
+                }
+            }
+        }
+
+        // Sort by raft_index descending and return the latest
+        snapshots.sort_by(|a, b| b.raft_index.cmp(&a.raft_index));
+        Ok(snapshots.into_iter().next())
+    }
+
+    /// Find the latest snapshot for a shard (sync version for backwards compatibility).
+    ///
+    /// Note: This uses blocking I/O. Prefer `find_latest_snapshot_async()` in async contexts.
     pub fn find_latest_snapshot(&self, shard_id: ShardId) -> Result<Option<ShardSnapshotInfo>> {
+        use std::fs;
         let shard_dir = self.shard_snapshots_dir(shard_id);
 
         if !shard_dir.exists() {
@@ -502,7 +677,12 @@ impl ShardStorageManager {
     }
 
     /// Read snapshot info from a file.
+    ///
+    /// Note: This uses blocking I/O for reading the snapshot header. This is acceptable
+    /// because it's typically only called during startup recovery.
     fn read_snapshot_info(&self, shard_id: ShardId, path: &Path) -> Result<ShardSnapshotInfo> {
+        use std::fs;
+
         let reader = SnapshotReader::open(path)
             .map_err(|e| Error::Internal(format!("Failed to open snapshot: {}", e)))?;
         let header = reader.header();
@@ -581,8 +761,64 @@ impl ShardStorageManager {
         Ok(loaded_count)
     }
 
-    /// Cleanup old snapshots for a shard, keeping only the most recent ones.
+    /// Cleanup old snapshots for a shard, keeping only the most recent ones (async version).
+    ///
+    /// This is the preferred method as it uses non-blocking I/O.
+    async fn cleanup_old_snapshots_async(&self, shard_id: ShardId) -> Result<()> {
+        let shard_dir = self.shard_snapshots_dir(shard_id);
+
+        match tokio_fs::metadata(&shard_dir).await {
+            Ok(_) => {}
+            Err(_) => return Ok(()),
+        }
+
+        let mut snapshots: Vec<(PathBuf, u64)> = Vec::new();
+        let mut entries = tokio_fs::read_dir(&shard_dir)
+            .await
+            .map_err(|e| Error::Internal(format!("Failed to read shard directory: {}", e)))?;
+
+        while let Some(entry) = entries
+            .next_entry()
+            .await
+            .map_err(|e| Error::Internal(e.to_string()))?
+        {
+            let path = entry.path();
+            if path.extension().map(|e| e == "snap").unwrap_or(false) {
+                if let Ok(info) = self.read_snapshot_info(shard_id, &path) {
+                    snapshots.push((path, info.raft_index));
+                }
+            }
+        }
+
+        // Sort by index descending
+        snapshots.sort_by(|a, b| b.1.cmp(&a.1));
+
+        // Remove old snapshots beyond max_snapshots_per_shard
+        for (path, index) in snapshots
+            .into_iter()
+            .skip(self.config.max_snapshots_per_shard)
+        {
+            debug!(
+                shard_id = shard_id,
+                index = index,
+                path = ?path,
+                "Removing old snapshot"
+            );
+            if let Err(e) = tokio_fs::remove_file(&path).await {
+                warn!("Failed to remove old snapshot {:?}: {}", path, e);
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Cleanup old snapshots for a shard, keeping only the most recent ones (sync version).
+    ///
+    /// Note: This uses blocking I/O. Prefer `cleanup_old_snapshots_async()` in async contexts.
+    #[allow(dead_code)]
     fn cleanup_old_snapshots(&self, shard_id: ShardId) -> Result<()> {
+        use std::fs;
+
         let shard_dir = self.shard_snapshots_dir(shard_id);
 
         if !shard_dir.exists() {
@@ -760,7 +996,12 @@ impl ShardStorageManager {
     }
 
     /// Persist the registry to disk.
+    ///
+    /// Note: This uses blocking I/O. For high-frequency registry updates, consider
+    /// batching writes or using an async version in the future.
     fn persist_registry(&self) -> Result<()> {
+        use std::fs;
+
         let registry_path = self.registry_path();
         let temp_path = registry_path.with_extension("bin.tmp");
 

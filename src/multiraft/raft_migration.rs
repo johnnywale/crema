@@ -1098,7 +1098,7 @@ impl RaftMigrationCoordinator {
             self.migrations_failed.fetch_add(1, Ordering::Relaxed);
 
             // Schedule cleanup in the background
-            // This is non-blocking to avoid slowing down the main migration flow
+            // This spawns a background task and returns quickly
             self.cleanup_manager
                 .schedule_cleanup(migration_id, shard_id, target_node);
 

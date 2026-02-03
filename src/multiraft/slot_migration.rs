@@ -26,6 +26,7 @@ use super::shard_raft_node::ShardRaftNode;
 use super::slot_control_plane::SlotControlPlane;
 use super::slot_table::{crc16, SlotId, SlotTable, TOTAL_SLOTS};
 use crate::error::{Error, RaftError, Result};
+use crate::metrics::CacheMetrics;
 use crate::types::{CacheCommand, NodeId};
 use bytes::Bytes;
 use parking_lot::RwLock;
@@ -387,6 +388,9 @@ pub enum MigrationRaftCommand {
         migration_id: MigrationId,
         /// The node claiming ownership.
         leader_id: NodeId,
+        /// Timestamp proposed by the leader (ms since epoch).
+        /// This ensures deterministic state machine replay.
+        proposed_at: u64,
     },
 
     /// Mark migration as prepared (target validated).
@@ -398,6 +402,9 @@ pub enum MigrationRaftCommand {
         target_commit_index: u64,
         /// Checksum of migrated data.
         validation_checksum: u64,
+        /// Timestamp proposed by the leader (ms since epoch).
+        /// This ensures deterministic state machine replay.
+        proposed_at: u64,
     },
 
     /// Mark migration as completed.
@@ -405,12 +412,18 @@ pub enum MigrationRaftCommand {
     Completed {
         /// Unique migration identifier.
         migration_id: MigrationId,
+        /// Timestamp proposed by the leader (ms since epoch).
+        /// This ensures deterministic state machine replay.
+        proposed_at: u64,
     },
 
     /// Mark source as cleaned (optional).
     Cleaned {
         /// Unique migration identifier.
         migration_id: MigrationId,
+        /// Timestamp proposed by the leader (ms since epoch).
+        /// This ensures deterministic state machine replay.
+        proposed_at: u64,
     },
 }
 
@@ -420,8 +433,21 @@ impl MigrationRaftCommand {
         match self {
             MigrationRaftCommand::Claim { migration_id, .. } => migration_id,
             MigrationRaftCommand::Prepared { migration_id, .. } => migration_id,
-            MigrationRaftCommand::Completed { migration_id } => migration_id,
-            MigrationRaftCommand::Cleaned { migration_id } => migration_id,
+            MigrationRaftCommand::Completed { migration_id, .. } => migration_id,
+            MigrationRaftCommand::Cleaned { migration_id, .. } => migration_id,
+        }
+    }
+
+    /// Get the proposed timestamp from this command.
+    ///
+    /// This timestamp is set by the leader when proposing the command,
+    /// ensuring deterministic state machine replay across all replicas.
+    pub fn proposed_at(&self) -> u64 {
+        match self {
+            MigrationRaftCommand::Claim { proposed_at, .. } => *proposed_at,
+            MigrationRaftCommand::Prepared { proposed_at, .. } => *proposed_at,
+            MigrationRaftCommand::Completed { proposed_at, .. } => *proposed_at,
+            MigrationRaftCommand::Cleaned { proposed_at, .. } => *proposed_at,
         }
     }
 
@@ -685,6 +711,9 @@ pub struct SlotMigrator {
     /// Statistics.
     stats: RwLock<MigrationStats>,
 
+    /// Metrics for observability.
+    metrics: Option<Arc<CacheMetrics>>,
+
     /// Whether the migrator is running.
     running: std::sync::atomic::AtomicBool,
 }
@@ -706,6 +735,7 @@ impl SlotMigrator {
             migrations: RwLock::new(HashMap::new()),
             config,
             stats: RwLock::new(MigrationStats::default()),
+            metrics: None,
             running: std::sync::atomic::AtomicBool::new(false),
         }
     }
@@ -720,15 +750,17 @@ impl SlotMigrator {
         Self::new(node_id, slot_table, SlotMigratorConfig::default())
     }
 
+    /// Set metrics for observability.
+    pub fn with_metrics(mut self, metrics: Arc<CacheMetrics>) -> Self {
+        self.metrics = Some(metrics);
+        self
+    }
+
     /// Register a new migration.
     pub fn register_migration(&self, slot_id: SlotId, from_shard: ShardId, to_shard: ShardId) {
         let record = SlotMigrationRecord::new(slot_id, from_shard, to_shard);
         self.migrations.write().insert(slot_id, record);
 
-        eprintln!(
-            "[MIG-REGISTER] slot={} from={} to={} (direct)",
-            slot_id, from_shard, to_shard
-        );
         tracing::info!(slot_id, from_shard, to_shard, "Registered slot migration");
     }
 
@@ -781,9 +813,11 @@ impl SlotMigrator {
 
         for (slot_id, from, to) in slots_to_migrate {
             if let Entry::Vacant(entry) = migrations.entry(slot_id) {
-                eprintln!(
-                    "[MIG-REGISTER] slot={} from={} to={} (from slot_table sync)",
-                    slot_id, from, to
+                tracing::debug!(
+                    slot_id,
+                    from_shard = from,
+                    to_shard = to,
+                    "Auto-registered migration from slot table sync"
                 );
                 let record = SlotMigrationRecord::new(slot_id, from, to);
                 entry.insert(record);
@@ -805,10 +839,10 @@ impl SlotMigrator {
     /// migrations that were registered on other nodes but not locally
     /// (e.g., when shard removal was initiated on a different node).
     pub fn sync_from_peer_migrations(&self, peer_migrations: &[SlotMigrationRecord]) {
-        eprintln!(
-            "[MIG-SYNC] node={} received {} peer migrations",
-            self.node_id,
-            peer_migrations.len()
+        tracing::debug!(
+            node_id = self.node_id,
+            peer_count = peer_migrations.len(),
+            "Syncing migrations from peers"
         );
 
         let mut new_migrations = Vec::new();
@@ -829,11 +863,11 @@ impl SlotMigrator {
         }
 
         if !new_migrations.is_empty() || !updated_migrations.is_empty() {
-            eprintln!(
-                "[MIG-SYNC] node={} adding {} new, updating {} migrations",
-                self.node_id,
-                new_migrations.len(),
-                updated_migrations.len()
+            tracing::debug!(
+                node_id = self.node_id,
+                new_count = new_migrations.len(),
+                updated_count = updated_migrations.len(),
+                "Applying peer migration sync"
             );
             let mut migrations = self.migrations.write();
 
@@ -847,9 +881,7 @@ impl SlotMigrator {
                 migrations.insert(record.slot_id, record);
             }
 
-            tracing::info!(
-                "Synced migrations from peer state"
-            );
+            tracing::info!("Synced migrations from peer state");
         }
     }
 
@@ -897,6 +929,14 @@ impl SlotMigrator {
     /// Get a migration record.
     pub fn get_migration(&self, slot_id: SlotId) -> Option<SlotMigrationRecord> {
         self.migrations.read().get(&slot_id).cloned()
+    }
+
+    /// Get mutable access to migrations (for testing only).
+    #[cfg(test)]
+    pub fn migrations_mut(
+        &self,
+    ) -> parking_lot::RwLockWriteGuard<'_, HashMap<SlotId, SlotMigrationRecord>> {
+        self.migrations.write()
     }
 
     /// Get all active migrations.
@@ -963,27 +1003,49 @@ impl SlotMigrator {
             .cloned()
             .collect();
 
-        // Debug: Log process_migrations iteration
-        static PROCESS_LOG_COUNT: std::sync::atomic::AtomicU64 =
-            std::sync::atomic::AtomicU64::new(0);
-        let count = PROCESS_LOG_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        // Count phases for metrics and logging
+        let pending_count = pending
+            .iter()
+            .filter(|r| matches!(r.phase, MigrationPhase::Pending))
+            .count();
+        let claimed_count = pending
+            .iter()
+            .filter(|r| matches!(r.phase, MigrationPhase::Claimed { .. }))
+            .count();
+        let scanning_count = pending
+            .iter()
+            .filter(|r| matches!(r.phase, MigrationPhase::Scanning { .. }))
+            .count();
+        let streaming_count = pending
+            .iter()
+            .filter(|r| matches!(r.phase, MigrationPhase::Streaming { .. }))
+            .count();
+        let prepared_count = pending
+            .iter()
+            .filter(|r| matches!(r.phase, MigrationPhase::Prepared { .. }))
+            .count();
 
-        // Count phases in the collected records
-        let pending_count = pending.iter().filter(|r| matches!(r.phase, MigrationPhase::Pending)).count();
-        let claimed_count = pending.iter().filter(|r| matches!(r.phase, MigrationPhase::Claimed { .. })).count();
-        let scanning_count = pending.iter().filter(|r| matches!(r.phase, MigrationPhase::Scanning { .. })).count();
-
-        // Log more frequently when there are pending migrations
-        if count < 30 || (!pending.is_empty() && count % 50 == 0) {
-            eprintln!(
-                "[MIG-PROCESS] #{} node={} total={} (P={} C={} S={}) map={}",
-                count,
-                self.node_id,
-                pending.len(),
+        // Update metrics for slot migration states
+        if let Some(metrics) = &self.metrics {
+            metrics.update_slot_migration_states(
                 pending_count,
                 claimed_count,
-                scanning_count,
-                self.migrations.read().len()
+                streaming_count,
+                prepared_count,
+            );
+        }
+
+        // Log migration state when there are active migrations
+        if !pending.is_empty() {
+            tracing::debug!(
+                node_id = self.node_id,
+                total = pending.len(),
+                pending = pending_count,
+                claimed = claimed_count,
+                scanning = scanning_count,
+                streaming = streaming_count,
+                prepared = prepared_count,
+                "Processing migrations"
             );
         }
 
@@ -1024,7 +1086,7 @@ impl SlotMigrator {
     /// 2. If source shard is draining/removed (no leader) → target shard leader drives migration ("pull" model)
     ///
     /// This ensures migrations can complete even when source shards are being removed.
-    async fn advance_migration<A: MigrationDataAccessor>(
+    pub(crate) async fn advance_migration<A: MigrationDataAccessor>(
         &self,
         slot_id: SlotId,
         accessor: &Arc<A>,
@@ -1037,18 +1099,13 @@ impl SlotMigrator {
             .cloned()
             .ok_or(Error::MigrationNotFound(slot_id as u32))?;
 
-        // Debug: Log entry into advance_migration for non-Pending phases
-        if !matches!(record.phase, MigrationPhase::Pending) {
-            static ADVANCE_LOG_COUNT: std::sync::atomic::AtomicU64 =
-                std::sync::atomic::AtomicU64::new(0);
-            let count = ADVANCE_LOG_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            if count < 20 || count % 100 == 0 {
-                eprintln!(
-                    "[MIG-ADVANCE] #{} slot={} phase={} node={}",
-                    count, slot_id, record.phase.name(), self.node_id
-                );
-            }
-        }
+        // Log migration advancement for non-pending phases
+        tracing::trace!(
+            slot_id,
+            phase = record.phase.name(),
+            node_id = self.node_id,
+            "Advancing migration"
+        );
 
         // Determine who should drive this migration:
         // Target shard leader ALWAYS drives migration (pull model) because:
@@ -1059,63 +1116,40 @@ impl SlotMigrator {
         let is_target_leader = accessor.is_target_shard_leader(record.to_shard);
 
         // Only target shard leader drives migration
-        // Source shard leader info is logged for debugging but not used for driving
         let should_drive = is_target_leader;
 
-        // Debug: Log should_drive decision for all phases
-        static SHOULD_DRIVE_LOG_COUNT: std::sync::atomic::AtomicU64 =
-            std::sync::atomic::AtomicU64::new(0);
-        let sd_count = SHOULD_DRIVE_LOG_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        if sd_count < 30 || sd_count % 500 == 0 {
-            eprintln!(
-                "[MIG-DRIVE] #{} slot={} node={} from={} to={} src_leader={} tgt_leader={} should_drive={} phase={}",
-                sd_count, slot_id, self.node_id, record.from_shard, record.to_shard,
-                is_source_leader, is_target_leader, should_drive, record.phase.name()
-            );
-        }
+        tracing::trace!(
+            slot_id,
+            node_id = self.node_id,
+            from_shard = record.from_shard,
+            to_shard = record.to_shard,
+            is_source_leader,
+            is_target_leader,
+            should_drive,
+            phase = record.phase.name(),
+            "Migration drive decision"
+        );
 
         if !should_drive {
-            // Periodically log why no node is driving (for debugging stuck migrations)
-            static SKIP_LOG_COUNT: std::sync::atomic::AtomicU64 =
-                std::sync::atomic::AtomicU64::new(0);
-            let count = SKIP_LOG_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            if count < 5 || count % 1000 == 0 {
-                tracing::warn!(
-                    slot_id,
-                    node_id = self.node_id,
-                    from_shard = record.from_shard,
-                    to_shard = record.to_shard,
-                    is_source_leader,
-                    is_target_leader,
-                    "Migration skip count {}: not responsible for driving",
-                    count
-                );
-            }
             tracing::trace!(
                 slot_id,
                 node_id = self.node_id,
                 from_shard = record.from_shard,
                 to_shard = record.to_shard,
-                is_source_leader,
-                is_target_leader,
-                "Skipping migration: not responsible for driving"
+                "Skipping migration: not target shard leader"
             );
             return Ok(());
         }
 
         match &record.phase {
             MigrationPhase::Pending => {
-                // Claim ownership before proceeding (via Raft)
-                static CLAIM_LOG_COUNT: std::sync::atomic::AtomicU64 =
-                    std::sync::atomic::AtomicU64::new(0);
-                let claim_count = CLAIM_LOG_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                if claim_count < 20 || claim_count % 100 == 0 {
-                    eprintln!(
-                        "[MIG-CLAIM] #{} slot={} node={} from={} to={} src={} tgt={}",
-                        claim_count, slot_id, self.node_id, record.from_shard, record.to_shard,
-                        is_source_leader, is_target_leader
-                    );
-                }
+                tracing::debug!(
+                    slot_id,
+                    node_id = self.node_id,
+                    from_shard = record.from_shard,
+                    to_shard = record.to_shard,
+                    "Claiming migration ownership"
+                );
                 self.claim_migration(slot_id, &record, accessor).await?;
             }
             MigrationPhase::Claimed {
@@ -1123,38 +1157,47 @@ impl SlotMigrator {
                 claim_epoch,
                 ..
             } => {
-                eprintln!(
-                    "[MIG-DEBUG] Claimed: slot={} owner={} claim_epoch={} self={} rec_epoch={} owner_match={} epoch_match={}",
-                    slot_id, owner_node, claim_epoch, self.node_id, record.id.epoch,
-                    *owner_node == self.node_id, *claim_epoch == record.id.epoch
+                tracing::debug!(
+                    slot_id,
+                    owner_node,
+                    claim_epoch,
+                    record_epoch = record.id.epoch,
+                    "Processing claimed migration"
                 );
                 // With Raft-based coordination, the target shard leader drives all phases.
-                // Since we already passed should_drive = is_target_leader check, we ARE
-                // the target shard leader and can proceed to Scanning.
                 // The epoch check ensures we don't process stale migrations from old epochs.
                 if *claim_epoch != record.id.epoch {
-                    eprintln!(
-                        "[MIG-DEBUG] Skipping: slot={} epoch mismatch (claim_epoch={}, rec_epoch={})",
-                        slot_id, claim_epoch, record.id.epoch
+                    tracing::debug!(
+                        slot_id,
+                        claim_epoch,
+                        record_epoch = record.id.epoch,
+                        "Skipping: epoch mismatch"
                     );
+                    if let Some(metrics) = &self.metrics {
+                        metrics.record_epoch_conflict();
+                    }
                     return Ok(());
                 }
-                eprintln!("[MIG-DEBUG] Transitioning slot={} Claimed → Scanning (target shard leader={})", slot_id, self.node_id);
+                tracing::debug!(
+                    slot_id,
+                    node_id = self.node_id,
+                    "Transitioning Claimed → Scanning"
+                );
                 self.transition_to_scanning(slot_id).await?;
             }
             MigrationPhase::Scanning { cursor, keys_found } => {
-                eprintln!(
-                    "[MIG-DEBUG] Scanning: slot={} keys_found={} cursor={:?}",
-                    slot_id, keys_found, cursor.as_ref().map(|c| c.len())
+                tracing::debug!(
+                    slot_id,
+                    keys_found,
+                    has_cursor = cursor.is_some(),
+                    "Processing scanning phase"
                 );
                 if !self.is_valid_owner(&record) {
-                    eprintln!("[MIG-DEBUG] Scanning skipped: not valid owner for slot={}", slot_id);
+                    tracing::trace!(slot_id, "Scanning skipped: not valid owner");
                     return Ok(());
                 }
-                eprintln!("[MIG-DEBUG] Processing scanning for slot={}", slot_id);
                 self.process_scanning(slot_id, cursor.clone(), *keys_found, accessor)
                     .await?;
-                eprintln!("[MIG-DEBUG] Scanning processed for slot={}", slot_id);
             }
             MigrationPhase::Streaming {
                 keys_total,
@@ -1223,7 +1266,7 @@ impl SlotMigrator {
     ///
     /// This proposes a Claim command through the target shard's Raft to ensure
     /// cluster-wide consistency. The claim will only be applied when committed.
-    async fn claim_migration<A: MigrationDataAccessor>(
+    pub(crate) async fn claim_migration<A: MigrationDataAccessor>(
         &self,
         slot_id: SlotId,
         record: &SlotMigrationRecord,
@@ -1246,6 +1289,7 @@ impl SlotMigrator {
         let command = MigrationRaftCommand::Claim {
             migration_id: record.id.clone(),
             leader_id: self.node_id,
+            proposed_at: now_ms(),
         };
 
         match self
@@ -1253,16 +1297,8 @@ impl SlotMigrator {
             .await
         {
             Ok(_) => {
-                // Update local state after successful Raft proposal
-                // The Raft command is committed, but we also need to update the
-                // SlotMigrator's local migrations HashMap for the migration loop
-                eprintln!(
-                    "[MIG-CLAIM-OK] slot={} node={} to_shard={}: Raft proposal succeeded",
-                    slot_id, self.node_id, record.to_shard
-                );
-                eprintln!("[MIG-CLAIM-OK2] About to call claim_migration_local for slot={}", slot_id);
-                self.claim_migration_local(slot_id)?;
-                eprintln!("[MIG-CLAIM-OK3] claim_migration_local completed for slot={}", slot_id);
+                // Apply to local state ONLY after successful Raft commit
+                self.apply_claim_to_local_state(slot_id);
                 tracing::info!(
                     slot_id,
                     node_id = self.node_id,
@@ -1274,34 +1310,36 @@ impl SlotMigrator {
             }
             Err(Error::Raft(RaftError::NotLeader { leader })) => {
                 // Not the target shard leader - can't propose claim
-                static NOT_LEADER_LOG: std::sync::atomic::AtomicU64 =
-                    std::sync::atomic::AtomicU64::new(0);
-                let nl_count = NOT_LEADER_LOG.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                if nl_count < 10 || nl_count % 100 == 0 {
-                    eprintln!(
-                        "[MIG-CLAIM-NOTLEADER] #{} slot={} node={} to_shard={} leader={:?}",
-                        nl_count, slot_id, self.node_id, record.to_shard, leader
-                    );
-                }
+                tracing::trace!(
+                    slot_id,
+                    node_id = self.node_id,
+                    target_shard = record.to_shard,
+                    ?leader,
+                    "Skipping claim: not target shard leader"
+                );
                 Ok(()) // Not an error, just skip this iteration
             }
             Err(e) => {
-                // Fall back to local claim if Raft not available
-                eprintln!(
-                    "[MIG-CLAIM-FALLBACK] slot={} node={} to_shard={} error={}",
-                    slot_id, self.node_id, record.to_shard, e
+                // CRITICAL: Do NOT fall back to local state on Raft failure!
+                // This could cause split-brain where two nodes both think they own the migration.
+                // Instead, fail and let the retry logic handle it.
+                tracing::warn!(
+                    slot_id,
+                    node_id = self.node_id,
+                    target_shard = record.to_shard,
+                    error = %e,
+                    "Raft proposal failed for claim - will retry"
                 );
-                self.claim_migration_local(slot_id)
+                Err(e)
             }
         }
     }
 
-    /// Claim migration locally (fallback when Raft is not available).
-    fn claim_migration_local(&self, slot_id: SlotId) -> Result<()> {
-        eprintln!("[MIG-LOCAL-CLAIM-START] slot={} node={}", slot_id, self.node_id);
+    /// Apply a successful claim to local state.
+    /// Only called after Raft has committed the claim.
+    fn apply_claim_to_local_state(&self, slot_id: SlotId) {
         let now = now_ms();
         let mut migrations = self.migrations.write();
-        eprintln!("[MIG-LOCAL-CLAIM-LOCK] slot={} map_len={}", slot_id, migrations.len());
         if let Some(record) = migrations.get_mut(&slot_id) {
             let old_phase = record.phase.name();
             record.set_phase(MigrationPhase::Claimed {
@@ -1309,19 +1347,13 @@ impl SlotMigrator {
                 claim_epoch: record.id.epoch,
                 claimed_at: now,
             });
-
-            eprintln!(
-                "[MIG-LOCAL-CLAIM] slot={} node={} {} → Claimed",
-                slot_id, self.node_id, old_phase
-            );
-        } else {
-            eprintln!(
-                "[MIG-LOCAL-CLAIM-NOTFOUND] slot={} node={}",
-                slot_id, self.node_id
+            tracing::debug!(
+                slot_id,
+                node_id = self.node_id,
+                old_phase,
+                "Migration claim applied to local state"
             );
         }
-        eprintln!("[MIG-LOCAL-CLAIM-END] slot={}", slot_id);
-        Ok(())
     }
 
     /// Propose a migration command through the target shard's Raft.
@@ -1346,7 +1378,7 @@ impl SlotMigrator {
     }
 
     /// Transition from Claimed to Scanning.
-    async fn transition_to_scanning(&self, slot_id: SlotId) -> Result<()> {
+    pub(crate) async fn transition_to_scanning(&self, slot_id: SlotId) -> Result<()> {
         let mut migrations = self.migrations.write();
         if let Some(record) = migrations.get_mut(&slot_id) {
             let old_phase = record.phase.name();
@@ -1354,22 +1386,15 @@ impl SlotMigrator {
                 cursor: None,
                 keys_found: 0,
             });
-            eprintln!(
-                "[MIG-DEBUG] transition_to_scanning: slot={} {} → Scanning",
-                slot_id, old_phase
-            );
-            tracing::debug!(slot_id, "Migration: {} → Scanning", old_phase);
+            tracing::debug!(slot_id, old_phase, "Migration: {} → Scanning", old_phase);
         } else {
-            eprintln!(
-                "[MIG-DEBUG] transition_to_scanning: slot={} NOT FOUND in migrations",
-                slot_id
-            );
+            tracing::warn!(slot_id, "Migration not found during transition to scanning");
         }
         Ok(())
     }
 
     /// Process the Scanning phase.
-    async fn process_scanning<A: MigrationDataAccessor>(
+    pub(crate) async fn process_scanning<A: MigrationDataAccessor>(
         &self,
         slot_id: SlotId,
         cursor: Option<Vec<u8>>,
@@ -1383,12 +1408,12 @@ impl SlotMigrator {
             .cloned()
             .ok_or(Error::MigrationNotFound(slot_id as u32))?;
 
-        eprintln!(
-            "[MIG-SCAN] slot={} from_shard={} cursor={:?} batch_size={}",
+        tracing::trace!(
             slot_id,
-            record.from_shard,
-            cursor.as_ref().map(|c| c.len()),
-            self.config.scan_batch_size
+            from_shard = record.from_shard,
+            has_cursor = cursor.is_some(),
+            batch_size = self.config.scan_batch_size,
+            "Scanning slot keys"
         );
 
         // Scan a batch of keys
@@ -1403,19 +1428,16 @@ impl SlotMigrator {
 
         let (keys, next_cursor) = match scan_result {
             Ok((keys, cursor)) => {
-                eprintln!(
-                    "[MIG-SCAN-OK] slot={} keys_found={} next_cursor={:?}",
+                tracing::trace!(
                     slot_id,
-                    keys.len(),
-                    cursor.as_ref().map(|c| c.len())
+                    keys_in_batch = keys.len(),
+                    has_next_cursor = cursor.is_some(),
+                    "Scan batch completed"
                 );
                 (keys, cursor)
             }
             Err(e) => {
-                eprintln!(
-                    "[MIG-SCAN-ERR] slot={} error={}",
-                    slot_id, e
-                );
+                tracing::warn!(slot_id, error = %e, "Scan failed");
                 return Err(e);
             }
         };
@@ -1424,29 +1446,21 @@ impl SlotMigrator {
 
         let mut migrations = self.migrations.write();
         if let Some(record) = migrations.get_mut(&slot_id) {
-            if keys.is_empty() && next_cursor.is_none() {
-                // Scanning complete, transition to Streaming
+            if next_cursor.is_none() {
+                // No more data to scan (cursor exhausted), transition to Streaming
                 record.set_phase(MigrationPhase::Streaming {
                     keys_total: new_keys_found,
                     keys_transferred: 0,
                     last_key: None,
                 });
-
-                eprintln!(
-                    "[MIG-PHASE] slot={} Scanning → Streaming (keys_total={})",
-                    slot_id, new_keys_found
-                );
                 tracing::debug!(
                     slot_id,
                     keys_total = new_keys_found,
                     "Migration: Scanning → Streaming"
                 );
             } else {
-                // Continue scanning
-                eprintln!(
-                    "[MIG-PHASE] slot={} Scanning continues (new_keys_found={})",
-                    slot_id, new_keys_found
-                );
+                // More data to scan (cursor points to resume position)
+                tracing::trace!(slot_id, keys_found = new_keys_found, "Scanning continues");
                 record.set_phase(MigrationPhase::Scanning {
                     cursor: next_cursor,
                     keys_found: new_keys_found,
@@ -1458,7 +1472,7 @@ impl SlotMigrator {
     }
 
     /// Process the Streaming phase.
-    async fn process_streaming<A: MigrationDataAccessor>(
+    pub(crate) async fn process_streaming<A: MigrationDataAccessor>(
         &self,
         slot_id: SlotId,
         keys_total: u64,
@@ -1537,7 +1551,7 @@ impl SlotMigrator {
     }
 
     /// Process the CatchingUp phase.
-    async fn process_catching_up<A: MigrationDataAccessor>(
+    pub(crate) async fn process_catching_up<A: MigrationDataAccessor>(
         &self,
         slot_id: SlotId,
         from_log_index: u64,
@@ -1598,7 +1612,7 @@ impl SlotMigrator {
     /// This validates the migration data and then proposes PREPARED through
     /// the target shard's Raft. The source data will NOT be deleted until
     /// PREPARED is Raft-committed.
-    async fn transition_to_prepared<A: MigrationDataAccessor>(
+    pub(crate) async fn transition_to_prepared<A: MigrationDataAccessor>(
         &self,
         slot_id: SlotId,
         accessor: &Arc<A>,
@@ -1618,6 +1632,7 @@ impl SlotMigrator {
             migration_id: record.id.clone(),
             target_commit_index: validation.raft_commit_index,
             validation_checksum: validation.checksum,
+            proposed_at: now_ms(),
         };
 
         match self
@@ -1645,23 +1660,22 @@ impl SlotMigrator {
                 Ok(()) // Not an error, just skip this iteration
             }
             Err(e) => {
-                // Fall back to local update if Raft not available
-                tracing::debug!(
+                // CRITICAL: Do NOT fall back to local state on Raft failure!
+                // PREPARED is a consensus-critical state - if two nodes both think
+                // a migration is PREPARED, source data deletion could cause data loss.
+                tracing::warn!(
                     slot_id,
                     error = %e,
-                    "Raft proposal failed, falling back to local PREPARED"
+                    "Raft proposal failed for PREPARED - will retry"
                 );
-                self.transition_to_prepared_local(slot_id, &validation)
+                Err(e)
             }
         }
     }
 
-    /// Transition to PREPARED locally (fallback when Raft is not available).
-    fn transition_to_prepared_local(
-        &self,
-        slot_id: SlotId,
-        validation: &ValidationResult,
-    ) -> Result<()> {
+    /// Apply PREPARED state to local migration record.
+    /// Only called after Raft has committed the PREPARED command.
+    fn apply_prepared_to_local_state(&self, slot_id: SlotId, validation: &ValidationResult) {
         let now = now_ms();
         let mut migrations = self.migrations.write();
         if let Some(record) = migrations.get_mut(&slot_id) {
@@ -1676,14 +1690,13 @@ impl SlotMigrator {
                 target_commit_index = validation.raft_commit_index,
                 key_count = validation.key_count,
                 checksum = validation.checksum,
-                "Migration validated locally: CatchingUp → Prepared"
+                "Migration PREPARED applied to local state"
             );
         }
-        Ok(())
     }
 
     /// Three-layer validation before PREPARED state.
-    async fn validate_migration<A: MigrationDataAccessor>(
+    pub(crate) async fn validate_migration<A: MigrationDataAccessor>(
         &self,
         record: &SlotMigrationRecord,
         accessor: &Arc<A>,
@@ -1753,7 +1766,7 @@ impl SlotMigrator {
     ///
     /// This deletes source data and verifies the deletion before proposing
     /// COMPLETED through the target shard's Raft.
-    async fn transition_to_completed<A: MigrationDataAccessor>(
+    pub(crate) async fn transition_to_completed<A: MigrationDataAccessor>(
         &self,
         slot_id: SlotId,
         accessor: &Arc<A>,
@@ -1785,6 +1798,7 @@ impl SlotMigrator {
         // Try to propose COMPLETED through target shard's Raft
         let command = MigrationRaftCommand::Completed {
             migration_id: record.id.clone(),
+            proposed_at: now_ms(),
         };
 
         match self
@@ -1861,7 +1875,7 @@ impl SlotMigrator {
     }
 
     /// Process retries for failed migrations.
-    async fn process_retries(&self) {
+    pub(crate) async fn process_retries(&self) {
         let retryable: Vec<SlotId> = self
             .migrations
             .read()
@@ -2230,36 +2244,22 @@ impl MigrationDataAccessor for ShardMigrationDataAccessor {
             .get_shard(shard_id)
             .ok_or(Error::ShardNotFound(shard_id))?;
 
-        // Iterate through storage, filtering by slot
+        // Use the storage's efficient slot scanning with O(keys_in_slot) complexity
+        // instead of O(total_keys) full iteration per batch
         let storage = shard.storage();
-        let mut keys = Vec::with_capacity(limit);
-        let mut next_cursor = None;
 
-        // Collect keys that belong to this slot
-        let cursor_bytes = cursor.map(Bytes::copy_from_slice);
-
-        for (key_arc, _value) in storage.iter() {
-            let key = (*key_arc).clone();
-
-            // Skip keys until we reach the cursor position
-            if let Some(ref cursor) = cursor_bytes {
-                if key <= *cursor {
-                    continue;
-                }
-            }
-
-            // Check if key belongs to this slot
-            if Self::key_to_slot(&key) == slot_id {
-                keys.push(key.to_vec());
-
-                if keys.len() >= limit {
-                    next_cursor = Some(key.to_vec());
-                    break;
-                }
-            }
+        // Enable slot indexing if not already enabled (lazy initialization)
+        // This rebuilds the index from existing data (O(N) once, then O(1) per slot)
+        if !storage.has_slot_indexing() {
+            storage.enable_slot_indexing();
         }
 
-        Ok((keys, next_cursor))
+        let (keys, next_cursor) = storage.scan_slot_keys(slot_id as u16, cursor, limit);
+
+        Ok((
+            keys.into_iter().map(|k| k.to_vec()).collect(),
+            next_cursor.map(|k| k.to_vec()),
+        ))
     }
 
     async fn get_keys(
@@ -2495,17 +2495,6 @@ impl MigrationDataAccessor for ShardMigrationDataAccessor {
         if let Some(manager) = self.shard_raft_manager.read().as_ref() {
             if let Some(shard_raft) = manager.get_shard(to_shard) {
                 let is_leader = shard_raft.is_leader();
-                let leader_id = shard_raft.leader_id();
-                // Debug: Log leadership check details
-                static TGT_LEADER_LOG: std::sync::atomic::AtomicU64 =
-                    std::sync::atomic::AtomicU64::new(0);
-                let count = TGT_LEADER_LOG.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                if count < 20 || count % 1000 == 0 {
-                    eprintln!(
-                        "[TGT-LEADER] #{} shard={} node={} is_leader={} leader_id={:?}",
-                        count, to_shard, self.node_id, is_leader, leader_id
-                    );
-                }
                 tracing::trace!(
                     to_shard,
                     node_id = self.node_id,
@@ -2515,16 +2504,11 @@ impl MigrationDataAccessor for ShardMigrationDataAccessor {
                 return is_leader;
             }
             // Shard doesn't exist in manager
-            static TGT_NOSHARD_LOG: std::sync::atomic::AtomicU64 =
-                std::sync::atomic::AtomicU64::new(0);
-            let count = TGT_NOSHARD_LOG.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            if count < 10 || count % 1000 == 0 {
-                let shard_ids = manager.shard_ids();
-                eprintln!(
-                    "[TGT-LEADER] #{} shard={} NOT IN manager (has {:?}), node={}",
-                    count, to_shard, shard_ids, self.node_id
-                );
-            }
+            tracing::trace!(
+                to_shard,
+                node_id = self.node_id,
+                "Target shard not in raft manager"
+            );
             return false;
         }
 

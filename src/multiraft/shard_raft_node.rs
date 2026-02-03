@@ -655,7 +655,10 @@ mod tests {
         let bytes = shard_cmd.to_bytes().unwrap();
 
         // Verify tag prefix
-        assert_eq!(bytes[0], CACHE_COMMAND_TAG, "First byte should be cache command tag");
+        assert_eq!(
+            bytes[0], CACHE_COMMAND_TAG,
+            "First byte should be cache command tag"
+        );
 
         // Roundtrip
         let decoded = ShardRaftCommand::from_bytes(&bytes).unwrap();
@@ -682,6 +685,7 @@ mod tests {
         let cmd = MigrationRaftCommand::Claim {
             migration_id,
             leader_id: 1,
+            proposed_at: 1000,
         };
         let shard_cmd = ShardRaftCommand::Migration(cmd);
 
@@ -754,6 +758,7 @@ mod tests {
         let migration_cmd = MigrationRaftCommand::Claim {
             migration_id,
             leader_id: 3,
+            proposed_at: 2000,
         };
         let shard_cmd = ShardRaftCommand::Migration(migration_cmd);
         let bytes = shard_cmd.to_bytes().unwrap();

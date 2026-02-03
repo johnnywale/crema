@@ -2296,9 +2296,35 @@ impl MessageHandler for CacheMessageHandler {
 
         // Handle shard forwarded commands (for per-shard Raft Phase 2)
         if let Message::ShardForwardedCommand(fwd_cmd) = msg {
+            let request_id = fwd_cmd.request_id;
+            let origin_node_id = fwd_cmd.origin_node_id;
+            let ttl = fwd_cmd.ttl;
+
+            // TTL check to prevent infinite forwarding loops
+            if ttl == 0 {
+                warn!(
+                    node_id = self.node_id,
+                    request_id = request_id,
+                    shard_id = fwd_cmd.shard_id,
+                    origin = origin_node_id,
+                    "ShardForwardedCommand TTL expired, rejecting to prevent infinite loop"
+                );
+                let transport = self.raft.transport().clone();
+                let response = Message::ShardForwardResponse(
+                    crate::network::rpc::ShardForwardResponse::error(
+                        request_id,
+                        "TTL expired - forwarding loop detected",
+                    ),
+                );
+                tokio::spawn(async move {
+                    if let Err(e) = transport.send_message(origin_node_id, response).await {
+                        warn!(error = %e, "Failed to send TTL expired response");
+                    }
+                });
+                return None;
+            }
+
             if let Some(handler) = self.shard_forward_handler.read().clone() {
-                let request_id = fwd_cmd.request_id;
-                let origin_node_id = fwd_cmd.origin_node_id;
                 let transport = self.raft.transport().clone();
                 let node_id = self.node_id;
 
@@ -2307,6 +2333,7 @@ impl MessageHandler for CacheMessageHandler {
                     request_id = request_id,
                     origin = origin_node_id,
                     shard_id = fwd_cmd.shard_id,
+                    ttl = ttl,
                     "Handling ShardForwardedCommand"
                 );
 

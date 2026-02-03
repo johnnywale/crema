@@ -171,7 +171,7 @@ mod migration;
 mod migration_cleanup;
 mod migration_metrics;
 mod migration_orchestrator;
-mod migration_routing;
+pub mod migration_routing;
 pub mod migration_state_machine;
 mod migration_transport;
 mod persistent_migration_store;
@@ -201,8 +201,8 @@ pub use migration::{
     ShardMigrationCoordinator, TransferBatch, TransferEntry,
 };
 pub use migration_cleanup::{
-    CleanupResource, CleanupResult, MigrationCleanupHandler, MigrationCleanupManager,
-    NoOpCleanupHandler,
+    CleanupPersistence, CleanupResource, CleanupResult, MigrationCleanupHandler,
+    MigrationCleanupManager, NoOpCleanupHandler, NoOpCleanupPersistence, PendingCleanupTask,
 };
 pub use migration_metrics::{MigrationMetrics, MigrationMetricsSnapshot, MigrationTimer};
 pub use migration_orchestrator::{
@@ -239,8 +239,9 @@ pub use shard_recovery::{
 };
 pub use shard_registry::{ShardLifecycleState, ShardMetadata, ShardRegistry};
 pub use shard_storage::{
-    PersistedShardMetadata, PersistedShardRegistry, ShardLeaderHint, ShardSnapshotInfo,
-    ShardStorageConfig, ShardStorageManager,
+    create_dir_all_durable, create_dir_all_durable_async, PersistedShardMetadata,
+    PersistedShardRegistry, ShardLeaderHint, ShardSnapshotInfo, ShardStorageConfig,
+    ShardStorageManager,
 };
 pub use shard_transport::{RaftShardMultiplexer, ShardRaftTransport, ShardTransportMultiplexer};
 
@@ -250,8 +251,9 @@ pub use slot_control_plane::{
     ShardState as SlotShardState, SlotControlPlane,
 };
 pub use slot_migration::{
-    MigrationDataAccessor, MigrationPhase as SlotMigrationPhase, MigrationStatus, NoOpDataAccessor,
-    SlotLogEntry, SlotLogOperation, SlotMigrationRecord, SlotMigrator, SlotMigratorConfig,
+    MigrationDataAccessor, MigrationId, MigrationPhase as SlotMigrationPhase, MigrationRaftCommand,
+    MigrationStatus, NoOpDataAccessor, SlotLogEntry, SlotLogOperation, SlotMigrationRecord,
+    SlotMigrator, SlotMigratorConfig, ValidationResult,
 };
 pub use slot_table::{
     crc16, Epoch, EpochCheck, RouteResult, ShardSlotInfo, SlotAssignment, SlotId, SlotReassignment,

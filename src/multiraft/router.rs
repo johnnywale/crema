@@ -9,6 +9,7 @@ use bytes::Bytes;
 use parking_lot::RwLock;
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use twox_hash::XxHash64;
@@ -97,6 +98,11 @@ pub struct ShardRouter {
     /// Reduces repeated hash-to-shard calculations for hot keys.
     /// Bounded to 100K entries. Must be cleared on topology changes.
     key_cache: Option<RwLock<HashMap<u64, ShardId>>>,
+
+    /// Atomic flag indicating the key cache is full.
+    /// Used to avoid write lock acquisition on hot path when cache is at capacity.
+    /// Checked with relaxed ordering since stale reads only cause extra read locks.
+    key_cache_full: AtomicBool,
 }
 
 impl ShardRouter {
@@ -113,6 +119,7 @@ impl ShardRouter {
             shards: RwLock::new(HashMap::new()),
             shard_leaders: RwLock::new(HashMap::new()),
             key_cache,
+            key_cache_full: AtomicBool::new(false),
         }
     }
 
@@ -146,12 +153,17 @@ impl ShardRouter {
 
         let shard_id = (hash % self.config.num_shards as u64) as ShardId;
 
-        // Cache the result
+        // Cache the result (unless cache is full)
+        // Use Relaxed ordering: stale reads only cause an extra read lock, not correctness issues
         if let Some(ref cache) = self.key_cache {
-            // Limit cache size
-            let mut cache = cache.write();
-            if cache.len() < 100_000 {
-                cache.insert(hash, shard_id);
+            if !self.key_cache_full.load(Ordering::Relaxed) {
+                let mut cache = cache.write();
+                if cache.len() < 100_000 {
+                    cache.insert(hash, shard_id);
+                } else {
+                    // Mark cache as full to avoid future write lock acquisition
+                    self.key_cache_full.store(true, Ordering::Relaxed);
+                }
             }
         }
 
@@ -284,6 +296,52 @@ impl ShardRouter {
     pub fn clear_cache(&self) {
         if let Some(ref cache) = self.key_cache {
             cache.write().clear();
+            // Reset the full flag to allow new insertions
+            self.key_cache_full.store(false, Ordering::Relaxed);
+        }
+    }
+
+    /// Invalidate cache entries for specific shards only.
+    ///
+    /// This is more efficient than `clear_cache()` when only a subset of shards
+    /// is affected (e.g., when a single node fails). Keys routed to unaffected
+    /// shards remain cached, preserving performance.
+    ///
+    /// Returns the number of entries invalidated.
+    pub fn invalidate_for_shards(&self, shard_ids: &[ShardId]) -> usize {
+        if shard_ids.is_empty() {
+            return 0;
+        }
+
+        if let Some(ref cache) = self.key_cache {
+            let mut cache = cache.write();
+
+            // If we're invalidating most shards, just clear everything
+            // (retain would iterate the whole cache anyway)
+            if shard_ids.len() >= self.config.num_shards as usize / 2 {
+                let count = cache.len();
+                cache.clear();
+                // Reset the full flag to allow new insertions
+                self.key_cache_full.store(false, Ordering::Relaxed);
+                return count;
+            }
+
+            // Convert to HashSet for O(1) lookups
+            let shard_set: std::collections::HashSet<ShardId> = shard_ids.iter().copied().collect();
+
+            let original_len = cache.len();
+            cache.retain(|_, &mut cached_shard| !shard_set.contains(&cached_shard));
+            let removed = original_len - cache.len();
+
+            // If we removed entries and cache was full, reset the flag
+            // to allow new insertions
+            if removed > 0 && self.key_cache_full.load(Ordering::Relaxed) {
+                self.key_cache_full.store(false, Ordering::Relaxed);
+            }
+
+            removed
+        } else {
+            0
         }
     }
 }
@@ -480,6 +538,107 @@ mod tests {
         assert_eq!(decisions.len(), 2);
         for decision in decisions {
             assert!(decision.shard_id < 4);
+        }
+    }
+
+    #[test]
+    fn test_invalidate_for_shards() {
+        // Use 8 shards so we can invalidate 1-2 shards without triggering
+        // the "clear all" optimization (which kicks in at 50% of shards)
+        let router = ShardRouter::new(RouterConfig::new(8));
+
+        // Populate cache with keys that route to different shards
+        let mut shard_counts: HashMap<ShardId, usize> = HashMap::new();
+        for i in 0..1000 {
+            let key = format!("key-{}", i);
+            let shard_id = router.shard_for_key(key.as_bytes());
+            *shard_counts.entry(shard_id).or_insert(0) += 1;
+        }
+
+        // Get initial cache size
+        let initial_cache_size = if let Some(ref cache) = router.key_cache {
+            cache.read().len()
+        } else {
+            0
+        };
+        assert_eq!(initial_cache_size, 1000, "Should have 1000 cached entries");
+
+        // Count entries for shard 0 before invalidation
+        let entries_shard_0 = shard_counts.get(&0).copied().unwrap_or(0);
+        assert!(entries_shard_0 > 0, "Should have some entries for shard 0");
+
+        // Invalidate only shard 0 (less than 50% of shards)
+        let removed = router.invalidate_for_shards(&[0]);
+        assert_eq!(
+            removed, entries_shard_0,
+            "Should have removed entries for shard 0"
+        );
+
+        // Check remaining cache size
+        let remaining_cache_size = if let Some(ref cache) = router.key_cache {
+            cache.read().len()
+        } else {
+            0
+        };
+        assert_eq!(
+            remaining_cache_size,
+            initial_cache_size - entries_shard_0,
+            "Should only have removed shard 0 entries"
+        );
+
+        // Verify no entries for shard 0 remain
+        if let Some(ref cache) = router.key_cache {
+            let cache = cache.read();
+            for (_, &shard_id) in cache.iter() {
+                assert_ne!(shard_id, 0, "Shard 0 entries should be removed from cache");
+            }
+        }
+    }
+
+    #[test]
+    fn test_invalidate_for_many_shards_clears_all() {
+        // When invalidating >= 50% of shards, the optimization clears the entire cache
+        let router = ShardRouter::new(RouterConfig::new(4));
+
+        // Populate cache
+        for i in 0..100 {
+            let key = format!("key-{}", i);
+            router.shard_for_key(key.as_bytes());
+        }
+
+        // Invalidating 2 of 4 shards (50%) should clear everything
+        let removed = router.invalidate_for_shards(&[0, 1]);
+        assert_eq!(
+            removed, 100,
+            "Should clear entire cache when invalidating 50%+ of shards"
+        );
+
+        // Cache should be empty
+        if let Some(ref cache) = router.key_cache {
+            assert!(
+                cache.read().is_empty(),
+                "Cache should be empty after bulk invalidation"
+            );
+        }
+    }
+
+    #[test]
+    fn test_invalidate_for_empty_shards() {
+        let router = ShardRouter::new(RouterConfig::new(4));
+
+        // Populate cache
+        for i in 0..100 {
+            let key = format!("key-{}", i);
+            router.shard_for_key(key.as_bytes());
+        }
+
+        // Empty invalidation should do nothing
+        let removed = router.invalidate_for_shards(&[]);
+        assert_eq!(removed, 0);
+
+        // Cache should still have entries
+        if let Some(ref cache) = router.key_cache {
+            assert!(!cache.read().is_empty(), "Cache should still have entries");
         }
     }
 }

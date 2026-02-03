@@ -3,7 +3,7 @@
 //! This module implements routing strategies during shard migration to ensure
 //! consistency and availability while data is being transferred between nodes.
 
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::types::NodeId;
 use std::sync::atomic::{AtomicU8, Ordering};
 
@@ -324,8 +324,47 @@ impl DualWriteResult {
         self.primary_result.is_ok() && self.secondary_result.is_ok()
     }
 
+    /// Check if the secondary write failed.
+    pub fn secondary_failed(&self) -> bool {
+        self.secondary_result.is_err()
+    }
+
+    /// Get the secondary error if present.
+    pub fn secondary_error(&self) -> Option<&Error> {
+        self.secondary_result.as_ref().err()
+    }
+
+    /// Get the secondary error message if present.
+    pub fn secondary_error_message(&self) -> Option<String> {
+        self.secondary_result.as_ref().err().map(|e| e.to_string())
+    }
+
     /// Convert to a single result (based on primary).
+    ///
+    /// WARNING: This discards secondary error information. Before calling this,
+    /// check `secondary_failed()` and use `secondary_error_message()` to log
+    /// or track the secondary error for reconciliation.
     pub fn into_result(self) -> Result<()> {
+        self.primary_result
+    }
+
+    /// Convert to a single result, logging any secondary failure.
+    ///
+    /// This is the recommended way to convert a DualWriteResult when you don't
+    /// need to track failures for reconciliation but want visibility into errors.
+    pub fn into_result_with_logging(
+        self,
+        shard_id: super::shard::ShardId,
+        key_hint: &str,
+    ) -> Result<()> {
+        if let Some(error) = self.secondary_error_message() {
+            tracing::warn!(
+                shard_id,
+                key_hint,
+                secondary_error = %error,
+                "Dual-write secondary failed (primary succeeded)"
+            );
+        }
         self.primary_result
     }
 }
@@ -378,8 +417,10 @@ impl MigrationRoutingConfig {
 
 // ==================== Dual Write Failure Tracking ====================
 
+use dashmap::DashMap;
 use parking_lot::Mutex;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 use std::time::Instant;
 
 /// A failed dual-write entry that needs reconciliation.
@@ -432,14 +473,30 @@ impl FailedDualWrite {
 /// 2. Before commit phase, call `get_failures_for_reconciliation()` to get all failures
 /// 3. Retry each failure against the target node
 /// 4. Call `clear_reconciled()` after successful reconciliation
+///
+/// # Thread Safety
+///
+/// Uses DashMap for per-shard lock granularity. Operations on different shards
+/// can proceed concurrently without blocking each other. This prevents deadlock
+/// risks where multiple shards are being reconciled simultaneously.
 #[derive(Debug)]
 pub struct DualWriteTracker {
     /// Failed writes per shard, keyed by shard ID.
-    failures: Mutex<HashMap<ShardId, Vec<FailedDualWrite>>>,
+    /// Uses DashMap for per-shard locking to avoid global lock bottleneck
+    /// and potential deadlocks when multiple shards are being processed.
+    failures: DashMap<ShardId, Vec<FailedDualWrite>>,
+    /// Approximate total count (may drift slightly due to concurrent updates).
+    /// Used for soft limit checking without global locking.
+    total_count: AtomicUsize,
     /// Maximum failures to track per shard (prevents unbounded growth).
     max_failures_per_shard: usize,
+    /// Maximum total failures across all shards.
+    max_total_failures: usize,
     /// Maximum age of failures before they're considered stale.
     max_failure_age: std::time::Duration,
+    /// Lock for global pruning operations that need to touch all shards.
+    /// Only used when global limit is hit and we need to prune across shards.
+    prune_lock: Mutex<()>,
 }
 
 impl Default for DualWriteTracker {
@@ -452,9 +509,12 @@ impl DualWriteTracker {
     /// Create a new tracker with default settings.
     pub fn new() -> Self {
         Self {
-            failures: Mutex::new(HashMap::new()),
+            failures: DashMap::new(),
+            total_count: AtomicUsize::new(0),
             max_failures_per_shard: 10000,
+            max_total_failures: 100000, // 100K total across all shards
             max_failure_age: std::time::Duration::from_secs(300), // 5 minutes
+            prune_lock: Mutex::new(()),
         }
     }
 
@@ -464,15 +524,19 @@ impl DualWriteTracker {
         max_failure_age: std::time::Duration,
     ) -> Self {
         Self {
-            failures: Mutex::new(HashMap::new()),
+            failures: DashMap::new(),
+            total_count: AtomicUsize::new(0),
             max_failures_per_shard,
+            max_total_failures: max_failures_per_shard * 10, // Default to 10x per-shard limit
             max_failure_age,
+            prune_lock: Mutex::new(()),
         }
     }
 
     /// Record a failed secondary write.
     ///
     /// Returns true if the failure was recorded, false if the limit was reached.
+    /// Automatically prunes stale entries when limits are reached.
     pub fn record_failure(
         &self,
         shard_id: ShardId,
@@ -480,20 +544,64 @@ impl DualWriteTracker {
         value: Vec<u8>,
         error: impl Into<String>,
     ) -> bool {
-        let mut failures = self.failures.lock();
-        let shard_failures = failures.entry(shard_id).or_default();
+        // Check approximate global limit first (soft check without global locking)
+        let approx_total = self.total_count.load(AtomicOrdering::Relaxed);
+        if approx_total >= self.max_total_failures {
+            // Try global prune under lock
+            let _guard = self.prune_lock.lock();
+            let pruned = self.prune_stale_internal();
+            if pruned > 0 {
+                tracing::info!(
+                    pruned_count = pruned,
+                    "Auto-pruned stale failures globally on limit reached"
+                );
+            }
 
-        // Check limit
+            // Re-check after pruning
+            let new_total = self.total_count.load(AtomicOrdering::Relaxed);
+            if new_total >= self.max_total_failures {
+                tracing::warn!(
+                    total_count = new_total,
+                    max_total = self.max_total_failures,
+                    "Global dual-write failure limit reached, dropping failure"
+                );
+                return false;
+            }
+        }
+
+        // Per-shard insertion with per-shard lock only
+        let mut entry = self.failures.entry(shard_id).or_default();
+        let shard_failures = entry.value_mut();
+
+        // Check per-shard limit
         if shard_failures.len() >= self.max_failures_per_shard {
-            tracing::warn!(
-                shard_id,
-                count = shard_failures.len(),
-                "Dual-write failure limit reached, dropping failure"
-            );
-            return false;
+            // Prune stale entries for this shard only
+            let before = shard_failures.len();
+            shard_failures.retain(|f| !f.is_stale(self.max_failure_age));
+            let pruned = before - shard_failures.len();
+
+            if pruned > 0 {
+                self.total_count.fetch_sub(pruned, AtomicOrdering::Relaxed);
+                tracing::debug!(
+                    shard_id,
+                    pruned_count = pruned,
+                    "Auto-pruned stale failures on shard limit reached"
+                );
+            }
+
+            // Check again after pruning
+            if shard_failures.len() >= self.max_failures_per_shard {
+                tracing::warn!(
+                    shard_id,
+                    count = shard_failures.len(),
+                    "Per-shard dual-write failure limit reached, dropping failure"
+                );
+                return false;
+            }
         }
 
         shard_failures.push(FailedDualWrite::new(key, value, error));
+        self.total_count.fetch_add(1, AtomicOrdering::Relaxed);
         tracing::debug!(
             shard_id,
             total_failures = shard_failures.len(),
@@ -504,52 +612,85 @@ impl DualWriteTracker {
 
     /// Get all failures for a shard that need reconciliation.
     ///
-    /// This clones the failures for processing without holding the lock.
+    /// This also prunes stale entries to prevent unbounded memory growth.
+    /// Returns cloned failures for processing without holding the lock long.
     pub fn get_failures_for_reconciliation(&self, shard_id: ShardId) -> Vec<FailedDualWrite> {
-        let failures = self.failures.lock();
-        failures
-            .get(&shard_id)
-            .cloned()
-            .unwrap_or_default()
-            .into_iter()
-            .filter(|f| !f.is_stale(self.max_failure_age))
-            .collect()
+        if let Some(mut entry) = self.failures.get_mut(&shard_id) {
+            let shard_failures = entry.value_mut();
+            let before = shard_failures.len();
+
+            // Prune stale entries while we have mutable access
+            shard_failures.retain(|f| !f.is_stale(self.max_failure_age));
+
+            let pruned = before - shard_failures.len();
+            if pruned > 0 {
+                self.total_count.fetch_sub(pruned, AtomicOrdering::Relaxed);
+                tracing::debug!(
+                    shard_id,
+                    pruned,
+                    remaining = shard_failures.len(),
+                    "Pruned stale entries during reconciliation fetch"
+                );
+            }
+
+            // Clone the non-stale failures for processing
+            shard_failures.clone()
+        } else {
+            Vec::new()
+        }
     }
 
-    /// Get the count of failures for a shard.
+    /// Get the count of actionable (non-stale) failures for a shard.
+    ///
+    /// Only counts failures that are not stale (within max_failure_age).
+    /// Use `total_failure_count()` to get the count including stale entries.
     pub fn failure_count(&self, shard_id: ShardId) -> usize {
         self.failures
-            .lock()
             .get(&shard_id)
-            .map(|v| v.len())
+            .map(|entry| {
+                entry
+                    .value()
+                    .iter()
+                    .filter(|f| !f.is_stale(self.max_failure_age))
+                    .count()
+            })
             .unwrap_or(0)
     }
 
-    /// Check if there are any failures pending for a shard.
+    /// Check if there are any actionable (non-stale) failures pending for a shard.
     pub fn has_pending_failures(&self, shard_id: ShardId) -> bool {
         self.failure_count(shard_id) > 0
     }
 
     /// Clear all failures for a shard after successful reconciliation.
     pub fn clear_reconciled(&self, shard_id: ShardId) {
-        let mut failures = self.failures.lock();
-        if let Some(removed) = failures.remove(&shard_id) {
+        if let Some((_, removed)) = self.failures.remove(&shard_id) {
+            let count = removed.len();
+            self.total_count.fetch_sub(count, AtomicOrdering::Relaxed);
             tracing::info!(
                 shard_id,
-                cleared_count = removed.len(),
+                cleared_count = count,
                 "Cleared reconciled dual-write failures"
             );
         }
     }
 
     /// Clear specific keys from failures (partial reconciliation).
+    ///
+    /// Uses HashSet for O(1) key lookup instead of O(n) linear search,
+    /// minimizing the time the per-shard lock is held.
     pub fn clear_keys(&self, shard_id: ShardId, keys: &[Vec<u8>]) {
-        let mut failures = self.failures.lock();
-        if let Some(shard_failures) = failures.get_mut(&shard_id) {
+        if let Some(mut entry) = self.failures.get_mut(&shard_id) {
+            let shard_failures = entry.value_mut();
             let before = shard_failures.len();
-            shard_failures.retain(|f| !keys.contains(&f.key));
+
+            // Use HashSet for O(1) lookup instead of O(n) contains check
+            let keys_set: HashSet<&[u8]> = keys.iter().map(|k| k.as_slice()).collect();
+            shard_failures.retain(|f| !keys_set.contains(f.key.as_slice()));
+
             let removed = before - shard_failures.len();
             if removed > 0 {
+                self.total_count.fetch_sub(removed, AtomicOrdering::Relaxed);
                 tracing::debug!(
                     shard_id,
                     removed_count = removed,
@@ -560,18 +701,20 @@ impl DualWriteTracker {
         }
     }
 
-    /// Remove stale failures across all shards.
-    pub fn prune_stale(&self) -> usize {
-        let mut failures = self.failures.lock();
+    /// Internal pruning without lock (caller must hold prune_lock if needed).
+    fn prune_stale_internal(&self) -> usize {
         let mut total_pruned = 0;
 
-        for (shard_id, shard_failures) in failures.iter_mut() {
+        // Iterate over all shards - DashMap iteration doesn't block other operations
+        for mut entry in self.failures.iter_mut() {
+            let shard_id = *entry.key();
+            let shard_failures = entry.value_mut();
             let before = shard_failures.len();
             shard_failures.retain(|f| !f.is_stale(self.max_failure_age));
             let pruned = before - shard_failures.len();
             if pruned > 0 {
                 tracing::debug!(
-                    shard_id = *shard_id,
+                    shard_id,
                     pruned_count = pruned,
                     "Pruned stale dual-write failures"
                 );
@@ -580,22 +723,33 @@ impl DualWriteTracker {
         }
 
         // Remove empty entries
-        failures.retain(|_, v| !v.is_empty());
+        self.failures.retain(|_, v| !v.is_empty());
+
+        // Update total count
+        if total_pruned > 0 {
+            self.total_count
+                .fetch_sub(total_pruned, AtomicOrdering::Relaxed);
+        }
 
         total_pruned
     }
 
+    /// Remove stale failures across all shards.
+    pub fn prune_stale(&self) -> usize {
+        let _guard = self.prune_lock.lock();
+        self.prune_stale_internal()
+    }
+
     /// Get total failure count across all shards.
     pub fn total_failure_count(&self) -> usize {
-        self.failures.lock().values().map(|v| v.len()).sum()
+        self.total_count.load(AtomicOrdering::Relaxed)
     }
 
     /// Get summary of failures per shard.
     pub fn failure_summary(&self) -> HashMap<ShardId, usize> {
         self.failures
-            .lock()
             .iter()
-            .map(|(k, v)| (*k, v.len()))
+            .map(|entry| (*entry.key(), entry.value().len()))
             .collect()
     }
 }

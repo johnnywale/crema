@@ -286,15 +286,24 @@ impl RateLimiter {
     }
 
     /// Try to acquire a permit without waiting.
+    ///
+    /// Returns true if a permit was acquired, false if no permits are
+    /// available or if contention prevented acquisition.
     pub fn try_acquire(&self) -> bool {
         self.refill();
 
-        loop {
+        // Limit CAS retries to prevent infinite loop under high contention.
+        // A small number of retries is sufficient for most cases.
+        // If we can't acquire after this many tries, the system is under
+        // extreme contention and we should fail fast rather than spin.
+        const MAX_CAS_RETRIES: usize = 8;
+
+        for _ in 0..MAX_CAS_RETRIES {
             let available = self.available_permits.load(Ordering::Acquire);
             if available > 0 {
                 if self
                     .available_permits
-                    .compare_exchange(
+                    .compare_exchange_weak(
                         available,
                         available - 1,
                         Ordering::AcqRel,
@@ -304,11 +313,14 @@ impl RateLimiter {
                 {
                     return true;
                 }
-                // CAS failed, retry
+                // CAS failed due to contention, retry up to limit
             } else {
                 return false;
             }
         }
+
+        // Too much contention, fail fast
+        false
     }
 
     /// Refill permits based on elapsed time.

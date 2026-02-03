@@ -5,10 +5,16 @@ use crate::types::CacheStats;
 use bytes::Bytes;
 use moka::future::Cache;
 use parking_lot::RwLock;
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
+
+/// Slot ID for slot-based key routing.
+pub type SlotId = u16;
+
+/// Total number of slots (matching Redis Cluster).
+pub const TOTAL_SLOTS: u16 = 1024;
 
 /// Local cache storage backed by Moka.
 pub struct CacheStorage {
@@ -25,6 +31,11 @@ pub struct CacheStorage {
     /// Maps key to absolute expiration time in milliseconds since Unix epoch.
     /// Entries without TTL are not present in this map.
     expirations: RwLock<HashMap<Bytes, u64>>,
+
+    /// Optional slot index for O(1) slot-based key lookups.
+    /// Maps slot_id -> set of keys in that slot.
+    /// This is only populated when slot indexing is enabled.
+    slot_index: RwLock<Option<HashMap<SlotId, BTreeSet<Bytes>>>>,
 }
 
 impl CacheStorage {
@@ -56,6 +67,175 @@ impl CacheStorage {
             hits: AtomicU64::new(0),
             misses: AtomicU64::new(0),
             expirations: RwLock::new(HashMap::new()),
+            slot_index: RwLock::new(None),
+        }
+    }
+
+    /// Enable slot indexing for O(1) slot-based key lookups.
+    ///
+    /// When enabled, the storage maintains an index mapping slot_id -> keys.
+    /// This enables efficient scanning for migration without O(N) iteration per batch.
+    ///
+    /// If `rebuild` is true, rebuilds the index from existing data (O(N) once).
+    pub fn enable_slot_indexing(&self) {
+        let mut guard = self.slot_index.write();
+        if guard.is_none() {
+            let mut index: HashMap<SlotId, BTreeSet<Bytes>> = HashMap::new();
+
+            // Build index from existing data (O(N) once)
+            for (key_arc, _) in self.cache.iter() {
+                let key = (*key_arc).clone();
+                let slot = Self::key_to_slot(&key);
+                index.entry(slot).or_default().insert(key);
+            }
+
+            *guard = Some(index);
+        }
+    }
+
+    /// Check if slot indexing is enabled.
+    pub fn has_slot_indexing(&self) -> bool {
+        self.slot_index.read().is_some()
+    }
+
+    /// Compute the slot for a key using CRC16 (XMODEM variant).
+    #[inline]
+    pub fn key_to_slot(key: &[u8]) -> SlotId {
+        let crc = crc16(key);
+        crc % TOTAL_SLOTS
+    }
+
+    /// Add a key to the slot index.
+    fn add_to_slot_index(&self, key: &Bytes) {
+        if let Some(ref mut index) = *self.slot_index.write() {
+            let slot = Self::key_to_slot(key);
+            index.entry(slot).or_default().insert(key.clone());
+        }
+    }
+
+    /// Remove a key from the slot index.
+    fn remove_from_slot_index(&self, key: &Bytes) {
+        if let Some(ref mut index) = *self.slot_index.write() {
+            let slot = Self::key_to_slot(key);
+            if let Some(keys) = index.get_mut(&slot) {
+                keys.remove(key);
+                if keys.is_empty() {
+                    index.remove(&slot);
+                }
+            }
+        }
+    }
+
+    /// Scan keys belonging to a specific slot with cursor-based pagination.
+    ///
+    /// Returns (keys, next_cursor). If next_cursor is None, all keys have been scanned.
+    /// Uses the slot index for O(keys_in_slot) instead of O(total_keys) iteration.
+    pub fn scan_slot_keys(
+        &self,
+        slot_id: SlotId,
+        cursor: Option<&[u8]>,
+        limit: usize,
+    ) -> (Vec<Bytes>, Option<Bytes>) {
+        let guard = self.slot_index.read();
+
+        if let Some(ref index) = *guard {
+            // Fast path: use slot index
+            if let Some(slot_keys) = index.get(&slot_id) {
+                let cursor_bytes = cursor.map(Bytes::copy_from_slice);
+                let mut keys = Vec::with_capacity(limit.min(slot_keys.len()));
+                let mut next_cursor = None;
+
+                // Use BTreeSet's range iteration for efficient cursor-based scanning
+                let iter = if let Some(ref c) = cursor_bytes {
+                    // Start from the key after cursor
+                    slot_keys.range::<Bytes, _>((
+                        std::ops::Bound::Excluded(c.clone()),
+                        std::ops::Bound::Unbounded,
+                    ))
+                } else {
+                    slot_keys.range::<Bytes, _>(..)
+                };
+
+                for key in iter {
+                    keys.push(key.clone());
+                    if keys.len() >= limit {
+                        next_cursor = Some(key.clone());
+                        break;
+                    }
+                }
+
+                return (keys, next_cursor);
+            }
+            // Slot not in index - no keys
+            return (Vec::new(), None);
+        }
+
+        // Slow path: no slot index, fall back to full iteration
+        self.scan_slot_keys_slow(slot_id, cursor, limit)
+    }
+
+    /// Slow path for slot scanning when index is not available.
+    fn scan_slot_keys_slow(
+        &self,
+        slot_id: SlotId,
+        cursor: Option<&[u8]>,
+        limit: usize,
+    ) -> (Vec<Bytes>, Option<Bytes>) {
+        let cursor_bytes = cursor.map(Bytes::copy_from_slice);
+        let mut keys = Vec::with_capacity(limit);
+        let mut next_cursor = None;
+
+        for (key_arc, _) in self.cache.iter() {
+            let key = (*key_arc).clone();
+
+            // Skip keys until we reach the cursor position
+            if let Some(ref c) = cursor_bytes {
+                if key <= *c {
+                    continue;
+                }
+            }
+
+            // Check if key belongs to this slot
+            if Self::key_to_slot(&key) == slot_id {
+                keys.push(key.clone());
+                if keys.len() >= limit {
+                    next_cursor = Some(key);
+                    break;
+                }
+            }
+        }
+
+        (keys, next_cursor)
+    }
+
+    /// Count keys in a specific slot.
+    pub fn count_slot_keys(&self, slot_id: SlotId) -> u64 {
+        let guard = self.slot_index.read();
+        if let Some(ref index) = *guard {
+            index.get(&slot_id).map(|s| s.len() as u64).unwrap_or(0)
+        } else {
+            // Slow path
+            self.cache
+                .iter()
+                .filter(|(k, _)| Self::key_to_slot(k) == slot_id)
+                .count() as u64
+        }
+    }
+
+    /// Get all keys in a specific slot.
+    pub fn get_slot_keys(&self, slot_id: SlotId) -> Vec<Bytes> {
+        let guard = self.slot_index.read();
+        if let Some(ref index) = *guard {
+            index
+                .get(&slot_id)
+                .map(|s| s.iter().cloned().collect())
+                .unwrap_or_default()
+        } else {
+            self.cache
+                .iter()
+                .filter(|(k, _)| Self::key_to_slot(k) == slot_id)
+                .map(|(k, _)| (*k).clone())
+                .collect()
         }
     }
 
@@ -81,6 +261,7 @@ impl CacheStorage {
 
     /// Insert a key-value pair into the cache.
     pub async fn insert(&self, key: Bytes, value: Bytes) {
+        self.add_to_slot_index(&key);
         self.cache.insert(key, value).await;
     }
 
@@ -103,6 +284,9 @@ impl CacheStorage {
         // Store expiration time
         self.expirations.write().insert(key.clone(), expires_at_ms);
 
+        // Update slot index
+        self.add_to_slot_index(&key);
+
         // Insert into Moka cache
         self.cache.insert(key, value).await;
     }
@@ -121,6 +305,7 @@ impl CacheStorage {
         // Only insert if not expired
         if expires_at_ms > now_ms {
             self.expirations.write().insert(key.clone(), expires_at_ms);
+            self.add_to_slot_index(&key);
             self.cache.insert(key, value).await;
         }
     }
@@ -129,12 +314,17 @@ impl CacheStorage {
     pub async fn invalidate(&self, key: &[u8]) {
         let key = Bytes::copy_from_slice(key);
         self.expirations.write().remove(&key);
+        self.remove_from_slot_index(&key);
         self.cache.invalidate(&key).await;
     }
 
     /// Invalidate all entries in the cache.
     pub fn invalidate_all(&self) {
         self.expirations.write().clear();
+        // Clear slot index
+        if let Some(ref mut index) = *self.slot_index.write() {
+            index.clear();
+        }
         self.cache.invalidate_all();
     }
 
@@ -219,8 +409,30 @@ impl std::fmt::Debug for CacheStorage {
         f.debug_struct("CacheStorage")
             .field("entry_count", &self.entry_count())
             .field("weighted_size", &self.weighted_size())
+            .field("slot_indexed", &self.has_slot_indexing())
             .finish()
     }
+}
+
+/// CRC16 implementation for slot hashing (XMODEM variant, matching Redis Cluster).
+///
+/// This uses the CRC-16-CCITT polynomial (0x1021) with initial value 0.
+#[inline]
+pub fn crc16(data: &[u8]) -> u16 {
+    let mut crc: u16 = 0;
+
+    for byte in data {
+        crc ^= (*byte as u16) << 8;
+        for _ in 0..8 {
+            if crc & 0x8000 != 0 {
+                crc = (crc << 1) ^ 0x1021;
+            } else {
+                crc <<= 1;
+            }
+        }
+    }
+
+    crc
 }
 
 #[cfg(test)]

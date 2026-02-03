@@ -10,12 +10,13 @@ use crate::network::rpc::{Message, ShardForwardResponse, ShardForwardedCommand, 
 use crate::types::{CacheCommand, NodeId};
 use bytes::Bytes;
 use dashmap::DashMap;
-use parking_lot::RwLock;
-use std::collections::HashMap;
+use parking_lot::{Mutex, RwLock};
+use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use tokio::net::TcpStream;
 use tokio::sync::oneshot;
 
 /// Configuration for shard forwarding.
@@ -29,6 +30,15 @@ pub struct ShardForwardingConfig {
 
     /// Maximum number of pending forwards (backpressure).
     pub max_pending_forwards: usize,
+
+    /// Interval for cleanup of stale pending entries.
+    pub cleanup_interval: Duration,
+
+    /// Maximum number of pooled connections per remote address.
+    pub max_connections_per_host: usize,
+
+    /// Maximum time a connection can remain idle in the pool.
+    pub connection_idle_timeout: Duration,
 }
 
 impl Default for ShardForwardingConfig {
@@ -37,6 +47,9 @@ impl Default for ShardForwardingConfig {
             enabled: true,
             timeout: Duration::from_secs(5),
             max_pending_forwards: 5000,
+            cleanup_interval: Duration::from_secs(30),
+            max_connections_per_host: 4,
+            connection_idle_timeout: Duration::from_secs(60),
         }
     }
 }
@@ -79,6 +92,65 @@ pub struct ForwardResult {
     pub error: Option<String>,
 }
 
+/// A pooled TCP connection with metadata.
+struct PooledConnection {
+    /// The TCP stream.
+    stream: TcpStream,
+    /// When this connection was last used.
+    last_used: Instant,
+}
+
+/// Connection pool for a specific address.
+struct ConnectionPool {
+    /// Available (idle) connections.
+    connections: VecDeque<PooledConnection>,
+    /// Maximum connections to keep in pool.
+    max_size: usize,
+    /// Idle timeout for connections.
+    idle_timeout: Duration,
+}
+
+impl ConnectionPool {
+    fn new(max_size: usize, idle_timeout: Duration) -> Self {
+        Self {
+            connections: VecDeque::new(),
+            max_size,
+            idle_timeout,
+        }
+    }
+
+    /// Try to get an idle connection from the pool.
+    fn get(&mut self) -> Option<TcpStream> {
+        let now = Instant::now();
+        // Remove expired connections from front and find a valid one
+        while let Some(conn) = self.connections.pop_front() {
+            if now.duration_since(conn.last_used) < self.idle_timeout {
+                return Some(conn.stream);
+            }
+            // Connection expired, drop it
+        }
+        None
+    }
+
+    /// Return a connection to the pool.
+    fn put(&mut self, stream: TcpStream) {
+        if self.connections.len() < self.max_size {
+            self.connections.push_back(PooledConnection {
+                stream,
+                last_used: Instant::now(),
+            });
+        }
+        // If pool is full, the stream is dropped
+    }
+
+    /// Remove expired connections from the pool.
+    fn cleanup_expired(&mut self) {
+        let now = Instant::now();
+        self.connections
+            .retain(|conn| now.duration_since(conn.last_used) < self.idle_timeout);
+    }
+}
+
 /// Handles cross-shard request forwarding.
 pub struct ShardForwarder {
     /// This node's ID.
@@ -99,15 +171,24 @@ pub struct ShardForwarder {
 
     /// Transport for sending messages (optional, set after initialization).
     transport: RwLock<Option<Arc<dyn RaftMessageSender>>>,
+
+    /// Flag to signal shutdown of the cleanup loop.
+    shutdown_flag: Arc<AtomicBool>,
+
+    /// Connection pool per remote address (for request-response patterns).
+    connection_pools: Arc<Mutex<HashMap<SocketAddr, ConnectionPool>>>,
 }
 
 impl std::fmt::Debug for ShardForwarder {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let pool_count = self.connection_pools.lock().len();
         f.debug_struct("ShardForwarder")
             .field("node_id", &self.node_id)
             .field("config", &self.config)
             .field("pending_count", &self.pending_forwards.len())
             .field("transport_set", &self.transport.read().is_some())
+            .field("shutdown", &self.shutdown_flag.load(Ordering::Relaxed))
+            .field("connection_pools", &pool_count)
             .finish()
     }
 }
@@ -122,6 +203,8 @@ impl ShardForwarder {
             pending_forwards: Arc::new(DashMap::new()),
             next_request_id: AtomicU64::new(1),
             transport: RwLock::new(None),
+            shutdown_flag: Arc::new(AtomicBool::new(false)),
+            connection_pools: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -202,6 +285,25 @@ impl ShardForwarder {
             );
             Error::Internal("ShardForwarder transport not initialized".into())
         })?;
+
+        // Check transport health before attempting to send
+        if !transport.is_healthy() {
+            counter_inc!("crema_shard_forward_failures_total", "node_id" => node_id_str.clone(), "reason" => "transport_unhealthy");
+            return Err(Error::Internal(
+                "Transport is unhealthy (dispatcher stopped)".into(),
+            ));
+        }
+
+        // Check if target peer is registered
+        if !transport.has_peer(target_node) {
+            tracing::warn!(
+                node_id = self.node_id,
+                target_node,
+                shard_id,
+                "Target peer not registered in transport"
+            );
+            // Don't fail immediately - the transport may establish connection on send
+        }
 
         // Generate request ID
         let request_id = self.next_request_id.fetch_add(1, Ordering::SeqCst);
@@ -311,6 +413,64 @@ impl ShardForwarder {
         removed
     }
 
+    /// Start a background cleanup loop that periodically removes stale pending entries
+    /// and expired pooled connections.
+    ///
+    /// This spawns a background task that runs until shutdown() is called.
+    /// Returns immediately after spawning the task.
+    pub fn start_cleanup_loop(self: &Arc<Self>) {
+        let forwarder = Arc::clone(self);
+        let interval = forwarder.config.cleanup_interval;
+        let node_id = forwarder.node_id;
+
+        tokio::spawn(async move {
+            tracing::debug!(node_id, "Starting shard forwarder cleanup loop");
+
+            while !forwarder.shutdown_flag.load(Ordering::Relaxed) {
+                tokio::time::sleep(interval).await;
+
+                if forwarder.shutdown_flag.load(Ordering::Relaxed) {
+                    break;
+                }
+
+                // Clean up stale pending forward entries
+                let removed = forwarder.cleanup_stale_entries();
+                if removed > 0 {
+                    tracing::debug!(
+                        node_id,
+                        removed,
+                        remaining = forwarder.pending_forwards.len(),
+                        "Cleaned up stale forwarding entries"
+                    );
+                    counter_inc!("crema_shard_forward_stale_cleaned_total", "node_id" => node_id.to_string());
+                }
+
+                // Clean up expired pooled connections
+                let connections_removed = forwarder.cleanup_connection_pools();
+                if connections_removed > 0 {
+                    tracing::debug!(
+                        node_id,
+                        connections_removed,
+                        "Cleaned up expired pooled connections"
+                    );
+                    counter_inc!("crema_connection_pool_expired_total", "node_id" => node_id.to_string());
+                }
+            }
+
+            tracing::debug!(node_id, "Shard forwarder cleanup loop stopped");
+        });
+    }
+
+    /// Signal the cleanup loop to stop.
+    pub fn shutdown(&self) {
+        self.shutdown_flag.store(true, Ordering::Relaxed);
+    }
+
+    /// Check if shutdown has been requested.
+    pub fn is_shutdown(&self) -> bool {
+        self.shutdown_flag.load(Ordering::Relaxed)
+    }
+
     /// Get the configured timeout for forwarded requests.
     pub fn timeout(&self) -> Duration {
         self.config.timeout
@@ -337,10 +497,64 @@ impl ShardForwarder {
         Ok(())
     }
 
+    /// Get a connection from the pool or create a new one.
+    async fn get_pooled_connection(&self, addr: SocketAddr) -> Result<TcpStream> {
+        // First, try to get a pooled connection
+        let pooled = {
+            let mut pools = self.connection_pools.lock();
+            pools.get_mut(&addr).and_then(|pool| pool.get())
+        };
+
+        if let Some(stream) = pooled {
+            tracing::trace!(addr = %addr, "Reusing pooled connection");
+            counter_inc!("crema_connection_pool_hits_total", "node_id" => self.node_id.to_string());
+            return Ok(stream);
+        }
+
+        // No pooled connection available, create a new one
+        tracing::trace!(addr = %addr, "Creating new connection");
+        counter_inc!("crema_connection_pool_misses_total", "node_id" => self.node_id.to_string());
+
+        TcpStream::connect(addr).await.map_err(|e| {
+            Error::Network(crate::error::NetworkError::ConnectionFailed {
+                addr: addr.to_string(),
+                reason: e.to_string(),
+            })
+        })
+    }
+
+    /// Return a connection to the pool for reuse.
+    fn return_connection_to_pool(&self, addr: SocketAddr, stream: TcpStream) {
+        let mut pools = self.connection_pools.lock();
+        let pool = pools.entry(addr).or_insert_with(|| {
+            ConnectionPool::new(
+                self.config.max_connections_per_host,
+                self.config.connection_idle_timeout,
+            )
+        });
+        pool.put(stream);
+    }
+
+    /// Clean up expired connections from all pools.
+    pub fn cleanup_connection_pools(&self) -> usize {
+        let mut pools = self.connection_pools.lock();
+        let mut total_removed = 0;
+        for pool in pools.values_mut() {
+            let before = pool.connections.len();
+            pool.cleanup_expired();
+            total_removed += before - pool.connections.len();
+        }
+        // Remove empty pools
+        pools.retain(|_, pool| !pool.connections.is_empty());
+        total_removed
+    }
+
     /// Send a raw message and wait for a response.
     ///
     /// This is used for request-response patterns like GetTopology where we need
     /// to wait for a specific response.
+    ///
+    /// Uses connection pooling to reduce connection churn.
     pub async fn send_raw_message_with_response(
         &self,
         target_node: NodeId,
@@ -348,32 +562,26 @@ impl ShardForwarder {
         msg: Message,
     ) -> Result<Message> {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        use tokio::net::TcpStream;
 
-        // For request-response patterns, we need to establish a direct connection
-        // and wait for the response, since the regular transport is fire-and-forget
-        // for some message types.
-
-        let mut stream = TcpStream::connect(target_addr).await.map_err(|e| {
-            Error::Network(crate::error::NetworkError::ConnectionFailed {
-                addr: target_addr.to_string(),
-                reason: e.to_string(),
-            })
-        })?;
+        // Get a connection from pool or create new
+        let mut stream = self.get_pooled_connection(target_addr).await?;
 
         // Serialize and send the message
         let framed = crate::network::rpc::frame_message(&msg).map_err(|e| {
             Error::Network(crate::error::NetworkError::Serialization(e.to_string()))
         })?;
 
-        stream
-            .write_all(&framed)
-            .await
-            .map_err(|e| Error::Network(crate::error::NetworkError::SendFailed(e.to_string())))?;
+        // Send with error handling - don't return connection on error
+        if let Err(e) = stream.write_all(&framed).await {
+            // Connection is broken, don't return to pool
+            return Err(Error::Network(crate::error::NetworkError::SendFailed(
+                e.to_string(),
+            )));
+        }
 
         // Read response with timeout
         let timeout_duration = self.config.timeout;
-        let response = tokio::time::timeout(timeout_duration, async {
+        let result = tokio::time::timeout(timeout_duration, async {
             // Read length prefix
             let mut len_buf = [0u8; 4];
             stream.read_exact(&mut len_buf).await?;
@@ -387,17 +595,32 @@ impl ShardForwarder {
             crate::network::rpc::decode_message(&buf)
                 .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))
         })
-        .await
-        .map_err(|_| Error::Timeout)?
-        .map_err(|e| Error::Network(crate::error::NetworkError::ReceiveFailed(e.to_string())))?;
+        .await;
 
-        tracing::debug!(
-            node_id = self.node_id,
-            target_node,
-            "Received response to raw message"
-        );
+        match result {
+            Ok(Ok(response)) => {
+                // Success - return connection to pool for reuse
+                self.return_connection_to_pool(target_addr, stream);
 
-        Ok(response)
+                tracing::debug!(
+                    node_id = self.node_id,
+                    target_node,
+                    "Received response to raw message"
+                );
+
+                Ok(response)
+            }
+            Ok(Err(e)) => {
+                // IO error - connection may be broken, don't return to pool
+                Err(Error::Network(crate::error::NetworkError::ReceiveFailed(
+                    e.to_string(),
+                )))
+            }
+            Err(_) => {
+                // Timeout - connection may be in bad state, don't return to pool
+                Err(Error::Timeout)
+            }
+        }
     }
 }
 

@@ -122,6 +122,9 @@ pub struct ShardPlacement {
     pending_ring: RwLock<Option<HashRing>>,
     /// Current placement version (for consistency).
     version: RwLock<u64>,
+    /// Reverse index: node -> shards hosted on that node.
+    /// Provides O(1) lookup for shards_on_node() instead of O(num_shards).
+    node_to_shards: RwLock<HashMap<NodeId, HashSet<ShardId>>>,
 }
 
 impl ShardPlacement {
@@ -135,7 +138,30 @@ impl ShardPlacement {
             ring: RwLock::new(ring),
             pending_ring: RwLock::new(None),
             version: RwLock::new(1),
+            node_to_shards: RwLock::new(HashMap::new()),
         }
+    }
+
+    /// Rebuild the reverse index from the current ring.
+    /// This is called after any change to the ring to maintain consistency.
+    fn rebuild_reverse_index(&self) {
+        let ring = self.ring.read();
+        let mut index = HashMap::new();
+
+        // Build the reverse index by checking each shard's placement
+        for shard_id in 0..self.num_shards {
+            let key = shard_id.to_le_bytes();
+            let nodes = ring.get_replica_owners(&key);
+            for node_id in nodes {
+                index
+                    .entry(node_id)
+                    .or_insert_with(HashSet::new)
+                    .insert(shard_id);
+            }
+        }
+
+        // Update the reverse index
+        *self.node_to_shards.write() = index;
     }
 
     /// Create with default configuration.
@@ -178,9 +204,12 @@ impl ShardPlacement {
     /// Note: This doesn't trigger migration automatically. Use
     /// `calculate_movements_on_add` to get the required movements first.
     pub fn add_node(&self, node_id: NodeId) {
-        let mut ring = self.ring.write();
-        ring.add_node(node_id);
+        {
+            let mut ring = self.ring.write();
+            ring.add_node(node_id);
+        }
         *self.version.write() += 1;
+        self.rebuild_reverse_index();
         tracing::info!(node_id, "Added node to placement ring");
     }
 
@@ -189,9 +218,14 @@ impl ShardPlacement {
     /// Note: This doesn't trigger migration automatically. Use
     /// `calculate_movements_on_remove` to get the required movements first.
     pub fn remove_node(&self, node_id: NodeId) {
-        let mut ring = self.ring.write();
-        ring.remove_node(node_id);
+        {
+            let mut ring = self.ring.write();
+            ring.remove_node(node_id);
+        }
+        // Remove from reverse index
+        self.node_to_shards.write().remove(&node_id);
         *self.version.write() += 1;
+        self.rebuild_reverse_index();
         tracing::info!(node_id, "Removed node from placement ring");
     }
 
@@ -230,14 +264,13 @@ impl ShardPlacement {
     }
 
     /// Get all shards that should be hosted on a node.
+    /// Uses O(1) lookup via reverse index instead of O(num_shards) iteration.
     pub fn shards_on_node(&self, node_id: NodeId) -> Vec<ShardId> {
-        let mut shards = Vec::new();
-        for shard_id in 0..self.num_shards {
-            if self.get_shard_nodes(shard_id).contains(&node_id) {
-                shards.push(shard_id);
-            }
-        }
-        shards
+        self.node_to_shards
+            .read()
+            .get(&node_id)
+            .map(|shards| shards.iter().copied().collect())
+            .unwrap_or_default()
     }
 
     /// Get shards where a node is the primary.
@@ -390,6 +423,8 @@ impl ShardPlacement {
             *ring_guard = new_ring;
             drop(ring_guard);
             *self.version.write() += 1;
+            // Rebuild reverse index after ring change
+            self.rebuild_reverse_index();
             tracing::info!(version = self.version(), "Committed new placement ring");
             true
         } else {

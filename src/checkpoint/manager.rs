@@ -165,6 +165,9 @@ pub struct CheckpointManager {
 
 impl CheckpointManager {
     /// Create a new checkpoint manager.
+    ///
+    /// On initialization, scans existing snapshots to restore the last snapshot index,
+    /// ensuring proper ordering is maintained across restarts.
     pub fn new(config: CheckpointConfig, storage: Arc<CacheStorage>) -> Result<Self, FormatError> {
         // Create checkpoint directory if it doesn't exist
         if config.enabled {
@@ -174,16 +177,83 @@ impl CheckpointManager {
             Self::cleanup_temp_files(&config.dir)?;
         }
 
+        // Scan existing snapshots to find the max raft_index for proper sequence ordering
+        let (last_snapshot_index, current_snapshot) = if config.enabled {
+            Self::scan_existing_snapshots(&config.dir)?
+        } else {
+            (0, None)
+        };
+
+        if last_snapshot_index > 0 {
+            info!(
+                last_snapshot_index,
+                "Restored checkpoint sequence from existing snapshots"
+            );
+        }
+
         Ok(Self {
             config,
             storage,
-            current_snapshot: RwLock::new(None),
-            last_snapshot_index: AtomicU64::new(0),
+            current_snapshot: RwLock::new(current_snapshot),
+            last_snapshot_index: AtomicU64::new(last_snapshot_index),
             entries_since_snapshot: AtomicU64::new(0),
             last_snapshot_time: RwLock::new(Instant::now()),
             last_error_time: RwLock::new(None),
             snapshot_in_progress: AtomicBool::new(false),
         })
+    }
+
+    /// Scan existing snapshots in the checkpoint directory to find the max raft_index.
+    ///
+    /// This ensures proper sequence ordering is maintained across restarts.
+    fn scan_existing_snapshots(dir: &Path) -> Result<(u64, Option<SnapshotInfo>), FormatError> {
+        if !dir.exists() {
+            return Ok((0, None));
+        }
+
+        let mut max_index = 0u64;
+        let mut latest_snapshot: Option<SnapshotInfo> = None;
+
+        for entry in fs::read_dir(dir)? {
+            let entry = entry?;
+            let path = entry.path();
+
+            if !path.is_file() {
+                continue;
+            }
+
+            let filename = match path.file_name().and_then(|n| n.to_str()) {
+                Some(name) => name,
+                None => continue,
+            };
+
+            if !filename.starts_with("snapshot-") {
+                continue;
+            }
+
+            // Try to read the snapshot header
+            match SnapshotReader::open(&path) {
+                Ok(reader) => {
+                    let header = reader.header();
+                    if header.raft_index > max_index {
+                        max_index = header.raft_index;
+                        latest_snapshot = Some(SnapshotInfo {
+                            path: path.clone(),
+                            raft_index: header.raft_index,
+                            raft_term: header.raft_term,
+                            timestamp: header.timestamp,
+                            entry_count: header.entry_count,
+                            file_size: entry.metadata().map(|m| m.len()).unwrap_or(0),
+                        });
+                    }
+                }
+                Err(e) => {
+                    debug!(path = %path.display(), error = %e, "Failed to read snapshot during init scan");
+                }
+            }
+        }
+
+        Ok((max_index, latest_snapshot))
     }
 
     /// Remove orphaned .tmp files from a previous interrupted snapshot.

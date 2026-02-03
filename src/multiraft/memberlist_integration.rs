@@ -152,10 +152,15 @@ impl ShardLeaderTracker {
     }
 }
 
+/// Maximum number of pending updates before forced flush.
+/// This prevents unbounded memory growth if broadcasts are delayed.
+const MAX_PENDING_UPDATES: usize = 10_000;
+
 /// Debounced shard leader broadcaster.
 ///
 /// Batches rapid shard leader updates to reduce gossip overhead.
 /// Updates are collected and broadcast after the debounce interval.
+/// Memory is bounded by MAX_PENDING_UPDATES (10,000 entries).
 #[derive(Debug)]
 pub struct ShardLeaderBroadcaster {
     /// Pending updates to be broadcast.
@@ -164,6 +169,8 @@ pub struct ShardLeaderBroadcaster {
     debounce_interval: Duration,
     /// Time of last broadcast.
     last_broadcast: Mutex<Instant>,
+    /// Count of dropped updates due to capacity limits.
+    dropped_updates: std::sync::atomic::AtomicU64,
 }
 
 impl ShardLeaderBroadcaster {
@@ -173,6 +180,7 @@ impl ShardLeaderBroadcaster {
             pending_updates: Mutex::new(HashMap::new()),
             debounce_interval,
             last_broadcast: Mutex::new(Instant::now()),
+            dropped_updates: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -180,16 +188,42 @@ impl ShardLeaderBroadcaster {
     ///
     /// The update will be batched with other pending updates and
     /// broadcast after the debounce interval elapses.
+    ///
+    /// If the pending queue exceeds MAX_PENDING_UPDATES and this is a new
+    /// shard (not an update to an existing entry), the update may be dropped
+    /// to prevent unbounded memory growth.
     pub fn queue_update(&self, shard_id: ShardId, leader_id: NodeId, epoch: u64) {
-        self.pending_updates
-            .lock()
-            .insert(shard_id, ShardLeaderInfo::new(leader_id, epoch));
+        let mut pending = self.pending_updates.lock();
+
+        // Check if we're at capacity and this would be a new entry
+        if pending.len() >= MAX_PENDING_UPDATES && !pending.contains_key(&shard_id) {
+            // Drop the update to prevent unbounded memory growth
+            self.dropped_updates
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            tracing::warn!(
+                shard_id,
+                leader_id,
+                epoch,
+                pending_count = pending.len(),
+                max = MAX_PENDING_UPDATES,
+                "Dropped shard leader update - pending queue at capacity"
+            );
+            return;
+        }
+
+        pending.insert(shard_id, ShardLeaderInfo::new(leader_id, epoch));
         tracing::debug!(
             shard_id = shard_id,
             leader_id = leader_id,
             epoch = epoch,
             "Queued shard leader update for broadcast"
         );
+    }
+
+    /// Get the count of dropped updates due to capacity limits.
+    pub fn dropped_count(&self) -> u64 {
+        self.dropped_updates
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Check if there are pending updates.

@@ -9,10 +9,13 @@ use crate::cache::storage::CacheStorage;
 use crate::config::ShardRaftConfig;
 use crate::error::{Error, Result};
 use crate::types::NodeId;
+use futures::stream::{FuturesUnordered, StreamExt};
+use futures::FutureExt;
 use parking_lot::RwLock;
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::panic::AssertUnwindSafe;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
@@ -317,6 +320,7 @@ impl ShardRaftManager {
 
         let handle = tokio::spawn(async move {
             let mut interval = tokio::time::interval(tick_interval);
+            let panic_count = AtomicU64::new(0);
 
             tracing::info!(node_id, "Unified shard tick loop started");
 
@@ -330,16 +334,74 @@ impl ShardRaftManager {
                             .cloned()
                             .collect();
 
-                        for shard_node in nodes {
-                            // Drain and process any pending incoming messages
-                            shard_node.drain_messages().await;
+                        // Phase 1: Drain messages and tick (synchronous, fast)
+                        // These operations must be sequential per shard but are CPU-bound
+                        // Wrap in catch_unwind to prevent one shard's panic from killing the loop
+                        for shard_node in &nodes {
+                            let shard_id = shard_node.shard_id();
 
-                            // Tick the Raft state machine
-                            shard_node.tick();
+                            // Drain messages with panic protection
+                            if let Err(e) = AssertUnwindSafe(shard_node.drain_messages())
+                                .catch_unwind()
+                                .await
+                            {
+                                let count = panic_count.fetch_add(1, Ordering::Relaxed);
+                                tracing::error!(
+                                    node_id,
+                                    shard_id,
+                                    panic_count = count + 1,
+                                    "Shard drain_messages panicked: {:?}",
+                                    e
+                                );
+                                continue; // Skip this shard for this tick
+                            }
 
-                            // Process ready state (send outgoing messages, apply commits)
-                            shard_node.process_ready().await;
+                            // Tick with panic protection
+                            if std::panic::catch_unwind(AssertUnwindSafe(|| {
+                                shard_node.tick();
+                            }))
+                            .is_err()
+                            {
+                                let count = panic_count.fetch_add(1, Ordering::Relaxed);
+                                tracing::error!(
+                                    node_id,
+                                    shard_id,
+                                    panic_count = count + 1,
+                                    "Shard tick panicked"
+                                );
+                                continue;
+                            }
                         }
+
+                        // Phase 2: Process ready state concurrently using FuturesUnordered
+                        // This is the I/O-heavy phase that can stall - run in parallel
+                        // so a slow shard doesn't block healthy shards
+                        let panic_count_ref = &panic_count;
+                        let mut ready_futures: FuturesUnordered<_> = nodes
+                            .iter()
+                            .map(|node| {
+                                let node = node.clone();
+                                async move {
+                                    let shard_id = node.shard_id();
+                                    // Wrap process_ready in panic protection
+                                    if let Err(_e) = AssertUnwindSafe(node.process_ready())
+                                        .catch_unwind()
+                                        .await
+                                    {
+                                        let count = panic_count_ref.fetch_add(1, Ordering::Relaxed);
+                                        tracing::error!(
+                                            node_id,
+                                            shard_id,
+                                            panic_count = count + 1,
+                                            "Shard process_ready panicked"
+                                        );
+                                    }
+                                }
+                            })
+                            .collect();
+
+                        // Drive all futures to completion concurrently
+                        while ready_futures.next().await.is_some() {}
 
                         // Yield to allow other tasks to run
                         tokio::task::yield_now().await;
@@ -351,7 +413,16 @@ impl ShardRaftManager {
                 }
             }
 
-            tracing::info!(node_id, "Unified shard tick loop stopped");
+            let total_panics = panic_count.load(Ordering::Relaxed);
+            if total_panics > 0 {
+                tracing::warn!(
+                    node_id,
+                    total_panics,
+                    "Unified shard tick loop stopped with panics recorded"
+                );
+            } else {
+                tracing::info!(node_id, "Unified shard tick loop stopped");
+            }
         });
 
         *self.unified_tick_handle.write() = Some(handle);
@@ -436,8 +507,10 @@ impl ShardRaftManager {
         // Add to transport
         self.transport.add_peer(peer_id, addr).await;
 
-        // Add to all shard nodes
-        for node in self.shard_nodes.read().values() {
+        // Collect nodes first, then drop lock before iterating
+        // This avoids holding the read lock while calling add_peer on each node
+        let nodes: Vec<_> = self.shard_nodes.read().values().cloned().collect();
+        for node in nodes {
             node.add_peer(peer_id);
         }
 
@@ -454,8 +527,10 @@ impl ShardRaftManager {
         // Remove from transport
         self.transport.remove_peer(peer_id);
 
-        // Remove from all shard nodes
-        for node in self.shard_nodes.read().values() {
+        // Collect nodes first, then drop lock before iterating
+        // This avoids holding the read lock while calling remove_peer on each node
+        let nodes: Vec<_> = self.shard_nodes.read().values().cloned().collect();
+        for node in nodes {
             node.remove_peer(peer_id);
         }
 

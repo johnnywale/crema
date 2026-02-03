@@ -66,6 +66,20 @@ pub trait PersistentMigrationStore: Send + Sync + std::fmt::Debug {
 
     /// Remove a checkpoint.
     async fn remove_checkpoint(&self, shard_id: ShardId) -> Result<()>;
+
+    /// Save the coordinator term for zombie fencing after restart.
+    ///
+    /// The term must be persisted durably before the coordinator starts
+    /// accepting commands with this term. This prevents zombie coordinators
+    /// (from before restart) from interfering with the new coordinator.
+    async fn save_coordinator_term(&self, term: u64) -> Result<()>;
+
+    /// Load the persisted coordinator term.
+    ///
+    /// Returns `None` if no term was previously persisted (first startup).
+    /// On restart, the coordinator should load this term and increment it
+    /// before starting to ensure it has a higher term than any previous instance.
+    async fn load_coordinator_term(&self) -> Result<Option<u64>>;
 }
 
 /// Checkpoint data for crash recovery.
@@ -91,6 +105,10 @@ pub struct MigrationCheckpointData {
 
 impl MigrationCheckpointData {
     /// Create a checkpoint from a migration.
+    ///
+    /// Uses the migration's `progress.last_updated` timestamp to ensure deterministic
+    /// checkpoints across replicas. Using `SystemTime::now()` would cause different
+    /// timestamps on different nodes, making checkpoint comparison unreliable.
     pub fn from_migration(migration: &RaftShardMigration, sequence: u64) -> Self {
         Self {
             migration_id: migration.id,
@@ -99,10 +117,13 @@ impl MigrationCheckpointData {
             learner_match_index: migration.progress.learner_match_index,
             leader_commit_index: migration.progress.leader_commit_index,
             snapshot_applied: migration.progress.snapshot_applied,
-            timestamp_ms: std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_millis() as u64,
+            // Use the migration's last_updated timestamp for determinism across replicas.
+            // Falls back to started_at if last_updated is 0 (should not happen in practice).
+            timestamp_ms: if migration.progress.last_updated > 0 {
+                migration.progress.last_updated
+            } else {
+                migration.started_at
+            },
             sequence,
         }
     }
@@ -118,6 +139,7 @@ pub struct InMemoryRaftMigrationStore {
     migrations: RwLock<HashMap<ShardId, RaftShardMigration>>,
     archived: RwLock<Vec<RaftShardMigration>>,
     checkpoints: RwLock<HashMap<ShardId, MigrationCheckpointData>>,
+    coordinator_term: RwLock<Option<u64>>,
 }
 
 impl InMemoryRaftMigrationStore {
@@ -169,6 +191,15 @@ impl PersistentMigrationStore for InMemoryRaftMigrationStore {
     async fn remove_checkpoint(&self, shard_id: ShardId) -> Result<()> {
         self.checkpoints.write().remove(&shard_id);
         Ok(())
+    }
+
+    async fn save_coordinator_term(&self, term: u64) -> Result<()> {
+        *self.coordinator_term.write() = Some(term);
+        Ok(())
+    }
+
+    async fn load_coordinator_term(&self) -> Result<Option<u64>> {
+        Ok(*self.coordinator_term.read())
     }
 }
 
@@ -229,6 +260,130 @@ impl FileMigrationStore {
         self.base_dir
             .join("completed")
             .join(format!("migration_{}.bin", migration_id))
+    }
+
+    /// Get path for coordinator term file.
+    fn coordinator_term_path(&self) -> PathBuf {
+        self.base_dir.join("coordinator_term.bin")
+    }
+
+    /// Get path for coordinator term lock file.
+    fn coordinator_term_lock_path(&self) -> PathBuf {
+        self.base_dir.join("coordinator_term.lock")
+    }
+
+    /// Atomically initialize the coordinator term on startup.
+    ///
+    /// This method:
+    /// 1. Acquires an exclusive lock to prevent races between multiple processes
+    /// 2. Loads the current term (or 0 if none)
+    /// 3. Increments and saves the new term
+    /// 4. Releases the lock
+    ///
+    /// This prevents the race condition where multiple processes starting
+    /// simultaneously could read the same term and both increment to the same value.
+    pub async fn initialize_coordinator_term(&self) -> Result<u64> {
+        let lock_path = self.coordinator_term_lock_path();
+
+        // Use blocking file operations for the lock since we need exclusive access
+        // This is acceptable because term initialization only happens once at startup
+        let lock_result = tokio::task::spawn_blocking({
+            let lock_path = lock_path.clone();
+            let term_path = self.coordinator_term_path();
+            move || -> Result<u64> {
+                use std::fs::{File, OpenOptions};
+                use std::io::{Read, Write};
+
+                // Create exclusive lock file
+                // O_CREAT | O_EXCL ensures only one process can create it
+                let lock_file = loop {
+                    match OpenOptions::new()
+                        .write(true)
+                        .create_new(true) // Fails if file exists (O_EXCL)
+                        .open(&lock_path)
+                    {
+                        Ok(f) => break f,
+                        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                            // Another process holds the lock, wait and retry
+                            std::thread::sleep(std::time::Duration::from_millis(50));
+
+                            // Check if lock is stale (older than 30 seconds)
+                            if let Ok(metadata) = std::fs::metadata(&lock_path) {
+                                if let Ok(modified) = metadata.modified() {
+                                    if modified.elapsed().unwrap_or_default()
+                                        > std::time::Duration::from_secs(30)
+                                    {
+                                        // Stale lock, remove it
+                                        let _ = std::fs::remove_file(&lock_path);
+                                    }
+                                }
+                            }
+                            continue;
+                        }
+                        Err(e) => {
+                            return Err(Error::Internal(format!(
+                                "Failed to create term lock: {}",
+                                e
+                            )));
+                        }
+                    }
+                };
+
+                // Write our PID to the lock file for debugging
+                let _ = writeln!(&lock_file, "{}", std::process::id());
+
+                // Now we have exclusive access - load current term
+                let current_term = match File::open(&term_path) {
+                    Ok(mut f) => {
+                        let mut content = Vec::new();
+                        f.read_to_end(&mut content).map_err(|e| {
+                            Error::Internal(format!("Failed to read term file: {}", e))
+                        })?;
+                        bincode::deserialize::<u64>(&content).unwrap_or(0)
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => 0,
+                    Err(e) => {
+                        return Err(Error::Internal(format!("Failed to open term file: {}", e)));
+                    }
+                };
+
+                // Increment term
+                let new_term = current_term + 1;
+
+                // Save new term atomically
+                let temp_path = term_path.with_extension("tmp");
+                let content = bincode::serialize(&new_term)
+                    .map_err(|e| Error::Internal(format!("Failed to serialize term: {}", e)))?;
+
+                let mut temp_file = File::create(&temp_path).map_err(|e| {
+                    Error::Internal(format!("Failed to create temp term file: {}", e))
+                })?;
+                temp_file.write_all(&content).map_err(|e| {
+                    Error::Internal(format!("Failed to write temp term file: {}", e))
+                })?;
+                temp_file.sync_all().map_err(|e| {
+                    Error::Internal(format!("Failed to sync temp term file: {}", e))
+                })?;
+
+                std::fs::rename(&temp_path, &term_path)
+                    .map_err(|e| Error::Internal(format!("Failed to rename term file: {}", e)))?;
+
+                // Release lock by removing the file
+                let _ = std::fs::remove_file(&lock_path);
+
+                tracing::info!(
+                    old_term = current_term,
+                    new_term,
+                    "Initialized coordinator term atomically"
+                );
+
+                Ok(new_term)
+            }
+        })
+        .await
+        .map_err(|e| Error::Internal(format!("Term initialization task panicked: {}", e)))?;
+
+        lock_result
     }
 
     /// Atomically write a file (write to temp, then rename).
@@ -303,8 +458,9 @@ impl PersistentMigrationStore for FileMigrationStore {
 
     async fn load_active_migrations(&self) -> Result<Vec<RaftShardMigration>> {
         let active_dir = self.base_dir.join("active");
-        let mut migrations = Vec::new();
 
+        // Collect all .bin file paths first
+        let mut paths = Vec::new();
         let mut entries = fs::read_dir(&active_dir)
             .await
             .map_err(|e| Error::Internal(format!("Failed to read active dir: {}", e)))?;
@@ -315,17 +471,27 @@ impl PersistentMigrationStore for FileMigrationStore {
             .map_err(|e| Error::Internal(format!("Failed to read dir entry: {}", e)))?
         {
             let path = entry.path();
-
             if path.extension().map(|e| e == "bin").unwrap_or(false) {
-                match self.read_file(&path).await {
+                paths.push(path);
+            }
+        }
+
+        // Parallel file loading using JoinSet for faster startup
+        // Especially beneficial on cloud storage (EBS/pd-ssd) where serial I/O is slow
+        let mut join_set = tokio::task::JoinSet::new();
+
+        for path in paths {
+            join_set.spawn(async move {
+                match fs::read(&path).await {
                     Ok(content) => match bincode::deserialize::<RaftShardMigration>(&content) {
-                        Ok(migration) => migrations.push(migration),
+                        Ok(migration) => Some(migration),
                         Err(e) => {
                             tracing::warn!(
                                 path = ?path,
                                 error = %e,
                                 "Failed to deserialize migration file, skipping"
                             );
+                            None
                         }
                     },
                     Err(e) => {
@@ -334,14 +500,27 @@ impl PersistentMigrationStore for FileMigrationStore {
                             error = %e,
                             "Failed to read migration file, skipping"
                         );
+                        None
                     }
+                }
+            });
+        }
+
+        // Collect results from all parallel reads
+        let mut migrations = Vec::new();
+        while let Some(result) = join_set.join_next().await {
+            match result {
+                Ok(Some(migration)) => migrations.push(migration),
+                Ok(None) => {} // File read/parse failed, already logged
+                Err(e) => {
+                    tracing::warn!(error = %e, "Migration load task panicked");
                 }
             }
         }
 
         tracing::info!(
             count = migrations.len(),
-            "Loaded active migrations from disk"
+            "Loaded active migrations from disk (parallel)"
         );
 
         Ok(migrations)
@@ -422,6 +601,37 @@ impl PersistentMigrationStore for FileMigrationStore {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
             Err(e) => Err(Error::Internal(format!(
                 "Failed to remove checkpoint: {}",
+                e
+            ))),
+        }
+    }
+
+    async fn save_coordinator_term(&self, term: u64) -> Result<()> {
+        let path = self.coordinator_term_path();
+        let content = bincode::serialize(&term)
+            .map_err(|e| Error::Internal(format!("Failed to serialize coordinator term: {}", e)))?;
+
+        self.atomic_write(&path, &content).await?;
+
+        tracing::debug!(term, "Saved coordinator term to disk");
+
+        Ok(())
+    }
+
+    async fn load_coordinator_term(&self) -> Result<Option<u64>> {
+        let path = self.coordinator_term_path();
+
+        match self.read_file(&path).await {
+            Ok(content) => {
+                let term: u64 = bincode::deserialize(&content).map_err(|e| {
+                    Error::Internal(format!("Failed to deserialize coordinator term: {}", e))
+                })?;
+                tracing::debug!(term, "Loaded coordinator term from disk");
+                Ok(Some(term))
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(Error::Internal(format!(
+                "Failed to read coordinator term: {}",
                 e
             ))),
         }
@@ -577,5 +787,80 @@ mod tests {
 
         store.remove_migration(1).await.unwrap();
         assert!(store.load_migration(1).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn test_in_memory_coordinator_term() {
+        let store = InMemoryRaftMigrationStore::new();
+
+        // Initially no term persisted
+        assert!(store.load_coordinator_term().await.unwrap().is_none());
+
+        // Save term
+        store.save_coordinator_term(5).await.unwrap();
+
+        // Load term
+        let term = store.load_coordinator_term().await.unwrap();
+        assert_eq!(term, Some(5));
+
+        // Update term
+        store.save_coordinator_term(10).await.unwrap();
+        let term = store.load_coordinator_term().await.unwrap();
+        assert_eq!(term, Some(10));
+    }
+
+    #[tokio::test]
+    async fn test_file_store_coordinator_term() {
+        let temp_dir = TempDir::new().unwrap();
+        let store = FileMigrationStore::new(temp_dir.path()).await.unwrap();
+
+        // Initially no term persisted
+        assert!(store.load_coordinator_term().await.unwrap().is_none());
+
+        // Save term
+        store.save_coordinator_term(42).await.unwrap();
+
+        // Load term
+        let term = store.load_coordinator_term().await.unwrap();
+        assert_eq!(term, Some(42));
+
+        // Verify file exists
+        let term_path = temp_dir.path().join("coordinator_term.bin");
+        assert!(term_path.exists());
+
+        // Create a new store and verify term survives
+        let store2 = FileMigrationStore::new(temp_dir.path()).await.unwrap();
+        let term = store2.load_coordinator_term().await.unwrap();
+        assert_eq!(term, Some(42));
+    }
+
+    #[tokio::test]
+    async fn test_coordinator_term_persistence_across_restart() {
+        let temp_dir = TempDir::new().unwrap();
+
+        // Simulate first instance with term 5
+        {
+            let store = FileMigrationStore::new(temp_dir.path()).await.unwrap();
+            store.save_coordinator_term(5).await.unwrap();
+        }
+
+        // Simulate restart - new instance should see persisted term
+        {
+            let store = FileMigrationStore::new(temp_dir.path()).await.unwrap();
+            let persisted = store.load_coordinator_term().await.unwrap().unwrap_or(0);
+
+            // New term should be higher to fence zombies
+            let new_term = persisted + 1;
+            assert_eq!(new_term, 6);
+
+            store.save_coordinator_term(new_term).await.unwrap();
+        }
+
+        // Verify final term
+        {
+            let store = FileMigrationStore::new(temp_dir.path()).await.unwrap();
+            let term = store.load_coordinator_term().await.unwrap();
+            assert_eq!(term, Some(6));
+        }
     }
 }

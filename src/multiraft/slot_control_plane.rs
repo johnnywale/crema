@@ -18,6 +18,7 @@ use super::slot_table::{
     Epoch, SlotId, SlotReassignment, SlotTable, SlotTableSnapshot, TOTAL_SLOTS,
 };
 use crate::error::{Error, Result};
+use crate::types::NodeId;
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -105,6 +106,9 @@ pub struct RemoveShardResult {
 /// Configuration for the control plane.
 #[derive(Debug, Clone)]
 pub struct ControlPlaneConfig {
+    /// Node ID for generating globally unique shard IDs.
+    /// Required to prevent shard ID collisions in distributed clusters.
+    pub node_id: NodeId,
     /// Grace period before a tombstone shard can be GC'd.
     pub tombstone_grace_period: Duration,
     /// Minimum slots per shard (to prevent over-draining).
@@ -116,9 +120,20 @@ pub struct ControlPlaneConfig {
 impl Default for ControlPlaneConfig {
     fn default() -> Self {
         Self {
+            node_id: 0, // Default to 0 for backwards compatibility in tests
             tombstone_grace_period: Duration::from_secs(300), // 5 minutes
             min_slots_per_shard: 1,
             max_slots_per_shard: TOTAL_SLOTS,
+        }
+    }
+}
+
+impl ControlPlaneConfig {
+    /// Create a new configuration with the given node ID.
+    pub fn new(node_id: NodeId) -> Self {
+        Self {
+            node_id,
+            ..Default::default()
         }
     }
 }
@@ -130,6 +145,16 @@ impl Default for ControlPlaneConfig {
 /// - Removing shards and draining their slots
 /// - Tracking shard states through the lifecycle
 /// - Managing tombstones and GC
+///
+/// # Shard ID Generation
+///
+/// Shard IDs are generated to be globally unique across all nodes in the cluster.
+/// The ID encoding uses:
+/// - Upper 8 bits: node_id (allows 256 nodes)
+/// - Lower 24 bits: local sequence counter (allows 16M shards per node)
+///
+/// This prevents collisions when multiple nodes add shards concurrently without
+/// requiring distributed coordination for ID allocation.
 #[derive(Debug)]
 pub struct SlotControlPlane {
     /// The slot table being managed.
@@ -141,8 +166,9 @@ pub struct SlotControlPlane {
     /// Configuration.
     config: ControlPlaneConfig,
 
-    /// Next shard ID to assign.
-    next_shard_id: RwLock<ShardId>,
+    /// Local sequence counter for shard IDs.
+    /// Combined with node_id to produce globally unique shard IDs.
+    local_shard_sequence: RwLock<u32>,
 }
 
 impl SlotControlPlane {
@@ -170,17 +196,108 @@ impl SlotControlPlane {
             );
         }
 
+        // Calculate starting local sequence from existing max shard_id
+        // This ensures we don't collide with pre-existing shards
+        let local_sequence = num_shards as u32;
+
         Self {
             slot_table,
             shard_states: RwLock::new(shard_states),
             config,
-            next_shard_id: RwLock::new(num_shards as ShardId),
+            local_shard_sequence: RwLock::new(local_sequence),
         }
     }
 
     /// Create a control plane with default configuration.
     pub fn with_defaults(slot_table: Arc<SlotTable>) -> Self {
         Self::new(slot_table, ControlPlaneConfig::default())
+    }
+
+    /// Generate a globally unique shard ID.
+    ///
+    /// Uses encoding: (node_id << 24) | local_sequence
+    /// - Upper 8 bits: node_id (allows 256 nodes)
+    /// - Lower 24 bits: local sequence (allows 16M shards per node)
+    fn generate_shard_id(&self) -> ShardId {
+        let mut seq = self.local_shard_sequence.write();
+        let local_seq = *seq;
+        *seq = seq.wrapping_add(1);
+
+        // Combine node_id (upper 8 bits) with local sequence (lower 24 bits)
+        let node_id = self.config.node_id as u32;
+        let shard_id = (node_id << 24) | (local_seq & 0x00FF_FFFF);
+        shard_id
+    }
+
+    /// Create a control plane from a snapshot.
+    ///
+    /// This restores the control plane state from a previously taken snapshot,
+    /// including all shard states (Active, Draining, Tombstone).
+    ///
+    /// # Important
+    ///
+    /// After calling this method, in-progress draining operations may need to be
+    /// resumed by the caller. Tombstone shards should still be garbage collected
+    /// after their grace period.
+    pub fn from_snapshot(snapshot: ControlPlaneSnapshot, config: ControlPlaneConfig) -> Self {
+        // Restore slot table from snapshot
+        let slot_table = Arc::new(SlotTable::from_snapshot(snapshot.slot_snapshot));
+
+        // Calculate local sequence from the maximum existing shard_id.
+        // Extract the local sequence part (lower 24 bits) from each shard_id,
+        // filtered to only include shards from this node_id.
+        let node_id = config.node_id as u32;
+        let local_sequence = snapshot
+            .shard_states
+            .keys()
+            .copied()
+            .filter_map(|shard_id| {
+                let shard_node = (shard_id >> 24) as u64;
+                if shard_node == node_id as u64 {
+                    Some((shard_id & 0x00FF_FFFF) + 1)
+                } else {
+                    None
+                }
+            })
+            .max()
+            .unwrap_or(slot_table.num_shards() as u32);
+
+        // Log restoration of non-Active shards for visibility
+        for (shard_id, info) in &snapshot.shard_states {
+            match &info.state {
+                ShardState::Draining {
+                    slots_remaining,
+                    started_at_ms,
+                } => {
+                    tracing::info!(
+                        shard_id,
+                        slots_remaining,
+                        started_at_ms,
+                        "Restored draining shard from snapshot"
+                    );
+                }
+                ShardState::Tombstone { marked_at_ms } => {
+                    tracing::info!(
+                        shard_id,
+                        marked_at_ms,
+                        "Restored tombstone shard from snapshot"
+                    );
+                }
+                ShardState::Active => {}
+            }
+        }
+
+        Self {
+            slot_table,
+            shard_states: RwLock::new(snapshot.shard_states),
+            config,
+            local_shard_sequence: RwLock::new(local_sequence),
+        }
+    }
+
+    /// Create a control plane from a snapshot with default configuration.
+    pub fn from_snapshot_with_defaults(snapshot: ControlPlaneSnapshot) -> Self {
+        Self::from_snapshot(snapshot, ControlPlaneConfig::default())
     }
 
     /// Get the slot table.
@@ -238,13 +355,8 @@ impl SlotControlPlane {
     ///
     /// Returns the new shard ID and the slot reassignment plan.
     pub fn add_shard(&self) -> Result<AddShardResult> {
-        // Allocate new shard ID
-        let new_shard_id = {
-            let mut next = self.next_shard_id.write();
-            let id = *next;
-            *next += 1;
-            id
-        };
+        // Generate globally unique shard ID using node_id + local sequence
+        let new_shard_id = self.generate_shard_id();
 
         // Compute rebalance plan
         let slots_to_move = self
@@ -705,6 +817,100 @@ mod tests {
         assert_eq!(snapshot.epoch.value(), 1);
         assert_eq!(snapshot.shard_states.len(), 4);
         assert_eq!(snapshot.slot_snapshot.num_shards, 4);
+    }
+
+    #[test]
+    fn test_snapshot_restore_preserves_shard_states() {
+        let cp = create_test_control_plane(4);
+
+        // Start removing shard 3 - puts it in Draining state
+        cp.remove_shard(3).unwrap();
+
+        // Verify shard 3 is draining
+        let info = cp.get_shard_info(3).unwrap();
+        assert!(info.state.is_draining());
+
+        // Take snapshot with draining shard
+        let snapshot = cp.snapshot();
+
+        // Verify snapshot captured the draining state
+        let draining_info = snapshot.shard_states.get(&3).unwrap();
+        assert!(
+            draining_info.state.is_draining(),
+            "Snapshot should preserve Draining state"
+        );
+
+        // Restore from snapshot
+        let restored = SlotControlPlane::from_snapshot_with_defaults(snapshot);
+
+        // Verify restored control plane has the draining shard
+        let restored_info = restored.get_shard_info(3).unwrap();
+        assert!(
+            restored_info.state.is_draining(),
+            "Restored control plane should have shard 3 in Draining state"
+        );
+
+        // Verify active shards are correct
+        assert_eq!(restored.active_shard_count(), 3);
+    }
+
+    #[test]
+    fn test_snapshot_restore_preserves_tombstone_state() {
+        let cp = create_test_control_plane(4);
+
+        // Remove and tombstone shard 2
+        cp.remove_shard(2).unwrap();
+        cp.mark_tombstone(2);
+
+        // Verify shard 2 is tombstoned
+        let info = cp.get_shard_info(2).unwrap();
+        assert!(info.state.is_tombstone());
+
+        // Take snapshot with tombstone shard
+        let snapshot = cp.snapshot();
+
+        // Verify snapshot captured the tombstone state
+        let tombstone_info = snapshot.shard_states.get(&2).unwrap();
+        assert!(
+            tombstone_info.state.is_tombstone(),
+            "Snapshot should preserve Tombstone state"
+        );
+
+        // Restore from snapshot
+        let restored = SlotControlPlane::from_snapshot_with_defaults(snapshot);
+
+        // Verify restored control plane has the tombstone shard
+        let restored_info = restored.get_shard_info(2).unwrap();
+        assert!(
+            restored_info.state.is_tombstone(),
+            "Restored control plane should have shard 2 in Tombstone state"
+        );
+
+        // Verify can still GC the tombstone after restore
+        restored.gc_shard(2).unwrap();
+        assert!(restored.get_shard_info(2).is_none());
+    }
+
+    #[test]
+    fn test_snapshot_restore_continues_next_shard_id() {
+        let cp = create_test_control_plane(4);
+
+        // Add a shard to advance next_shard_id
+        let result = cp.add_shard().unwrap();
+        assert_eq!(result.shard_id, 4);
+
+        // Take snapshot
+        let snapshot = cp.snapshot();
+
+        // Restore from snapshot
+        let restored = SlotControlPlane::from_snapshot_with_defaults(snapshot);
+
+        // Add another shard - should get ID 5, not 4
+        let result2 = restored.add_shard().unwrap();
+        assert_eq!(
+            result2.shard_id, 5,
+            "Restored control plane should continue with correct next_shard_id"
+        );
     }
 
     #[test]

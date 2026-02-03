@@ -75,6 +75,16 @@ pub trait RaftMessageSender: Send + Sync + 'static {
     /// Returns current statistics about messages sent, failed, connections, etc.
     fn metrics(&self) -> TransportMetricsSnapshot;
 
+    /// Check if the transport is healthy and ready to send messages.
+    ///
+    /// Returns true if the transport can accept and send messages.
+    fn is_healthy(&self) -> bool;
+
+    /// Check if a peer is registered in the transport.
+    ///
+    /// Returns true if the peer has been added via `add_peer()`.
+    fn has_peer(&self, id: NodeId) -> bool;
+
     /// Shutdown the sender.
     ///
     /// Gracefully closes all connections and stops background tasks.
@@ -120,6 +130,72 @@ struct PendingMessage {
     msg: Message,
     #[allow(dead_code)]
     enqueued_at: Instant,
+    /// Estimated size in bytes (cached for batch size tracking)
+    estimated_size: usize,
+}
+
+impl PendingMessage {
+    /// Create a new pending message with size estimation.
+    fn new(to: NodeId, msg: Message) -> Self {
+        let estimated_size = Self::estimate_message_size(&msg);
+        Self {
+            to,
+            msg,
+            enqueued_at: Instant::now(),
+            estimated_size,
+        }
+    }
+
+    /// Estimate the serialized size of a message.
+    /// This is an approximation used for batch size limiting.
+    fn estimate_message_size(msg: &Message) -> usize {
+        // Base overhead for enum variant + framing
+        const BASE_OVERHEAD: usize = 32;
+
+        match msg {
+            Message::Raft(wrapper) => BASE_OVERHEAD + wrapper.data.len(),
+            Message::ClientRequest(req) => {
+                BASE_OVERHEAD + Self::estimate_command_size(&req.command)
+            }
+            Message::ForwardedCommand(fwd) => {
+                BASE_OVERHEAD + Self::estimate_command_size(&fwd.command)
+            }
+            Message::ShardForwardedCommand(fwd) => {
+                BASE_OVERHEAD + Self::estimate_command_size(&fwd.command)
+            }
+            Message::ShardRaft(msg) => BASE_OVERHEAD + msg.raft_message.data.len(),
+            Message::MigrationFetchResponse(resp) => {
+                BASE_OVERHEAD
+                    + resp
+                        .entries
+                        .iter()
+                        .map(|e| e.key.len() + e.value.len() + 16)
+                        .sum::<usize>()
+            }
+            Message::MigrationApplyRequest(req) => {
+                BASE_OVERHEAD
+                    + req
+                        .entries
+                        .iter()
+                        .map(|e| e.key.len() + e.value.len() + 16)
+                        .sum::<usize>()
+            }
+            Message::MigrationProposalForward(fwd) => BASE_OVERHEAD + fwd.command_bytes.len(),
+            // For other message types, use a conservative estimate
+            _ => BASE_OVERHEAD + 256,
+        }
+    }
+
+    /// Estimate the size of a cache command.
+    fn estimate_command_size(cmd: &crate::types::CacheCommand) -> usize {
+        use crate::types::CacheCommand;
+        match cmd {
+            CacheCommand::Put { key, value, .. } => key.len() + value.len() + 32,
+            CacheCommand::Delete { key } => key.len() + 16,
+            CacheCommand::Get { key } => key.len() + 16,
+            CacheCommand::Clear => 16,
+        }
+    }
 }
 
 /// RAII 封装：连接 + Permit 绑定，防止泄露
@@ -161,6 +237,9 @@ pub struct TransportConfig {
     pub batch_delay: Option<Duration>,
     /// 批处理最大消息数量
     pub batch_max_messages: usize,
+    /// 批处理最大字节数。防止大消息导致OOM。
+    /// 当批次大小达到此限制时立即发送，即使消息数量未达到 batch_max_messages。
+    pub batch_max_bytes: usize,
     /// 连接建立阶段的最大重试次数
     pub max_connect_retries: usize,
     /// 连接重试的初始延迟
@@ -199,6 +278,7 @@ impl Default for TransportConfig {
             idle_timeout: Some(Duration::from_secs(300)), // 5 minutes default
             batch_delay: None,                            // Disabled by default
             batch_max_messages: 32,
+            batch_max_bytes: 4 * 1024 * 1024, // 4MB default - prevents OOM from large messages
             max_connect_retries: 3,
             initial_connect_retry_delay: Duration::from_millis(50),
             max_connect_retry_delay: Duration::from_millis(500),
@@ -544,6 +624,31 @@ impl RaftTransport {
         self.peers.read().len()
     }
 
+    /// Check if the transport is healthy and ready to send messages.
+    ///
+    /// Returns true if:
+    /// - The dispatcher task is still running
+    /// - The command channel is not closed
+    pub fn is_healthy(&self) -> bool {
+        // Check if dispatcher task is still running
+        !self.dispatcher_handle.is_finished() && !self.command_tx.is_closed()
+    }
+
+    /// Check if a specific peer is registered and has an active worker.
+    pub fn is_peer_connected(&self, peer_id: NodeId) -> bool {
+        self.peers.read().contains_key(&peer_id) && self.workers.read().contains_key(&peer_id)
+    }
+
+    /// Check if a peer is registered (may not have active worker yet).
+    pub fn has_peer(&self, peer_id: NodeId) -> bool {
+        self.peers.read().contains_key(&peer_id)
+    }
+
+    /// Get the count of active workers (peers with established connections).
+    pub fn active_worker_count(&self) -> usize {
+        self.workers.read().len()
+    }
+
     pub fn metrics(&self) -> TransportMetricsSnapshot {
         self.metrics.snapshot()
     }
@@ -558,11 +663,7 @@ impl RaftTransport {
             .map_err(|e| NetworkError::Serialization(e.to_string()))?;
 
         let message = Message::Raft(wrapper);
-        let pending = PendingMessage {
-            to,
-            msg: message,
-            enqueued_at: Instant::now(),
-        };
+        let pending = PendingMessage::new(to, message);
 
         // 根据优先级选择队列
         let worker = {
@@ -678,11 +779,7 @@ impl RaftTransport {
     /// Unlike `send()` which takes RaftMessage, this method sends our custom
     /// Message enum directly. Used for ForwardedCommand/ForwardResponse.
     pub async fn send_message(&self, to: NodeId, msg: Message) -> Result<()> {
-        let pending = PendingMessage {
-            to,
-            msg,
-            enqueued_at: Instant::now(),
-        };
+        let pending = PendingMessage::new(to, msg);
 
         // Try to send via worker (use high priority for forwarded commands)
         let worker = {
@@ -987,6 +1084,7 @@ impl RaftTransport {
 
         // 批处理缓冲区
         let mut batch_buffer: Vec<PendingMessage> = Vec::with_capacity(config.batch_max_messages);
+        let mut batch_bytes: usize = 0; // Track current batch size in bytes
         let batch_delay = config.batch_delay;
 
         loop {
@@ -1157,14 +1255,18 @@ impl RaftTransport {
 
                     if batch_delay.is_some() {
                         // 启用批处理：收集消息
+                        batch_bytes += msg.estimated_size;
                         batch_buffer.push(msg);
 
-                        // 如果达到批处理上限，立即发送
-                        if batch_buffer.len() >= config.batch_max_messages {
+                        // 如果达到批处理上限（消息数量或字节数），立即发送
+                        if batch_buffer.len() >= config.batch_max_messages
+                            || batch_bytes >= config.batch_max_bytes
+                        {
                             Self::process_batch(
                                 peer_id,
                                 addr,
                                 &mut batch_buffer,
+                                &mut batch_bytes,
                                 &mut connection,
                                 &mut buffer,
                                 &config,
@@ -1196,6 +1298,7 @@ impl RaftTransport {
                         peer_id,
                         addr,
                         &mut batch_buffer,
+                        &mut batch_bytes,
                         &mut connection,
                         &mut buffer,
                         &config,
@@ -1225,6 +1328,7 @@ impl RaftTransport {
                             peer_id,
                             addr,
                             &mut batch_buffer,
+                            &mut batch_bytes,
                             &mut connection,
                             &mut buffer,
                             &config,
@@ -1304,12 +1408,13 @@ impl RaftTransport {
 
     /// 批量处理消息（零拷贝优化）
     ///
-    /// **关键改进：增加连接失败追踪**
+    /// **关键改进：增加连接失败追踪和字节大小限制**
     #[allow(clippy::too_many_arguments)]
     async fn process_batch(
         peer_id: NodeId,
         addr: SocketAddr,
         batch: &mut Vec<PendingMessage>,
+        batch_bytes: &mut usize,
         connection: &mut Option<TiedConnection>,
         buffer: &mut BytesMut,
         config: &TransportConfig,
@@ -1324,6 +1429,7 @@ impl RaftTransport {
         trace!(
             peer_id,
             batch_size = batch.len(),
+            batch_bytes = *batch_bytes,
             "Processing message batch"
         );
 
@@ -1414,6 +1520,7 @@ impl RaftTransport {
         }
 
         batch.clear();
+        *batch_bytes = 0;
     }
 
     /// 处理单条消息（带指数退避 + Jitter）
@@ -1763,6 +1870,14 @@ impl RaftMessageSender for RaftTransport {
 
     fn metrics(&self) -> TransportMetricsSnapshot {
         RaftTransport::metrics(self)
+    }
+
+    fn is_healthy(&self) -> bool {
+        RaftTransport::is_healthy(self)
+    }
+
+    fn has_peer(&self, id: NodeId) -> bool {
+        RaftTransport::has_peer(self, id)
     }
 
     fn shutdown(&self) -> BoxFuture<'_, ()> {

@@ -74,9 +74,12 @@ mod cache_integration_tests_edge_failed;
 mod cache_integration_tests_edge_pass;
 mod dashboard_e2e_tests;
 #[cfg(feature = "memberlist")]
+mod fix_regression_tests;
+#[cfg(feature = "memberlist")]
 mod memberlist_cache_integration_tests;
 #[cfg(feature = "memberlist")]
 mod memberlist_cluster_tests;
+mod migration_unit_tests;
 mod multiraft_forwarding_tests;
 mod multiraft_integration_tests;
 #[cfg(feature = "memberlist")]

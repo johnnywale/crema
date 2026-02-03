@@ -503,6 +503,24 @@ impl RaftMessageSender for ShardRaftTransport {
         }
     }
 
+    /// Check if the transport is healthy.
+    fn is_healthy(&self) -> bool {
+        if let Some(router) = self.multiplexer.node_router() {
+            router.is_healthy()
+        } else {
+            self.multiplexer.transport().is_healthy()
+        }
+    }
+
+    /// Check if a peer is registered.
+    fn has_peer(&self, id: NodeId) -> bool {
+        if let Some(router) = self.multiplexer.node_router() {
+            router.has_peer(id)
+        } else {
+            self.multiplexer.transport().has_peer(id)
+        }
+    }
+
     /// Shutdown the transport.
     ///
     /// Note: This is a no-op because `ShardRaftTransport` doesn't own the
