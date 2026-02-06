@@ -168,6 +168,11 @@ impl ShardRaftManager {
         self.shard_nodes.read().keys().copied().collect()
     }
 
+    /// Get all shard Raft nodes.
+    pub fn all_shards(&self) -> Vec<Arc<ShardRaftNode>> {
+        self.shard_nodes.read().values().cloned().collect()
+    }
+
     /// Create and register a new shard Raft node.
     pub async fn create_shard(
         &self,

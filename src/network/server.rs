@@ -278,8 +278,15 @@ fn get_message_type(msg: &Message) -> &'static str {
         // Shard coordination messages
         Message::ShardCreationBroadcast(_) => "shard_creation_broadcast",
         Message::ShardCreationAck(_) => "shard_creation_ack",
+        Message::ShardRemovalBroadcast(_) => "shard_removal_broadcast",
+        Message::ShardRemovalAck(_) => "shard_removal_ack",
         Message::GetTopology(_) => "get_topology",
         Message::TopologyResponse(_) => "topology_response",
+        Message::GetShardInfo(_) => "get_shard_info",
+        Message::ShardInfoResponse(_) => "shard_info_response",
+        // Slot migration scan messages
+        Message::SlotScanRequest(_) => "slot_scan_request",
+        Message::SlotScanResponse(_) => "slot_scan_response",
     }
 }
 

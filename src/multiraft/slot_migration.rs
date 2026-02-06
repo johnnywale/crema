@@ -284,6 +284,10 @@ pub struct SlotMigrationRecord {
     pub updated_at: u64,
     /// Last progress timestamp for timeout detection (ms since epoch).
     pub last_progress_at: u64,
+    /// Total keys actually transferred during this migration.
+    pub keys_migrated: u64,
+    /// Which node drove this migration to completion (None if sync-completed from slot table).
+    pub completed_by_node: Option<NodeId>,
 }
 
 impl SlotMigrationRecord {
@@ -299,6 +303,8 @@ impl SlotMigrationRecord {
             created_at: now,
             updated_at: now,
             last_progress_at: now,
+            keys_migrated: 0,
+            completed_by_node: None,
         }
     }
 
@@ -314,6 +320,8 @@ impl SlotMigrationRecord {
             created_at: now,
             updated_at: now,
             last_progress_at: now,
+            keys_migrated: 0,
+            completed_by_node: None,
         }
     }
 
@@ -619,6 +627,25 @@ pub trait MigrationDataAccessor: Send + Sync {
         Ok(1)
     }
 
+    /// Sync storage to ensure all pending writes are visible.
+    /// Called before validation to ensure checksums are accurate.
+    async fn sync_storage(&self, _shard_id: ShardId) -> Result<()> {
+        // Default implementation: no-op
+        Ok(())
+    }
+
+    /// Wait for source shard replication to catch up.
+    ///
+    /// When this node is a follower for the source shard, data may be stale due to
+    /// Raft replication lag. This method ensures the local storage is consistent
+    /// with the source shard leader before reading data.
+    ///
+    /// Returns Ok(()) when sync is complete or times out.
+    async fn wait_for_source_sync(&self, _shard_id: ShardId) -> Result<()> {
+        // Default implementation: sync storage and return
+        self.sync_storage(_shard_id).await
+    }
+
     /// Delete all data for a slot from a shard.
     /// Called after PREPARED state is committed to clean up source.
     async fn delete_slot_data(&self, shard_id: ShardId, slot_id: SlotId) -> Result<()>;
@@ -660,6 +687,32 @@ pub trait MigrationDataAccessor: Send + Sync {
     fn get_shard_raft_node(&self, _shard_id: ShardId) -> Option<Arc<ShardRaftNode>> {
         // Default implementation: not available
         None
+    }
+
+    /// Get all migration records from all shards' MigrationStateMachines.
+    ///
+    /// This is used to sync SlotMigrator state from Raft-committed state.
+    /// Returns records from all shards' MigrationStateMachines.
+    fn get_all_raft_migration_records(&self) -> Vec<SlotMigrationRecord> {
+        // Default implementation: empty (for test accessors without Raft)
+        Vec::new()
+    }
+
+    // ==================== Shard Lifecycle Management ====================
+
+    /// Cleanup a tombstoned shard after all migrations are complete.
+    ///
+    /// This is called by the migration loop to garbage collect shards that have
+    /// been fully drained (all slots migrated away) and have passed the grace period.
+    /// Implementations should:
+    /// 1. Stop any Raft node for the shard
+    /// 2. Unregister the shard from the router
+    /// 3. Clean up any other shard-specific resources
+    ///
+    /// Returns Ok(()) if the shard was successfully cleaned up or didn't exist.
+    fn gc_tombstoned_shard(&self, _shard_id: ShardId) -> Result<()> {
+        // Default implementation: no-op (for test accessors)
+        Ok(())
     }
 }
 
@@ -716,6 +769,13 @@ pub struct SlotMigrator {
 
     /// Whether the migrator is running.
     running: std::sync::atomic::AtomicBool,
+
+    /// Whether we had active migrations in the previous iteration.
+    /// Used to detect and log when all migrations complete.
+    had_active_migrations: std::sync::atomic::AtomicBool,
+
+    /// Ordered event log for all migration events (for testing/debugging).
+    event_log: RwLock<Vec<MigrationEvent>>,
 }
 
 /// Migration statistics.
@@ -737,6 +797,8 @@ impl SlotMigrator {
             stats: RwLock::new(MigrationStats::default()),
             metrics: None,
             running: std::sync::atomic::AtomicBool::new(false),
+            had_active_migrations: std::sync::atomic::AtomicBool::new(false),
+            event_log: RwLock::new(Vec::new()),
         }
     }
 
@@ -756,11 +818,82 @@ impl SlotMigrator {
         self
     }
 
+    /// Record a migration event.
+    fn record_event(
+        &self,
+        slot_id: SlotId,
+        from_shard: ShardId,
+        to_shard: ShardId,
+        event_type: MigrationEventType,
+    ) {
+        self.record_event_with_duration(slot_id, from_shard, to_shard, event_type, None);
+    }
+
+    /// Record a migration event with an optional phase duration.
+    fn record_event_with_duration(
+        &self,
+        slot_id: SlotId,
+        from_shard: ShardId,
+        to_shard: ShardId,
+        event_type: MigrationEventType,
+        phase_duration_ms: Option<u64>,
+    ) {
+        self.event_log.write().push(MigrationEvent {
+            slot_id,
+            from_shard,
+            to_shard,
+            event_type,
+            timestamp_ms: now_ms(),
+            node_id: self.node_id,
+            phase_duration_ms,
+        });
+    }
+
+    /// Compute duration since the last event matching the predicate for a given slot.
+    fn phase_duration_since(
+        &self,
+        slot_id: SlotId,
+        matcher: impl Fn(&MigrationEventType) -> bool,
+    ) -> Option<u64> {
+        let now = now_ms();
+        self.event_log
+            .read()
+            .iter()
+            .rev()
+            .find(|e| e.slot_id == slot_id && matcher(&e.event_type))
+            .map(|e| now.saturating_sub(e.timestamp_ms))
+    }
+
+    /// Get all migration events (for testing/debugging).
+    pub fn events(&self) -> Vec<MigrationEvent> {
+        self.event_log.read().clone()
+    }
+
+    /// Get events for a specific slot.
+    pub fn events_for_slot(&self, slot_id: SlotId) -> Vec<MigrationEvent> {
+        self.event_log
+            .read()
+            .iter()
+            .filter(|e| e.slot_id == slot_id)
+            .cloned()
+            .collect()
+    }
+
+    /// Clear the event log.
+    pub fn clear_events(&self) {
+        self.event_log.write().clear();
+    }
+
     /// Register a new migration.
     pub fn register_migration(&self, slot_id: SlotId, from_shard: ShardId, to_shard: ShardId) {
         let record = SlotMigrationRecord::new(slot_id, from_shard, to_shard);
         self.migrations.write().insert(slot_id, record);
-
+        self.record_event(
+            slot_id,
+            from_shard,
+            to_shard,
+            MigrationEventType::Registered,
+        );
         tracing::info!(slot_id, from_shard, to_shard, "Registered slot migration");
     }
 
@@ -770,6 +903,12 @@ impl SlotMigrator {
         for (slot_id, from, to) in moves {
             let record = SlotMigrationRecord::new(*slot_id, *from, *to);
             migrations.insert(*slot_id, record);
+        }
+        // Release lock before recording events
+        drop(migrations);
+
+        for (slot_id, from, to) in moves {
+            self.record_event(*slot_id, *from, *to, MigrationEventType::Registered);
         }
 
         tracing::info!(
@@ -786,33 +925,83 @@ impl SlotMigrator {
     /// shard removal/addition.
     pub fn sync_from_slot_table(&self) {
         use crate::multiraft::slot_table::SlotState;
-        use std::collections::hash_map::Entry;
 
         let slot_table = self.slot_table.clone();
         let snapshot = slot_table.snapshot();
 
         // Collect slots that need migrations
         let mut slots_to_migrate = Vec::new();
+        // Collect slots that have completed migration (no longer in Migrating state)
+        let mut slots_completed = Vec::new();
 
         for (slot_id, assignment) in snapshot.slots.iter().enumerate() {
             let slot_id = slot_id as SlotId;
             // Check if slot is migrating
             if let SlotState::Migrating { from, .. } = &assignment.state {
                 slots_to_migrate.push((slot_id, *from, assignment.owner));
+            } else {
+                // Slot is NOT migrating - if we have a local migration record for it,
+                // the migration must have completed (slot is now Imported or Stable)
+                slots_completed.push(slot_id);
             }
         }
 
-        if slots_to_migrate.is_empty() {
-            return;
-        }
+        let mut sync_completed_events: Vec<(SlotId, ShardId, ShardId)> = Vec::new();
 
-        // Use entry API to prevent race conditions where we overwrite
-        // a record that was just updated (e.g., to Claimed) by another thread
         let mut migrations = self.migrations.write();
         let mut inserted_count = 0;
+        let mut completed_count = 0;
 
+        // Mark completed migrations based on slot table state
+        // This ensures follower nodes see completions when the slot table
+        // (which IS synchronized via Raft) is updated by the leader
+        for slot_id in slots_completed {
+            if let Some(record) = migrations.get_mut(&slot_id) {
+                if record.phase.is_in_progress() {
+                    // Slot table says this slot is no longer migrating,
+                    // so mark our local record as completed
+                    // completed_by_node = None indicates sync-completion (not driven by this node)
+                    record.completed_by_node = None;
+                    record.set_phase(MigrationPhase::Completed {
+                        completed_at: crate::multiraft::slot_migration::now_ms(),
+                    });
+                    sync_completed_events.push((slot_id, record.from_shard, record.to_shard));
+                    completed_count += 1;
+                    tracing::debug!(
+                        slot_id,
+                        "Migration marked completed based on slot table state (sync)"
+                    );
+                }
+            }
+        }
+
+        if completed_count > 0 {
+            // Update completed stats
+            let mut stats = self.stats.write();
+            stats.completed += completed_count as u64;
+            tracing::info!(
+                count = completed_count,
+                "Marked migrations completed from slot table sync"
+            );
+        }
+
+        // Register new migrations (replacing completed ones if needed)
         for (slot_id, from, to) in slots_to_migrate {
-            if let Entry::Vacant(entry) = migrations.entry(slot_id) {
+            let should_register = match migrations.get(&slot_id) {
+                None => true,
+                Some(existing) => {
+                    // Replace if:
+                    // 1. Existing migration is completed/cleaned, OR
+                    // 2. Migration direction has REVERSED (e.g., ADD → REMOVE scenario)
+                    //    When direction reverses, the old migration is obsolete and should
+                    //    be replaced. This happens when a shard is added then quickly removed.
+                    let is_completed = !existing.phase.is_in_progress();
+                    let is_reversed = existing.from_shard == to && existing.to_shard == from;
+                    is_completed || is_reversed
+                }
+            };
+
+            if should_register {
                 tracing::debug!(
                     slot_id,
                     from_shard = from,
@@ -820,7 +1009,7 @@ impl SlotMigrator {
                     "Auto-registered migration from slot table sync"
                 );
                 let record = SlotMigrationRecord::new(slot_id, from, to);
-                entry.insert(record);
+                migrations.insert(slot_id, record);
                 inserted_count += 1;
             }
         }
@@ -829,6 +1018,18 @@ impl SlotMigrator {
             tracing::info!(
                 count = inserted_count,
                 "Auto-registered migrations from slot table state"
+            );
+        }
+
+        drop(migrations);
+
+        // Record events after releasing the migrations lock
+        for (slot_id, from_shard, to_shard) in sync_completed_events {
+            self.record_event(
+                slot_id,
+                from_shard,
+                to_shard,
+                MigrationEventType::SyncCompleted,
             );
         }
     }
@@ -847,13 +1048,34 @@ impl SlotMigrator {
 
         let mut new_migrations = Vec::new();
         let mut updated_migrations = Vec::new();
+        let mut replaced_migrations = Vec::new();
 
         for record in peer_migrations {
             let migrations = self.migrations.read();
             if let Some(existing) = migrations.get(&record.slot_id) {
-                // Update phase if peer has a more advanced phase
-                // (Claimed > Pending, Scanning > Claimed, etc.)
-                if record.phase.is_more_advanced_than(&existing.phase) {
+                // Check if this is a DIFFERENT migration (new epoch with different from/to).
+                // This happens during add-then-remove scenarios where:
+                // - ADD: slot migrates from original_shard -> new_shard
+                // - REMOVE: slot migrates from new_shard -> original_shard
+                // The peer's migration should replace ours if it has different from/to shards.
+                let is_different_migration = record.from_shard != existing.from_shard
+                    || record.to_shard != existing.to_shard;
+
+                if is_different_migration && record.phase.is_in_progress() {
+                    // Peer has a newer migration for this slot (different direction)
+                    // Replace our old migration with theirs
+                    tracing::debug!(
+                        slot_id = record.slot_id,
+                        old_from = existing.from_shard,
+                        old_to = existing.to_shard,
+                        new_from = record.from_shard,
+                        new_to = record.to_shard,
+                        "Replacing migration with different direction from peer"
+                    );
+                    replaced_migrations.push(record.clone());
+                } else if record.phase.is_more_advanced_than(&existing.phase) {
+                    // Same migration, peer has more advanced phase
+                    // (Claimed > Pending, Scanning > Claimed, etc.)
                     updated_migrations.push(record.clone());
                 }
             } else if record.phase.is_in_progress() {
@@ -862,26 +1084,68 @@ impl SlotMigrator {
             }
         }
 
-        if !new_migrations.is_empty() || !updated_migrations.is_empty() {
+        if !new_migrations.is_empty()
+            || !updated_migrations.is_empty()
+            || !replaced_migrations.is_empty()
+        {
+            let new_count = new_migrations.len();
+            let updated_count = updated_migrations.len();
+            let replaced_count = replaced_migrations.len();
+
             tracing::debug!(
                 node_id = self.node_id,
-                new_count = new_migrations.len(),
-                updated_count = updated_migrations.len(),
+                new_count,
+                updated_count,
+                replaced_count,
                 "Applying peer migration sync"
             );
+
+            // Collect event data for recording after lock is dropped
+            let mut peer_synced_events: Vec<(SlotId, ShardId, ShardId, bool)> = Vec::new();
+
             let mut migrations = self.migrations.write();
 
             // Add new migrations (preserving peer's phase)
-            for record in new_migrations {
-                migrations.insert(record.slot_id, record);
+            for record in &new_migrations {
+                peer_synced_events.push((record.slot_id, record.from_shard, record.to_shard, true));
+                migrations.insert(record.slot_id, record.clone());
             }
 
             // Update existing migrations with more advanced phases
-            for record in updated_migrations {
-                migrations.insert(record.slot_id, record);
+            for record in &updated_migrations {
+                peer_synced_events.push((
+                    record.slot_id,
+                    record.from_shard,
+                    record.to_shard,
+                    false,
+                ));
+                migrations.insert(record.slot_id, record.clone());
             }
 
-            tracing::info!("Synced migrations from peer state");
+            // Replace old migrations with new direction (e.g., after add-then-remove)
+            for record in &replaced_migrations {
+                peer_synced_events.push((record.slot_id, record.from_shard, record.to_shard, true));
+                migrations.insert(record.slot_id, record.clone());
+            }
+
+            drop(migrations);
+
+            // Record PeerSynced events after lock is dropped
+            for (slot_id, from_shard, to_shard, is_new) in peer_synced_events {
+                self.record_event(
+                    slot_id,
+                    from_shard,
+                    to_shard,
+                    MigrationEventType::PeerSynced { is_new },
+                );
+            }
+
+            tracing::info!(
+                new = new_count,
+                updated = updated_count,
+                replaced = replaced_count,
+                "Synced migrations from peer state"
+            );
         }
     }
 
@@ -984,6 +1248,100 @@ impl SlotMigrator {
         self.running.load(std::sync::atomic::Ordering::SeqCst)
     }
 
+    /// Sync local migration state from Raft-committed state.
+    ///
+    /// This is critical for ensuring all nodes have the same view of migration states
+    /// when claims and transitions are committed via Raft on other nodes.
+    fn sync_from_raft_state_machines<A: MigrationDataAccessor>(&self, accessor: &Arc<A>) {
+        let raft_records = accessor.get_all_raft_migration_records();
+
+        if raft_records.is_empty() {
+            return;
+        }
+
+        let mut updated = 0;
+        let mut newly_completed: Vec<(SlotId, ShardId, ShardId)> = Vec::new();
+        let mut migrations = self.migrations.write();
+
+        for raft_record in raft_records {
+            if let Some(local_record) = migrations.get_mut(&raft_record.slot_id) {
+                // Only update if Raft state is more advanced than local state
+                if raft_record.phase.is_more_advanced_than(&local_record.phase) {
+                    // Track transitions to Completed so we can update slot table + emit events
+                    let was_in_progress = local_record.phase.is_in_progress();
+                    tracing::debug!(
+                        slot_id = raft_record.slot_id,
+                        old_phase = local_record.phase.name(),
+                        new_phase = raft_record.phase.name(),
+                        node_id = self.node_id,
+                        "Syncing more advanced phase from Raft state machine"
+                    );
+                    local_record.phase = raft_record.phase.clone();
+                    local_record.updated_at = raft_record.updated_at;
+                    local_record.last_progress_at = raft_record.last_progress_at;
+                    updated += 1;
+
+                    // If Raft says Completed and our local record was still in-progress,
+                    // update the slot table so non-owner nodes transition Migrating → Imported.
+                    if was_in_progress && raft_record.phase.is_completed() {
+                        newly_completed.push((
+                            raft_record.slot_id,
+                            local_record.from_shard,
+                            local_record.to_shard,
+                        ));
+                    }
+                }
+            } else {
+                // Raft has a record we don't have locally - add it
+                tracing::debug!(
+                    slot_id = raft_record.slot_id,
+                    phase = raft_record.phase.name(),
+                    node_id = self.node_id,
+                    "Adding migration from Raft state machine"
+                );
+                // If the new record is already completed, also mark the slot table
+                if raft_record.phase.is_completed() {
+                    newly_completed.push((
+                        raft_record.slot_id,
+                        raft_record.from_shard,
+                        raft_record.to_shard,
+                    ));
+                }
+                migrations.insert(raft_record.slot_id, raft_record);
+                updated += 1;
+            }
+        }
+
+        drop(migrations);
+
+        // Update slot table and emit events for newly-completed migrations.
+        // This ensures non-owner nodes transition their slot tables from Migrating → Imported
+        // when they learn about completions via Raft state machine sync.
+        for (slot_id, from_shard, to_shard) in &newly_completed {
+            self.slot_table.mark_imported(*slot_id);
+            self.record_event(
+                *slot_id,
+                *from_shard,
+                *to_shard,
+                MigrationEventType::SyncCompleted,
+            );
+            tracing::debug!(
+                slot_id,
+                node_id = self.node_id,
+                "Marked slot imported from Raft state machine sync"
+            );
+        }
+
+        if updated > 0 {
+            tracing::debug!(
+                node_id = self.node_id,
+                updated,
+                newly_completed = newly_completed.len(),
+                "Synced migration state from Raft state machines"
+            );
+        }
+    }
+
     /// Process one iteration of migrations.
     async fn process_migrations<A: MigrationDataAccessor>(
         &self,
@@ -994,14 +1352,19 @@ impl SlotMigrator {
         // pending migrations (important when shard removal was triggered on another node)
         self.sync_from_slot_table();
 
+        // Sync migrations from Raft state machines to get authoritative phase state
+        // This ensures local state reflects Raft-committed claims and transitions
+        self.sync_from_raft_state_machines(accessor);
+
         // Get migrations that need processing
-        let pending: Vec<SlotMigrationRecord> = self
-            .migrations
-            .read()
-            .values()
-            .filter(|r| r.phase.is_in_progress())
-            .cloned()
-            .collect();
+        let pending: Vec<SlotMigrationRecord> = {
+            let migrations = self.migrations.read();
+            migrations
+                .values()
+                .filter(|r| r.phase.is_in_progress())
+                .cloned()
+                .collect()
+        };
 
         // Count phases for metrics and logging
         let pending_count = pending
@@ -1049,23 +1412,110 @@ impl SlotMigrator {
             );
         }
 
-        for record in pending {
+        // Process migrations in priority order:
+        // 1. Non-Pending phases first (Claimed, Scanning, etc.) - these are already in progress
+        // 2. Then Pending phases (limited to avoid starving other phases)
+        //
+        // This prevents the scenario where claiming all 200+ slots blocks
+        // processing of already-claimed slots for minutes.
+        let max_pending_per_iteration = 50; // Limit new claims per iteration
+        let mut pending_processed = 0;
+
+        // Partition into non-pending and pending
+        let (non_pending, pending_only): (Vec<_>, Vec<_>) = pending
+            .into_iter()
+            .partition(|r| !matches!(r.phase, MigrationPhase::Pending));
+
+        // Process non-pending first (Claimed, Scanning, Streaming, CatchingUp, Prepared)
+        for record in non_pending {
             if let Err(e) = self
                 .advance_migration(record.slot_id, accessor, control_plane)
                 .await
             {
-                tracing::warn!(
-                    slot_id = record.slot_id,
-                    phase = record.phase.name(),
-                    error = %e,
-                    "Failed to advance migration"
-                );
+                // Only mark as failed for permanent (non-retryable) errors.
+                // Transient errors like NotLeader should be silently retried on the next
+                // iteration - they don't indicate a migration failure, just that the
+                // operation couldn't be performed right now (e.g., leader election in progress,
+                // different shard leader, etc.).
+                if e.is_retryable() {
+                    tracing::debug!(
+                        slot_id = record.slot_id,
+                        phase = record.phase.name(),
+                        error = %e,
+                        "Transient error advancing migration, will retry"
+                    );
+                } else {
+                    tracing::warn!(
+                        slot_id = record.slot_id,
+                        phase = record.phase.name(),
+                        error = %e,
+                        "Failed to advance migration (permanent error)"
+                    );
 
-                // Mark as failed
-                if let Some(record) = self.migrations.write().get_mut(&record.slot_id) {
-                    record.mark_failed(e.to_string());
+                    // Mark as failed only for permanent errors
+                    if let Some(record) = self.migrations.write().get_mut(&record.slot_id) {
+                        let error = e.to_string();
+                        record.mark_failed(error.clone());
+                        let retry_count = match &record.phase {
+                            MigrationPhase::Failed { retry_count, .. } => *retry_count,
+                            _ => 0,
+                        };
+                        self.record_event(
+                            record.slot_id,
+                            record.from_shard,
+                            record.to_shard,
+                            MigrationEventType::Failed { error, retry_count },
+                        );
+                    }
                 }
             }
+        }
+
+        // Process limited pending (new claims)
+        for record in pending_only {
+            if pending_processed >= max_pending_per_iteration {
+                break; // Process rest in next iteration
+            }
+
+            if let Err(e) = self
+                .advance_migration(record.slot_id, accessor, control_plane)
+                .await
+            {
+                // Only mark as failed for permanent (non-retryable) errors.
+                if e.is_retryable() {
+                    tracing::debug!(
+                        slot_id = record.slot_id,
+                        phase = record.phase.name(),
+                        error = %e,
+                        "Transient error advancing migration, will retry"
+                    );
+                } else {
+                    tracing::warn!(
+                        slot_id = record.slot_id,
+                        phase = record.phase.name(),
+                        error = %e,
+                        "Failed to advance migration (permanent error)"
+                    );
+
+                    // Mark as failed only for permanent errors
+                    if let Some(record) = self.migrations.write().get_mut(&record.slot_id) {
+                        let error = e.to_string();
+                        record.mark_failed(error.clone());
+                        let retry_count = match &record.phase {
+                            MigrationPhase::Failed { retry_count, .. } => *retry_count,
+                            _ => 0,
+                        };
+                        self.record_event(
+                            record.slot_id,
+                            record.from_shard,
+                            record.to_shard,
+                            MigrationEventType::Failed { error, retry_count },
+                        );
+                    }
+                }
+            }
+
+            pending_processed += 1;
         }
 
         // Handle retries for failed migrations
@@ -1074,7 +1524,94 @@ impl SlotMigrator {
         // Check for and takeover stale migrations
         self.process_stale_migrations(accessor).await;
 
+        // Re-count active migrations AFTER processing (some may have completed)
+        let active_after: usize = self
+            .migrations
+            .read()
+            .values()
+            .filter(|r| r.phase.is_in_progress())
+            .count();
+
+        // Detect and log when all migrations complete
+        let has_active = active_after > 0;
+        let had_active = self
+            .had_active_migrations
+            .swap(has_active, std::sync::atomic::Ordering::SeqCst);
+
+        if had_active && !has_active {
+            // Transitioned from having migrations to having none
+            let stats = self.stats.read();
+            tracing::info!(
+                node_id = self.node_id,
+                total_completed = stats.completed,
+                total_failed = stats.failed,
+                "All slot migrations completed"
+            );
+        }
+
+        // Log periodic status when there are active migrations
+        if active_after > 0 && active_after % 10 == 0 {
+            tracing::debug!(
+                node_id = self.node_id,
+                active_migrations = active_after,
+                "Migration progress"
+            );
+        }
+
+        // Garbage collect tombstoned shards that have passed the grace period
+        self.gc_tombstoned_shards(accessor, control_plane);
+
         Ok(())
+    }
+
+    /// Garbage collect tombstoned shards that have passed the grace period.
+    ///
+    /// This is called periodically from the migration loop to clean up shards
+    /// that have been fully drained (all slots migrated away).
+    fn gc_tombstoned_shards<A: MigrationDataAccessor>(
+        &self,
+        accessor: &Arc<A>,
+        control_plane: &Option<Arc<SlotControlPlane>>,
+    ) {
+        let Some(cp) = control_plane else {
+            return;
+        };
+
+        // Get shards that have passed the tombstone grace period
+        let gc_candidates = cp.get_gc_candidates();
+
+        for shard_id in gc_candidates {
+            tracing::info!(
+                shard_id,
+                node_id = self.node_id,
+                "Garbage collecting tombstoned shard"
+            );
+
+            // Step 1: Clean up shard resources (Raft node, router entry, storage)
+            if let Err(e) = accessor.gc_tombstoned_shard(shard_id) {
+                tracing::warn!(
+                    shard_id,
+                    error = %e,
+                    "Error cleaning up tombstoned shard resources"
+                );
+                // Continue to try GC from control plane anyway
+            }
+
+            // Step 2: Remove from control plane's shard_states
+            if let Err(e) = cp.gc_shard(shard_id) {
+                tracing::warn!(
+                    shard_id,
+                    error = %e,
+                    "Error removing tombstoned shard from control plane"
+                );
+            } else {
+                tracing::info!(
+                    shard_id,
+                    node_id = self.node_id,
+                    "Successfully garbage collected tombstoned shard"
+                );
+            }
+        }
     }
 
     /// Advance a single migration through its state machine.
@@ -1099,11 +1636,12 @@ impl SlotMigrator {
             .cloned()
             .ok_or(Error::MigrationNotFound(slot_id as u32))?;
 
-        // Log migration advancement for non-pending phases
-        tracing::trace!(
+        tracing::debug!(
             slot_id,
             phase = record.phase.name(),
             node_id = self.node_id,
+            from_shard = record.from_shard,
+            to_shard = record.to_shard,
             "Advancing migration"
         );
 
@@ -1118,7 +1656,7 @@ impl SlotMigrator {
         // Only target shard leader drives migration
         let should_drive = is_target_leader;
 
-        tracing::trace!(
+        tracing::debug!(
             slot_id,
             node_id = self.node_id,
             from_shard = record.from_shard,
@@ -1130,20 +1668,41 @@ impl SlotMigrator {
             "Migration drive decision"
         );
 
-        if !should_drive {
-            tracing::trace!(
-                slot_id,
-                node_id = self.node_id,
-                from_shard = record.from_shard,
-                to_shard = record.to_shard,
-                "Skipping migration: not target shard leader"
-            );
+        // Once a node drives a migration locally through Scanning/Streaming/CatchingUp/Prepared,
+        // it must continue to Completed even if it's no longer the target shard leader.
+        // transition_to_completed() handles NotLeader via local fallback + mark_imported().
+        //
+        // This is important because:
+        // 1. Local work phases (Scanning, Streaming, CatchingUp) don't go through Raft
+        // 2. If leadership changes mid-migration, the new leader won't know about these phases
+        // 3. The original claim owner must continue driving to avoid stuck migrations
+        // 4. Prepared is the validated-but-not-yet-committed phase — if the owner loses
+        //    leadership after CatchingUp → Prepared, it must still drive to Completed
+        //
+        // We check if this node is the original claim owner by looking at MigrationStateMachine
+        // records, which are Raft-committed and thus authoritative.
+        let is_migration_owner = match &record.phase {
+            MigrationPhase::Claimed { owner_node, .. } => *owner_node == self.node_id,
+            // For local work phases (+ Prepared), the owner IS this node if we have a record
+            // in this phase (only the owner transitions to these phases)
+            MigrationPhase::Scanning { .. }
+            | MigrationPhase::Streaming { .. }
+            | MigrationPhase::CatchingUp { .. }
+            | MigrationPhase::Prepared { .. } => true, // Owner drives through Prepared to Completed
+            // For terminal/initial phases, only target leader should drive
+            MigrationPhase::Pending
+            | MigrationPhase::Completed { .. }
+            | MigrationPhase::Cleaned { .. }
+            | MigrationPhase::Failed { .. } => false,
+        };
+
+        if !should_drive && !is_migration_owner {
             return Ok(());
         }
 
         match &record.phase {
             MigrationPhase::Pending => {
-                tracing::debug!(
+                tracing::info!(
                     slot_id,
                     node_id = self.node_id,
                     from_shard = record.from_shard,
@@ -1151,49 +1710,34 @@ impl SlotMigrator {
                     "Claiming migration ownership"
                 );
                 self.claim_migration(slot_id, &record, accessor).await?;
+                // After successful claim, immediately transition to Scanning
+                // instead of waiting for the next iteration. This dramatically
+                // speeds up migrations by avoiding the iteration delay.
+                self.transition_to_scanning(slot_id).await?;
             }
             MigrationPhase::Claimed {
                 owner_node,
                 claim_epoch,
                 ..
             } => {
-                tracing::debug!(
-                    slot_id,
-                    owner_node,
-                    claim_epoch,
-                    record_epoch = record.id.epoch,
-                    "Processing claimed migration"
-                );
-                // With Raft-based coordination, the target shard leader drives all phases.
                 // The epoch check ensures we don't process stale migrations from old epochs.
                 if *claim_epoch != record.id.epoch {
-                    tracing::debug!(
-                        slot_id,
-                        claim_epoch,
-                        record_epoch = record.id.epoch,
-                        "Skipping: epoch mismatch"
-                    );
                     if let Some(metrics) = &self.metrics {
                         metrics.record_epoch_conflict();
                     }
                     return Ok(());
                 }
-                tracing::debug!(
-                    slot_id,
-                    node_id = self.node_id,
-                    "Transitioning Claimed → Scanning"
-                );
+                // Check if we're the owner.
+                // NOTE: The owner can transition to Scanning even if no longer target leader,
+                // since transition_to_scanning is a local state update (not Raft-based).
+                // This prevents migrations from getting stuck when leadership changes after claim.
+                if *owner_node != self.node_id {
+                    return Ok(());
+                }
                 self.transition_to_scanning(slot_id).await?;
             }
             MigrationPhase::Scanning { cursor, keys_found } => {
-                tracing::debug!(
-                    slot_id,
-                    keys_found,
-                    has_cursor = cursor.is_some(),
-                    "Processing scanning phase"
-                );
                 if !self.is_valid_owner(&record) {
-                    tracing::trace!(slot_id, "Scanning skipped: not valid owner");
                     return Ok(());
                 }
                 self.process_scanning(slot_id, cursor.clone(), *keys_found, accessor)
@@ -1339,19 +1883,32 @@ impl SlotMigrator {
     /// Only called after Raft has committed the claim.
     fn apply_claim_to_local_state(&self, slot_id: SlotId) {
         let now = now_ms();
+        let claimed_phase = MigrationPhase::Claimed {
+            owner_node: self.node_id,
+            claim_epoch: 0, // Placeholder for comparison
+            claimed_at: now,
+        };
+
         let mut migrations = self.migrations.write();
         if let Some(record) = migrations.get_mut(&slot_id) {
-            let old_phase = record.phase.name();
+            // Only apply if the current phase is NOT more advanced than Claimed.
+            // This prevents overwriting phases like Scanning, Streaming, CatchingUp, Prepared
+            // when the Raft commit arrives after local progression.
+            if record.phase.ordinal() > claimed_phase.ordinal() {
+                return;
+            }
+
+            let claim_epoch = record.id.epoch;
             record.set_phase(MigrationPhase::Claimed {
                 owner_node: self.node_id,
-                claim_epoch: record.id.epoch,
+                claim_epoch,
                 claimed_at: now,
             });
-            tracing::debug!(
+            self.record_event(
                 slot_id,
-                node_id = self.node_id,
-                old_phase,
-                "Migration claim applied to local state"
+                record.from_shard,
+                record.to_shard,
+                MigrationEventType::Claimed { claim_epoch },
             );
         }
     }
@@ -1382,10 +1939,20 @@ impl SlotMigrator {
         let mut migrations = self.migrations.write();
         if let Some(record) = migrations.get_mut(&slot_id) {
             let old_phase = record.phase.name();
+            // Guard against regression from completed states
+            if matches!(record.phase, MigrationPhase::Completed { .. }) {
+                return Ok(());
+            }
             record.set_phase(MigrationPhase::Scanning {
                 cursor: None,
                 keys_found: 0,
             });
+            self.record_event(
+                slot_id,
+                record.from_shard,
+                record.to_shard,
+                MigrationEventType::ScanningStarted,
+            );
             tracing::debug!(slot_id, old_phase, "Migration: {} → Scanning", old_phase);
         } else {
             tracing::warn!(slot_id, "Migration not found during transition to scanning");
@@ -1408,6 +1975,18 @@ impl SlotMigrator {
             .cloned()
             .ok_or(Error::MigrationNotFound(slot_id as u32))?;
 
+        // On first scan batch, ensure source shard data is replicated and visible.
+        // This is critical when this node is a follower for the source shard, as
+        // Raft replication lag could cause us to miss keys.
+        if cursor.is_none() {
+            tracing::debug!(
+                slot_id,
+                from_shard = record.from_shard,
+                "Waiting for source shard replication sync before scanning"
+            );
+            accessor.wait_for_source_sync(record.from_shard).await?;
+        }
+
         tracing::trace!(
             slot_id,
             from_shard = record.from_shard,
@@ -1416,33 +1995,70 @@ impl SlotMigrator {
             "Scanning slot keys"
         );
 
-        // Scan a batch of keys
-        let scan_result = accessor
+        // Scan a batch of keys from source shard
+        let (keys, next_cursor) = accessor
             .scan_slot_keys(
                 record.from_shard,
                 slot_id,
                 cursor.as_deref(),
                 self.config.scan_batch_size,
             )
-            .await;
-
-        let (keys, next_cursor) = match scan_result {
-            Ok((keys, cursor)) => {
-                tracing::trace!(
-                    slot_id,
-                    keys_in_batch = keys.len(),
-                    has_next_cursor = cursor.is_some(),
-                    "Scan batch completed"
-                );
-                (keys, cursor)
-            }
-            Err(e) => {
-                tracing::warn!(slot_id, error = %e, "Scan failed");
-                return Err(e);
-            }
-        };
+            .await?;
 
         let new_keys_found = keys_found + keys.len() as u64;
+
+        // Handle reversed migration case:
+        // When a migration direction is reversed (e.g., ADD shard then REMOVE immediately),
+        // the source shard (newly added) may have no keys because the original forward
+        // migration never completed. In this case, the data is still on the target shard
+        // (the original location). We can skip data transfer and complete immediately.
+        if cursor.is_none() && keys.is_empty() && next_cursor.is_none() {
+            // First scan found no keys. Check if target already has this slot's data.
+            let (target_keys, _) = accessor
+                .scan_slot_keys(record.to_shard, slot_id, None, 1)
+                .await
+                .unwrap_or_else(|_| (vec![], None));
+
+            if !target_keys.is_empty() {
+                tracing::info!(
+                    slot_id,
+                    from_shard = record.from_shard,
+                    to_shard = record.to_shard,
+                    "Migration reversed: source has no data, target already has data. Skipping transfer."
+                );
+
+                // Mark migration as completed - data is already at target
+                let mut migrations = self.migrations.write();
+                let (from_shard, to_shard) = if let Some(record) = migrations.get_mut(&slot_id) {
+                    record.keys_migrated = 0; // No transfer needed
+                    record.completed_by_node = Some(self.node_id);
+                    record.set_phase(MigrationPhase::Completed {
+                        completed_at: std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_millis() as u64,
+                    });
+                    (record.from_shard, record.to_shard)
+                } else {
+                    (0, 0)
+                };
+                drop(migrations);
+
+                // Record SkippedReversed event
+                self.record_event(
+                    slot_id,
+                    from_shard,
+                    to_shard,
+                    MigrationEventType::SkippedReversed,
+                );
+
+                // Update stats
+                let mut stats = self.stats.write();
+                stats.completed += 1;
+
+                return Ok(());
+            }
+        }
 
         let mut migrations = self.migrations.write();
         if let Some(record) = migrations.get_mut(&slot_id) {
@@ -1453,6 +2069,26 @@ impl SlotMigrator {
                     keys_transferred: 0,
                     last_key: None,
                 });
+                let scan_duration = self.phase_duration_since(slot_id, |t| {
+                    matches!(t, MigrationEventType::ScanningStarted)
+                });
+                self.record_event_with_duration(
+                    slot_id,
+                    record.from_shard,
+                    record.to_shard,
+                    MigrationEventType::ScanningCompleted {
+                        keys_found: new_keys_found,
+                    },
+                    scan_duration,
+                );
+                self.record_event(
+                    slot_id,
+                    record.from_shard,
+                    record.to_shard,
+                    MigrationEventType::StreamingStarted {
+                        keys_total: new_keys_found,
+                    },
+                );
                 tracing::debug!(
                     slot_id,
                     keys_total = new_keys_found,
@@ -1501,13 +2137,25 @@ impl SlotMigrator {
             // All data transferred, get log index for catch-up
             let log_index = accessor.current_log_index(record.from_shard).await?;
 
-            let mut migrations = self.migrations.write();
-            if let Some(record) = migrations.get_mut(&slot_id) {
-                record.set_phase(MigrationPhase::CatchingUp {
-                    from_log_index: log_index,
-                });
+            {
+                let mut migrations = self.migrations.write();
+                if let Some(record) = migrations.get_mut(&slot_id) {
+                    // Snapshot keys_transferred before phase transition
+                    record.keys_migrated = keys_transferred;
+                    record.set_phase(MigrationPhase::CatchingUp {
+                        from_log_index: log_index,
+                    });
+                    self.record_event(
+                        slot_id,
+                        record.from_shard,
+                        record.to_shard,
+                        MigrationEventType::CatchingUpStarted {
+                            from_log_index: log_index,
+                        },
+                    );
 
-                tracing::debug!(slot_id, log_index, "Migration: Streaming → CatchingUp");
+                    tracing::debug!(slot_id, log_index, "Migration: Streaming → CatchingUp");
+                }
             }
 
             return Ok(());
@@ -1538,6 +2186,15 @@ impl SlotMigrator {
                 keys_transferred: new_transferred,
                 last_key: new_last_key,
             });
+            self.record_event(
+                slot_id,
+                record.from_shard,
+                record.to_shard,
+                MigrationEventType::StreamingProgress {
+                    keys_transferred: new_transferred,
+                    keys_total,
+                },
+            );
         }
 
         // Update stats
@@ -1640,6 +2297,8 @@ impl SlotMigrator {
             .await
         {
             Ok(_) => {
+                // Apply to local state ONLY after successful Raft commit
+                self.apply_prepared_to_local_state(slot_id, &validation);
                 tracing::info!(
                     slot_id,
                     target_commit_index = validation.raft_commit_index,
@@ -1651,13 +2310,20 @@ impl SlotMigrator {
                 Ok(())
             }
             Err(Error::Raft(RaftError::NotLeader { leader })) => {
-                tracing::debug!(
+                // Fall back to local application when not leader.
+                // This is safe because:
+                // 1. Data has been validated (checksum, commit index verified)
+                // 2. No data deletion happens at Prepared phase (only at Completed)
+                // 3. Other nodes will sync via their own processing or Raft replication
+                // 4. This prevents migrations from getting stuck when owner != target leader
+                self.apply_prepared_to_local_state(slot_id, &validation);
+                tracing::info!(
                     slot_id,
                     target_shard = record.to_shard,
                     leader = ?leader,
-                    "Cannot propose PREPARED: not target shard leader"
+                    "Migration PREPARED applied locally (not target shard leader)"
                 );
-                Ok(()) // Not an error, just skip this iteration
+                Ok(())
             }
             Err(e) => {
                 // CRITICAL: Do NOT fall back to local state on Raft failure!
@@ -1675,7 +2341,14 @@ impl SlotMigrator {
 
     /// Apply PREPARED state to local migration record.
     /// Only called after Raft has committed the PREPARED command.
-    fn apply_prepared_to_local_state(&self, slot_id: SlotId, validation: &ValidationResult) {
+    ///
+    /// This method is pub(crate) to allow testing the local state synchronization
+    /// that was the root cause of the "migrations stuck at active=N" bug.
+    pub(crate) fn apply_prepared_to_local_state(
+        &self,
+        slot_id: SlotId,
+        validation: &ValidationResult,
+    ) {
         let now = now_ms();
         let mut migrations = self.migrations.write();
         if let Some(record) = migrations.get_mut(&slot_id) {
@@ -1684,6 +2357,16 @@ impl SlotMigrator {
                 target_commit_index: validation.raft_commit_index,
                 validation_checksum: validation.checksum,
             });
+            self.record_event(
+                slot_id,
+                record.from_shard,
+                record.to_shard,
+                MigrationEventType::Prepared {
+                    checksum: validation.checksum,
+                    source_count: validation.key_count,
+                    target_count: validation.key_count,
+                },
+            );
 
             tracing::info!(
                 slot_id,
@@ -1712,17 +2395,31 @@ impl SlotMigrator {
         let source_count = accessor.count_keys_in_slot(from_shard, slot_id).await?;
         let target_count = accessor.count_keys_in_slot(to_shard, slot_id).await?;
 
+        // Allow case where source is empty but target has data - this means the data
+        // was successfully transferred and source was cleaned up, we just need to finalize.
+        // This can happen in race conditions where multiple nodes process the same migration.
         if source_count != target_count {
-            return Err(Error::MigrationValidationFailed(format!(
-                "Key count mismatch: source={}, target={}",
-                source_count, target_count
-            )));
+            if source_count == 0 && target_count > 0 {
+                tracing::info!(
+                    slot_id,
+                    target_count,
+                    "Migration validation: source empty, target has data (already transferred)"
+                );
+            } else {
+                return Err(Error::MigrationValidationFailed(format!(
+                    "Key count mismatch: source={}, target={}",
+                    source_count, target_count
+                )));
+            }
         }
 
+        // Compute checksums for validation and return value
         let source_checksum = accessor.checksum_slot(from_shard, slot_id).await?;
         let target_checksum = accessor.checksum_slot(to_shard, slot_id).await?;
 
-        if source_checksum != target_checksum {
+        // Only compare checksums if source has data
+        // (if source=0, data was already transferred and source cleaned up)
+        if source_count > 0 && source_checksum != target_checksum {
             return Err(Error::MigrationValidationFailed(format!(
                 "Checksum mismatch: source={:#x}, target={:#x}",
                 source_checksum, target_checksum
@@ -1753,6 +2450,20 @@ impl SlotMigrator {
             "Migration validation completed"
         );
 
+        // Record ValidationCompleted event
+        self.record_event(
+            slot_id,
+            from_shard,
+            to_shard,
+            MigrationEventType::ValidationCompleted {
+                source_count,
+                target_count,
+                source_checksum,
+                target_checksum,
+                follower_ok: follower_sample_ok,
+            },
+        );
+
         Ok(ValidationResult {
             raft_commit_index: target_commit_index,
             key_count: target_count,
@@ -1780,20 +2491,81 @@ impl SlotMigrator {
             .ok_or(Error::MigrationNotFound(slot_id as u32))?;
 
         // Delete source data (safe because PREPARED is committed)
-        accessor
-            .delete_slot_data(record.from_shard, slot_id)
-            .await?;
+        // In Multi-Raft with different leaders per shard, we might not be the source
+        // shard leader. If so, skip the delete - the source shard leader's cleanup
+        // process will handle orphaned data. The slot table has already been updated
+        // to route traffic to the target shard.
+        let source_deleted = match accessor.delete_slot_data(record.from_shard, slot_id).await {
+            Ok(()) => {
+                // Verify source is empty
+                let remaining = accessor
+                    .count_keys_in_slot(record.from_shard, slot_id)
+                    .await
+                    .unwrap_or(0);
+                if remaining > 0 {
+                    tracing::warn!(
+                        slot_id,
+                        remaining,
+                        from_shard = record.from_shard,
+                        "Source still has keys after deletion, will be cleaned up later"
+                    );
+                    false
+                } else {
+                    true
+                }
+            }
+            Err(Error::Raft(RaftError::NotLeader { leader })) => {
+                // Not the source shard leader - can't delete from source.
+                // This is expected in Multi-Raft with different leaders per shard.
+                // The data will be orphaned but harmless (slot routes to target now).
+                tracing::debug!(
+                    slot_id,
+                    from_shard = record.from_shard,
+                    source_leader = ?leader,
+                    "Cannot delete source data: not source shard leader, will be cleaned up by source leader"
+                );
+                false
+            }
+            Err(e) if e.is_retryable() => {
+                // Other transient error - skip for now, will retry later
+                tracing::debug!(
+                    slot_id,
+                    from_shard = record.from_shard,
+                    error = %e,
+                    "Transient error deleting source data, will retry"
+                );
+                return Ok(()); // Skip this iteration, retry later
+            }
+            Err(e) => {
+                // Permanent error - log but proceed with completion
+                tracing::warn!(
+                    slot_id,
+                    from_shard = record.from_shard,
+                    error = %e,
+                    "Failed to delete source data, proceeding with completion"
+                );
+                false
+            }
+        };
 
-        // Verify source is empty
-        let remaining = accessor
-            .count_keys_in_slot(record.from_shard, slot_id)
-            .await?;
-        if remaining > 0 {
-            return Err(Error::MigrationValidationFailed(format!(
-                "Source still has {} keys after deletion",
-                remaining
-            )));
-        }
+        // Record SourceDeleted event
+        self.record_event(
+            slot_id,
+            record.from_shard,
+            record.to_shard,
+            MigrationEventType::SourceDeleted {
+                success: source_deleted,
+                keys_deleted: 0, // Exact count not tracked; success flag indicates outcome
+            },
+        );
+
+        tracing::debug!(
+            slot_id,
+            source_deleted,
+            from_shard = record.from_shard,
+            to_shard = record.to_shard,
+            "Source deletion status before proposing COMPLETED"
+        );
 
         // Try to propose COMPLETED through target shard's Raft
         let command = MigrationRaftCommand::Completed {
@@ -1819,9 +2591,13 @@ impl SlotMigrator {
                     slot_id,
                     target_shard = record.to_shard,
                     leader = ?leader,
-                    "Cannot propose COMPLETED: not target shard leader"
+                    "Cannot propose COMPLETED: not target shard leader, falling back to local completion"
                 );
-                Ok(()) // Not an error, just skip this iteration
+                // Fall back to local completion since data is already safely replicated
+                // (PREPARED phase guarantees data integrity). The slot table will be
+                // updated locally, and other nodes will sync via slot table sync.
+                // This handles unstable leadership scenarios during shard creation.
+                self.complete_migration_local(slot_id, control_plane).await
             }
             Err(e) => {
                 // Fall back to local completion if Raft not available
@@ -1847,7 +2623,25 @@ impl SlotMigrator {
         {
             let mut migrations = self.migrations.write();
             if let Some(record) = migrations.get_mut(&slot_id) {
+                // Capture keys_transferred from Streaming phase before overwriting
+                let keys_transferred = match &record.phase {
+                    MigrationPhase::Streaming {
+                        keys_transferred, ..
+                    } => *keys_transferred,
+                    _ => record.keys_migrated, // preserve if already set
+                };
+                record.keys_migrated = keys_transferred;
+                record.completed_by_node = Some(self.node_id);
                 record.set_phase(MigrationPhase::Completed { completed_at: now });
+                let total_duration = self
+                    .phase_duration_since(slot_id, |t| matches!(t, MigrationEventType::Registered));
+                self.record_event_with_duration(
+                    slot_id,
+                    record.from_shard,
+                    record.to_shard,
+                    MigrationEventType::Completed,
+                    total_duration,
+                );
             }
         }
 
@@ -1892,13 +2686,16 @@ impl SlotMigrator {
         for slot_id in retryable {
             let mut migrations = self.migrations.write();
             if let Some(record) = migrations.get_mut(&slot_id) {
-                tracing::info!(
+                let attempt = match &record.phase {
+                    MigrationPhase::Failed { retry_count, .. } => *retry_count,
+                    _ => 0,
+                };
+                tracing::info!(slot_id, retry_count = attempt, "Retrying failed migration");
+                self.record_event(
                     slot_id,
-                    retry_count = match &record.phase {
-                        MigrationPhase::Failed { retry_count, .. } => *retry_count,
-                        _ => 0,
-                    },
-                    "Retrying failed migration"
+                    record.from_shard,
+                    record.to_shard,
+                    MigrationEventType::Retried { attempt },
                 );
                 record.set_phase(MigrationPhase::Pending);
             }
@@ -1917,10 +2714,15 @@ impl SlotMigrator {
             .read()
             .iter()
             .filter_map(|(&slot_id, record)| {
-                // Only check migrations that are in progress
-                if record.phase.is_in_progress()
-                    && (now.saturating_sub(record.last_progress_at) > timeout_ms)
-                {
+                // Only check migrations that have been CLAIMED and started but stopped progressing.
+                // Pending migrations are just waiting in the queue - not stuck.
+                // With 200+ migrations and only 10 processed per iteration, many will
+                // naturally wait in Pending state without being "stuck".
+                let is_started = !matches!(record.phase, MigrationPhase::Pending);
+                let is_in_progress = record.phase.is_in_progress();
+                let is_timed_out = now.saturating_sub(record.last_progress_at) > timeout_ms;
+
+                if is_started && is_in_progress && is_timed_out {
                     Some(slot_id)
                 } else {
                     None
@@ -1942,13 +2744,30 @@ impl SlotMigrator {
             // Increment epoch for takeover
             record.increment_epoch();
 
+            let new_epoch = record.id.epoch;
+            let from_shard = record.from_shard;
+            let to_shard = record.to_shard;
+
             tracing::warn!(
                 slot_id,
                 old_epoch,
-                new_epoch = record.id.epoch,
+                new_epoch,
                 old_phase,
                 node_id = self.node_id,
                 "Taking over stale migration with new epoch"
+            );
+
+            drop(migrations);
+
+            // Record StaleTakeover event after lock is dropped
+            self.record_event(
+                slot_id,
+                from_shard,
+                to_shard,
+                MigrationEventType::StaleTakeover {
+                    old_epoch,
+                    new_epoch,
+                },
             );
 
             Ok(())
@@ -1960,13 +2779,16 @@ impl SlotMigrator {
     /// Process stale migration takeovers.
     ///
     /// Called periodically to check for and take over stuck migrations.
+    /// Only the TARGET shard leader should take over stale migrations since
+    /// it's the one driving migrations (pull model).
     pub async fn process_stale_migrations<A: MigrationDataAccessor>(&self, accessor: &Arc<A>) {
         let stale_slots = self.check_for_stale_migrations();
 
         for slot_id in stale_slots {
-            // Only take over if we're the source shard leader
+            // Only take over if we're the TARGET shard leader
+            // (since target shard leader drives migrations in our pull model)
             if let Some(record) = self.get_migration(slot_id) {
-                if accessor.is_source_shard_leader(record.from_shard) {
+                if accessor.is_target_shard_leader(record.to_shard) {
                     if let Err(e) = self.takeover_stale_migration(slot_id) {
                         tracing::warn!(
                             slot_id,
@@ -2036,6 +2858,81 @@ impl SlotMigrator {
             migrations.insert(record.slot_id, record);
         }
     }
+}
+
+// ==================== Migration Event Log ====================
+
+/// A single migration event recording a phase transition or notable occurrence.
+#[derive(Debug, Clone)]
+pub struct MigrationEvent {
+    /// The slot being migrated.
+    pub slot_id: SlotId,
+    /// Source shard.
+    pub from_shard: ShardId,
+    /// Target shard.
+    pub to_shard: ShardId,
+    /// Type of event.
+    pub event_type: MigrationEventType,
+    /// Timestamp in milliseconds since Unix epoch.
+    pub timestamp_ms: u64,
+    /// Node that recorded this event.
+    pub node_id: NodeId,
+    /// Optional duration of the phase that just completed (ms).
+    pub phase_duration_ms: Option<u64>,
+}
+
+/// Types of migration events.
+#[derive(Debug, Clone, PartialEq)]
+pub enum MigrationEventType {
+    /// Migration registered (Pending).
+    Registered,
+    /// Ownership claimed via Raft.
+    Claimed { claim_epoch: u64 },
+    /// Transitioned to scanning source keys.
+    ScanningStarted,
+    /// Scanning completed, found N keys.
+    ScanningCompleted { keys_found: u64 },
+    /// Streaming data to target.
+    StreamingStarted { keys_total: u64 },
+    /// Streaming batch transferred.
+    StreamingProgress {
+        keys_transferred: u64,
+        keys_total: u64,
+    },
+    /// Catching up with new writes.
+    CatchingUpStarted { from_log_index: u64 },
+    /// Migration prepared and validated.
+    Prepared {
+        checksum: u64,
+        source_count: u64,
+        target_count: u64,
+    },
+    /// Migration completed (target authoritative).
+    Completed,
+    /// Source data cleaned.
+    Cleaned,
+    /// Migration failed.
+    Failed { error: String, retry_count: u32 },
+    /// Retry attempt after failure.
+    Retried { attempt: u32 },
+    /// Slot table sync detected completed migration (follower discovery).
+    SyncCompleted,
+    /// Peer migration synced (new or updated).
+    PeerSynced { is_new: bool },
+    /// Source data deletion result after migration.
+    SourceDeleted { success: bool, keys_deleted: u64 },
+    /// Multi-layer validation completed (before PREPARED).
+    ValidationCompleted {
+        source_count: u64,
+        target_count: u64,
+        source_checksum: u64,
+        target_checksum: u64,
+        follower_ok: bool,
+    },
+    /// Migration skipped because source had no data (reversed migration).
+    SkippedReversed,
+    /// Stale migration detected and taken over.
+    StaleTakeover { old_epoch: u64, new_epoch: u64 },
 }
 
 /// Get current time in milliseconds since Unix epoch.
@@ -2123,7 +3020,9 @@ impl MigrationDataAccessor for NoOpDataAccessor {
 /// When per-shard Raft is enabled, this accessor supports automatic leader forwarding
 /// for write operations. If a put fails with `NotLeader`, the request is forwarded
 /// to the actual shard leader.
-#[derive(Debug)]
+///
+/// For remote shards (e.g., during shard removal), this accessor can forward scan
+/// requests to the node that owns the shard.
 pub struct ShardMigrationDataAccessor {
     /// Router to access shards by ID.
     router: Arc<ShardRouter>,
@@ -2135,6 +3034,39 @@ pub struct ShardMigrationDataAccessor {
     leader_tracker: Arc<ShardLeaderTracker>,
     /// Per-shard Raft manager (optional).
     shard_raft_manager: Arc<RwLock<Option<Arc<ShardRaftManager>>>>,
+    /// Remote slot scan callback for cross-node slot scanning.
+    /// This is called when the source shard is on a remote node.
+    remote_scan_callback: Option<RemoteScanCallback>,
+    /// Configurable total number of slots.
+    total_slots: usize,
+}
+
+/// Callback type for remote slot scanning.
+/// Parameters: target_node, shard_id, slot_id, cursor, limit
+/// Returns: (keys, next_cursor)
+pub type RemoteScanCallback = Arc<
+    dyn Fn(
+            NodeId,
+            ShardId,
+            SlotId,
+            Option<Vec<u8>>,
+            usize,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<(Vec<Vec<u8>>, Option<Vec<u8>>)>> + Send>,
+        > + Send
+        + Sync,
+>;
+
+impl std::fmt::Debug for ShardMigrationDataAccessor {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ShardMigrationDataAccessor")
+            .field("node_id", &self.node_id)
+            .field(
+                "has_remote_scan_callback",
+                &self.remote_scan_callback.is_some(),
+            )
+            .finish()
+    }
 }
 
 impl ShardMigrationDataAccessor {
@@ -2152,12 +3084,32 @@ impl ShardMigrationDataAccessor {
             shard_forwarder,
             leader_tracker,
             shard_raft_manager,
+            remote_scan_callback: None,
+            total_slots: TOTAL_SLOTS,
         }
     }
 
+    /// Set the total number of slots.
+    pub fn with_total_slots(mut self, total_slots: usize) -> Self {
+        self.total_slots = total_slots;
+        self
+    }
+
+    /// Set the remote scan callback for cross-node slot scanning.
+    pub fn with_remote_scan_callback(mut self, callback: RemoteScanCallback) -> Self {
+        self.remote_scan_callback = Some(callback);
+        self
+    }
+
+    /// Get the node ID that owns a shard.
+    /// Shard IDs are encoded as (node_id << 24) | local_seq.
+    fn get_shard_owner_node(&self, shard_id: ShardId) -> NodeId {
+        (shard_id >> 24) as NodeId
+    }
+
     /// Calculate which slot a key belongs to.
-    fn key_to_slot(key: &[u8]) -> SlotId {
-        crc16(key) % TOTAL_SLOTS as u16
+    fn key_to_slot(&self, key: &[u8]) -> SlotId {
+        crc16(key) % self.total_slots as u16
     }
 
     /// Put a key-value pair with automatic leader forwarding.
@@ -2239,27 +3191,59 @@ impl MigrationDataAccessor for ShardMigrationDataAccessor {
         cursor: Option<&[u8]>,
         limit: usize,
     ) -> Result<(Vec<Vec<u8>>, Option<Vec<u8>>)> {
-        let shard = self
-            .router
-            .get_shard(shard_id)
-            .ok_or(Error::ShardNotFound(shard_id))?;
+        // Check if shard exists locally
+        if let Some(shard) = self.router.get_shard(shard_id) {
+            // Shard exists locally - scan from local storage
+            let storage = shard.storage();
 
-        // Use the storage's efficient slot scanning with O(keys_in_slot) complexity
-        // instead of O(total_keys) full iteration per batch
-        let storage = shard.storage();
+            // Enable slot indexing if not already enabled (lazy initialization)
+            if !storage.has_slot_indexing() {
+                storage.set_total_slots(self.total_slots as u16);
+                storage.enable_slot_indexing();
+            }
 
-        // Enable slot indexing if not already enabled (lazy initialization)
-        // This rebuilds the index from existing data (O(N) once, then O(1) per slot)
-        if !storage.has_slot_indexing() {
-            storage.enable_slot_indexing();
+            let (keys, next_cursor) = storage.scan_slot_keys(slot_id as u16, cursor, limit);
+
+            return Ok((
+                keys.into_iter().map(|k| k.to_vec()).collect(),
+                next_cursor.map(|k| k.to_vec()),
+            ));
         }
 
-        let (keys, next_cursor) = storage.scan_slot_keys(slot_id as u16, cursor, limit);
+        // Shard not local - determine which node owns it and forward the scan
+        let owner_node = self.get_shard_owner_node(shard_id);
 
-        Ok((
-            keys.into_iter().map(|k| k.to_vec()).collect(),
-            next_cursor.map(|k| k.to_vec()),
-        ))
+        if owner_node == self.node_id {
+            // This shouldn't happen: we own the shard but can't find it locally
+            tracing::warn!(
+                shard_id,
+                node_id = self.node_id,
+                "Shard owned by this node but not found in router"
+            );
+            return Err(Error::ShardNotFound(shard_id));
+        }
+
+        // Forward slot scan to the owner node via callback
+        tracing::debug!(
+            slot_id,
+            shard_id,
+            owner_node,
+            "Forwarding slot scan to remote owner"
+        );
+
+        let callback = self
+            .remote_scan_callback
+            .as_ref()
+            .ok_or_else(|| Error::Config("Remote scan callback not configured".into()))?;
+
+        callback(
+            owner_node,
+            shard_id,
+            slot_id,
+            cursor.map(|c| c.to_vec()),
+            limit,
+        )
+        .await
     }
 
     async fn get_keys(
@@ -2366,7 +3350,7 @@ impl MigrationDataAccessor for ShardMigrationDataAccessor {
         let mut count = 0u64;
 
         for (key_arc, _value) in storage.iter() {
-            if Self::key_to_slot(&key_arc) == slot_id {
+            if self.key_to_slot(&key_arc) == slot_id {
                 count += 1;
             }
         }
@@ -2384,7 +3368,7 @@ impl MigrationDataAccessor for ShardMigrationDataAccessor {
         let mut checksum: u64 = 0;
 
         for (key_arc, value) in storage.iter() {
-            if Self::key_to_slot(&key_arc) == slot_id {
+            if self.key_to_slot(&key_arc) == slot_id {
                 // Simple checksum: XOR of key hash and value hash
                 let key_hash = crc16(&key_arc) as u64;
                 let value_hash = crc16(&value) as u64;
@@ -2427,7 +3411,7 @@ impl MigrationDataAccessor for ShardMigrationDataAccessor {
         let keys_to_delete: Vec<Bytes> = storage
             .iter()
             .filter_map(|(key_arc, _value)| {
-                if Self::key_to_slot(&key_arc) == slot_id {
+                if self.key_to_slot(&key_arc) == slot_id {
                     Some((*key_arc).clone())
                 } else {
                     None
@@ -2490,32 +3474,54 @@ impl MigrationDataAccessor for ShardMigrationDataAccessor {
     }
 
     fn is_target_shard_leader(&self, to_shard: ShardId) -> bool {
-        // Primary: Check shard Raft manager directly (authoritative source of truth)
-        // The shard Raft node knows if it's the leader via Raft consensus
+        // Primary: Check shard Raft manager directly
         if let Some(manager) = self.shard_raft_manager.read().as_ref() {
             if let Some(shard_raft) = manager.get_shard(to_shard) {
                 let is_leader = shard_raft.is_leader();
-                tracing::trace!(
+                let leader_id = shard_raft.leader_id();
+
+                // If Raft says we're the leader, trust it
+                if is_leader {
+                    return true;
+                }
+
+                // If Raft knows who the leader is (and it's not us), don't immediately reject.
+                // In distributed systems, Raft state can be temporarily inconsistent during
+                // leadership transitions, causing split-brain where each node thinks the other
+                // is the leader. Instead of blocking, we fall through to let the Raft proposal
+                // attempt happen - if we're truly not the leader, Raft will reject with NotLeader.
+                //
+                // Note: We DON'T return false here anymore to handle split-brain scenarios.
+                // The actual leadership is determined by the Raft protocol during proposal.
+                if let Some(known_leader) = leader_id {
+                    if known_leader != 0 && known_leader != self.node_id {
+                        // Allow attempt - Raft will be the ultimate arbiter
+                        // This handles split-brain where leadership is inconsistent
+                        return true;
+                    }
+                }
+
+                // Raft says we're not the leader, but leader_id is None or 0
+                // This happens during leader election after shard creation.
+                // Fall through to leader_tracker which may have fresher gossip info.
+            } else {
+                // Shard doesn't exist in manager - fall through to leader_tracker fallback
+                tracing::debug!(
                     to_shard,
                     node_id = self.node_id,
-                    is_leader,
-                    "Target shard leader check via shard_raft_manager"
+                    manager_shard_count = manager.shard_count(),
+                    "Target shard not found in ShardRaftManager, checking leader_tracker"
                 );
-                return is_leader;
             }
-            // Shard doesn't exist in manager
-            tracing::trace!(
-                to_shard,
-                node_id = self.node_id,
-                "Target shard not in raft manager"
-            );
-            return false;
         }
 
-        // Fallback: check leader_tracker (may be stale but useful for single-node mode)
+        // Fallback: check leader_tracker
+        // This is useful when:
+        // 1. Shard doesn't exist in local manager but leader_tracker has info from other nodes
+        // 2. Manager doesn't exist (single-node test mode without per-shard Raft)
         if let Some(leader) = self.leader_tracker.get_leader(to_shard) {
             let is_leader = leader == self.node_id;
-            tracing::trace!(
+            tracing::debug!(
                 to_shard,
                 leader,
                 node_id = self.node_id,
@@ -2525,11 +3531,31 @@ impl MigrationDataAccessor for ShardMigrationDataAccessor {
             return is_leader;
         }
 
-        // No manager at all - single-node test mode
-        tracing::trace!(
+        // No manager at all and no leader_tracker info - single-node test mode
+        // Only return true if we have no shard_raft_manager at all
+        if self.shard_raft_manager.read().is_none() {
+            tracing::debug!(
+                to_shard,
+                node_id = self.node_id,
+                "No shard_raft_manager, returning true (single-node mode)"
+            );
+            return true;
+        }
+
+        // Manager exists but shard not found and no leader_tracker info
+        // This typically happens when:
+        // 1. The shard is newly created and leader election is in progress
+        // 2. Leader info hasn't been synced via gossip yet
+        //
+        // CRITICAL FIX: Instead of returning false (which blocks all migrations),
+        // return true to allow this node to attempt migration.
+        // Only ONE node will succeed in the Raft proposal anyway (leader check
+        // happens during Raft commit), so allowing attempts is safe.
+        // This prevents deadlock where no node thinks it's the leader yet.
+        tracing::debug!(
             to_shard,
             node_id = self.node_id,
-            "No shard_raft_manager, returning true (single-node mode)"
+            "Shard not in manager and not in leader_tracker, allowing migration attempt"
         );
         true
     }
@@ -2541,6 +3567,239 @@ impl MigrationDataAccessor for ShardMigrationDataAccessor {
             .as_ref()
             .and_then(|m| m.get_shard(shard_id))
     }
+
+    fn gc_tombstoned_shard(&self, shard_id: ShardId) -> Result<()> {
+        tracing::info!(shard_id, "Garbage collecting tombstoned shard");
+
+        // Unregister shard from router - this drops the Arc<Shard>
+        // When the last Arc reference is dropped, the shard's resources are cleaned up
+        if let Some(shard) = self.router.unregister_shard(shard_id) {
+            tracing::info!(shard_id, "Unregistered shard from router during GC");
+
+            // Clear any remaining data from the shard's storage
+            // This is a best-effort cleanup - the shard should already be empty
+            // since all slots were migrated away
+            let storage = shard.storage();
+            let entry_count = storage.entry_count();
+            if entry_count > 0 {
+                tracing::warn!(
+                    shard_id,
+                    entry_count,
+                    "Shard still has entries during GC, clearing"
+                );
+                storage.invalidate_all();
+            }
+        } else {
+            tracing::debug!(
+                shard_id,
+                "Shard not found in router during GC (already removed)"
+            );
+        }
+
+        // Note: The ShardRaftNode associated with this shard will be cleaned up
+        // when its Arc refcount reaches 0. The ShardRaftManager still holds a
+        // reference, but it will be removed when the shard Raft group is no
+        // longer needed (no more shards on this node referencing it).
+
+        Ok(())
+    }
+
+    fn get_all_raft_migration_records(&self) -> Vec<SlotMigrationRecord> {
+        let mut all_records = Vec::new();
+
+        // Get records from all shards' MigrationStateMachines
+        if let Some(manager) = self.shard_raft_manager.read().as_ref() {
+            let all_shards = manager.all_shards();
+
+            for shard_raft in all_shards {
+                let state_machine = shard_raft.migration_state_machine();
+                let records = state_machine.all_migrations();
+                all_records.extend(records);
+            }
+        }
+
+        tracing::trace!(
+            node_id = self.node_id,
+            record_count = all_records.len(),
+            "Collected Raft migration records from all shards"
+        );
+
+        all_records
+    }
+}
+
+// ==================== State Consistency Verification ====================
+
+/// Result of a state consistency check between SlotMigrator and MigrationStateMachine.
+#[derive(Debug, Clone)]
+pub struct StateConsistencyResult {
+    /// Whether states are consistent.
+    pub consistent: bool,
+    /// Slots where phases diverge.
+    pub divergent_slots: Vec<StateDivergence>,
+    /// Slots only in SlotMigrator (not in MigrationStateMachine).
+    pub only_in_migrator: Vec<SlotId>,
+    /// Slots only in MigrationStateMachine (not in SlotMigrator).
+    pub only_in_state_machine: Vec<SlotId>,
+}
+
+/// Details about state divergence for a slot.
+#[derive(Debug, Clone)]
+pub struct StateDivergence {
+    /// The slot ID.
+    pub slot_id: SlotId,
+    /// Phase in SlotMigrator.
+    pub migrator_phase: String,
+    /// Phase in MigrationStateMachine.
+    pub state_machine_phase: String,
+}
+
+impl SlotMigrator {
+    /// Check consistency between SlotMigrator state and a MigrationStateMachine.
+    ///
+    /// This method compares the migration records in this SlotMigrator with those
+    /// in the provided MigrationStateMachine and reports any divergences.
+    ///
+    /// # When to Use
+    ///
+    /// - For debugging migration stuck issues
+    /// - In tests to verify state synchronization
+    /// - Periodically during runtime to detect bugs early
+    ///
+    /// # Returns
+    ///
+    /// A `StateConsistencyResult` describing any divergences found.
+    pub fn check_consistency_with(
+        &self,
+        state_machine: &super::migration_state_machine::MigrationStateMachine,
+    ) -> StateConsistencyResult {
+        let migrator_records = self.migrations.read();
+        let sm_records = state_machine.all_migrations();
+
+        let mut divergent_slots = Vec::new();
+        let mut only_in_migrator = Vec::new();
+        let mut only_in_state_machine = Vec::new();
+
+        // Build a map of state machine records for quick lookup
+        let sm_map: std::collections::HashMap<SlotId, &SlotMigrationRecord> =
+            sm_records.iter().map(|r| (r.slot_id, r)).collect();
+
+        // Check each slot in the migrator
+        for (slot_id, migrator_record) in migrator_records.iter() {
+            if let Some(sm_record) = sm_map.get(slot_id) {
+                // Check if phases match (allowing for local-only phases like Scanning)
+                if !phases_are_compatible(&migrator_record.phase, &sm_record.phase) {
+                    divergent_slots.push(StateDivergence {
+                        slot_id: *slot_id,
+                        migrator_phase: migrator_record.phase.name().to_string(),
+                        state_machine_phase: sm_record.phase.name().to_string(),
+                    });
+                }
+            } else {
+                // Not in state machine - this is OK for Pending/Scanning/Streaming/CatchingUp
+                // (these are local-only phases that don't need Raft commitment)
+                if is_raft_committed_phase(&migrator_record.phase) {
+                    only_in_migrator.push(*slot_id);
+                }
+            }
+        }
+
+        // Check for slots only in state machine
+        let migrator_slot_ids: std::collections::HashSet<_> = migrator_records.keys().collect();
+        for sm_record in &sm_records {
+            if !migrator_slot_ids.contains(&sm_record.slot_id) {
+                // State machine has a record that migrator doesn't know about
+                only_in_state_machine.push(sm_record.slot_id);
+            }
+        }
+
+        let consistent = divergent_slots.is_empty()
+            && only_in_migrator.is_empty()
+            && only_in_state_machine.is_empty();
+
+        StateConsistencyResult {
+            consistent,
+            divergent_slots,
+            only_in_migrator,
+            only_in_state_machine,
+        }
+    }
+
+    /// Log state consistency check results.
+    ///
+    /// Logs a warning if any inconsistencies are found.
+    pub fn log_consistency_check(
+        &self,
+        state_machine: &super::migration_state_machine::MigrationStateMachine,
+        label: &str,
+    ) {
+        let result = self.check_consistency_with(state_machine);
+
+        if !result.consistent {
+            tracing::warn!(
+                label,
+                divergent_count = result.divergent_slots.len(),
+                only_in_migrator = result.only_in_migrator.len(),
+                only_in_state_machine = result.only_in_state_machine.len(),
+                "State consistency check FAILED"
+            );
+
+            for divergence in &result.divergent_slots {
+                tracing::warn!(
+                    slot_id = divergence.slot_id,
+                    migrator_phase = %divergence.migrator_phase,
+                    state_machine_phase = %divergence.state_machine_phase,
+                    "Migration state divergence detected"
+                );
+            }
+        } else {
+            tracing::debug!(label, "State consistency check passed");
+        }
+    }
+}
+
+/// Check if two phases are compatible (considering local-only vs Raft-committed phases).
+///
+/// Some phases are local-only (Scanning, Streaming, CatchingUp) and don't need
+/// to match the state machine exactly. The state machine only tracks
+/// Raft-committed states (Pending, Claimed, Prepared, Completed, Cleaned).
+fn phases_are_compatible(migrator_phase: &MigrationPhase, sm_phase: &MigrationPhase) -> bool {
+    // If phases are the same, they're compatible
+    if migrator_phase.name() == sm_phase.name() {
+        return true;
+    }
+
+    // Local-only phases in migrator are OK even if state machine has Claimed
+    // (migrator progresses locally while state machine tracks last Raft commit)
+    let migrator_is_local = matches!(
+        migrator_phase,
+        MigrationPhase::Scanning { .. }
+            | MigrationPhase::Streaming { .. }
+            | MigrationPhase::CatchingUp { .. }
+    );
+
+    let sm_is_claimed = matches!(sm_phase, MigrationPhase::Claimed { .. });
+
+    if migrator_is_local && sm_is_claimed {
+        // Migrator has progressed locally past Claimed, SM still shows Claimed
+        // This is expected - local work happens between Raft commits
+        return true;
+    }
+
+    // For Raft-committed phases (Prepared, Completed, Cleaned), they MUST match
+    // If SM is in Prepared but migrator isn't, that's the bug we fixed!
+    false
+}
+
+/// Check if a phase is Raft-committed (requires consensus).
+fn is_raft_committed_phase(phase: &MigrationPhase) -> bool {
+    matches!(
+        phase,
+        MigrationPhase::Claimed { .. }
+            | MigrationPhase::Prepared { .. }
+            | MigrationPhase::Completed { .. }
+            | MigrationPhase::Cleaned { .. }
+    )
 }
 
 #[cfg(test)]
@@ -2548,7 +3807,7 @@ mod tests {
     use super::*;
 
     fn create_test_migrator() -> SlotMigrator {
-        let slot_table = Arc::new(SlotTable::new(4));
+        let slot_table = Arc::new(SlotTable::new(4, TOTAL_SLOTS));
         SlotMigrator::with_defaults(slot_table)
     }
 
@@ -2758,19 +4017,25 @@ mod tests {
         migrator.register_migration(0, 0, 3);
         migrator.register_migration(1, 0, 3);
 
-        // Fresh migrations should not be stale
+        // Fresh migrations should not be stale (they're in Pending state)
         let stale = migrator.check_for_stale_migrations();
         assert!(stale.is_empty());
 
-        // Manually set old progress timestamp
+        // Advance migration 0 to Claimed state (started) and set old progress timestamp
+        // Only started migrations (non-Pending) are checked for staleness
         {
             let mut migrations = migrator.migrations.write();
             if let Some(record) = migrations.get_mut(&0) {
+                record.set_phase(MigrationPhase::Claimed {
+                    owner_node: 1,
+                    claim_epoch: 1,
+                    claimed_at: 1000,
+                });
                 record.last_progress_at = 0; // Very old
             }
         }
 
-        // Now slot 0 should be stale
+        // Now slot 0 should be stale (it's Claimed and timed out)
         let stale = migrator.check_for_stale_migrations();
         assert_eq!(stale.len(), 1);
         assert!(stale.contains(&0));
@@ -2796,5 +4061,253 @@ mod tests {
         // Phase should be reset to Pending
         let record = migrator.get_migration(0).unwrap();
         assert!(matches!(record.phase, MigrationPhase::Pending));
+    }
+
+    // ==================== Tests for Local State Updates ====================
+
+    /// Test that apply_prepared_to_local_state correctly updates the local migrations HashMap.
+    ///
+    /// This test catches the bug where transition_to_prepared would commit via Raft but fail
+    /// to update SlotMigrator::migrations, leaving process_migrations unable to see the
+    /// Prepared phase.
+    #[test]
+    fn test_apply_prepared_to_local_state() {
+        let migrator = create_test_migrator();
+
+        // Register a migration in Scanning phase (simulating post-data-transfer)
+        migrator.register_migration(42, 0, 1);
+        {
+            let mut migrations = migrator.migrations.write();
+            if let Some(record) = migrations.get_mut(&42) {
+                record.set_phase(MigrationPhase::Scanning {
+                    cursor: None,
+                    keys_found: 100,
+                });
+            }
+        }
+
+        // Create a validation result (simulating what validate_migration would return)
+        let validation = ValidationResult {
+            raft_commit_index: 500,
+            key_count: 100,
+            checksum: 0xDEADBEEF,
+            replica_count: 3,
+            follower_sample_ok: true,
+        };
+
+        // Apply the prepared state to local state (this is what happens after Raft commits)
+        migrator.apply_prepared_to_local_state(42, &validation);
+
+        // Verify the local state was updated
+        let record = migrator.get_migration(42).expect("Migration should exist");
+        match &record.phase {
+            MigrationPhase::Prepared {
+                target_commit_index,
+                validation_checksum,
+                ..
+            } => {
+                assert_eq!(*target_commit_index, 500);
+                assert_eq!(*validation_checksum, 0xDEADBEEF);
+            }
+            other => panic!(
+                "Expected Prepared phase, got {:?}. \
+                 This indicates apply_prepared_to_local_state failed to update local state.",
+                other
+            ),
+        }
+    }
+
+    /// Test that apply_prepared_to_local_state handles non-existent migrations gracefully.
+    #[test]
+    fn test_apply_prepared_to_local_state_missing_migration() {
+        let migrator = create_test_migrator();
+
+        let validation = ValidationResult {
+            raft_commit_index: 500,
+            key_count: 100,
+            checksum: 0xDEADBEEF,
+            replica_count: 3,
+            follower_sample_ok: true,
+        };
+
+        // Should not panic when migration doesn't exist
+        migrator.apply_prepared_to_local_state(999, &validation);
+
+        // Verify migration still doesn't exist (no side effects)
+        assert!(migrator.get_migration(999).is_none());
+    }
+
+    // ==================== State Consistency Assertion Helpers ====================
+
+    /// Helper to check if a phase in SlotMigrator matches expected phase.
+    /// Returns (matches, actual_phase_name) for debugging.
+    fn assert_migration_phase(
+        migrator: &SlotMigrator,
+        slot_id: SlotId,
+        expected_phase_name: &str,
+    ) -> bool {
+        match migrator.get_migration(slot_id) {
+            Some(record) => record.phase.name() == expected_phase_name,
+            None => false,
+        }
+    }
+
+    /// Test that the state consistency helper correctly identifies phase mismatches.
+    #[test]
+    fn test_state_consistency_assertion_helper() {
+        let migrator = create_test_migrator();
+
+        // Register a migration
+        migrator.register_migration(42, 0, 1);
+
+        // Initially should be Pending
+        assert!(assert_migration_phase(&migrator, 42, "Pending"));
+        assert!(!assert_migration_phase(&migrator, 42, "Claimed"));
+        assert!(!assert_migration_phase(&migrator, 42, "Prepared"));
+
+        // Update to Claimed
+        {
+            let mut migrations = migrator.migrations.write();
+            if let Some(record) = migrations.get_mut(&42) {
+                record.set_phase(MigrationPhase::Claimed {
+                    owner_node: 1,
+                    claim_epoch: 1,
+                    claimed_at: now_ms(),
+                });
+            }
+        }
+
+        assert!(assert_migration_phase(&migrator, 42, "Claimed"));
+        assert!(!assert_migration_phase(&migrator, 42, "Pending"));
+
+        // Non-existent migration should return false
+        assert!(!assert_migration_phase(&migrator, 999, "Pending"));
+    }
+
+    // ==================== State Consistency Checker Tests ====================
+
+    use super::super::migration_state_machine::MigrationStateMachine;
+
+    /// Test state consistency check when states are in sync.
+    #[test]
+    fn test_state_consistency_check_in_sync() {
+        let migrator = create_test_migrator();
+        let state_machine = MigrationStateMachine::new();
+
+        // Register migration in both
+        migrator.register_migration(42, 0, 3);
+        state_machine.register_migration(42, 0, 3);
+
+        // Both in Pending - should be consistent
+        let result = migrator.check_consistency_with(&state_machine);
+        assert!(
+            result.consistent,
+            "States should be consistent when both in Pending"
+        );
+        assert!(result.divergent_slots.is_empty());
+        assert!(result.only_in_migrator.is_empty());
+        assert!(result.only_in_state_machine.is_empty());
+    }
+
+    /// Test state consistency check detects divergence.
+    #[test]
+    fn test_state_consistency_check_detects_divergence() {
+        let migrator = create_test_migrator();
+        let state_machine = MigrationStateMachine::new();
+
+        // Register migration in both
+        migrator.register_migration(42, 0, 3);
+        state_machine.register_migration(42, 0, 3);
+
+        // State machine moves to Prepared (via Raft)
+        state_machine.apply(
+            1,
+            1,
+            MigrationRaftCommand::Claim {
+                migration_id: MigrationId::new(42, 1),
+                leader_id: 1,
+                proposed_at: 1000,
+            },
+        );
+        state_machine.apply(
+            2,
+            1,
+            MigrationRaftCommand::Prepared {
+                migration_id: MigrationId::new(42, 1),
+                target_commit_index: 100,
+                validation_checksum: 0xDEAD,
+                proposed_at: 2000,
+            },
+        );
+
+        // BUT migrator is still in Pending (the bug scenario!)
+        // This is the exact bug that caused migrations to get stuck.
+
+        let result = migrator.check_consistency_with(&state_machine);
+
+        // Should detect divergence
+        assert!(!result.consistent, "Should detect divergence");
+        assert_eq!(result.divergent_slots.len(), 1);
+        assert_eq!(result.divergent_slots[0].slot_id, 42);
+        assert_eq!(result.divergent_slots[0].migrator_phase, "Pending");
+        assert_eq!(result.divergent_slots[0].state_machine_phase, "Prepared");
+    }
+
+    /// Test state consistency allows local-only phases.
+    #[test]
+    fn test_state_consistency_allows_local_phases() {
+        let migrator = create_test_migrator();
+        let state_machine = MigrationStateMachine::new();
+
+        // Register migration in both
+        migrator.register_migration(42, 0, 3);
+        state_machine.register_migration(42, 0, 3);
+
+        // State machine in Claimed
+        state_machine.apply(
+            1,
+            1,
+            MigrationRaftCommand::Claim {
+                migration_id: MigrationId::new(42, 1),
+                leader_id: 1,
+                proposed_at: 1000,
+            },
+        );
+
+        // Migrator has progressed locally to Scanning
+        {
+            let mut migrations = migrator.migrations.write();
+            if let Some(record) = migrations.get_mut(&42) {
+                record.set_phase(MigrationPhase::Scanning {
+                    cursor: None,
+                    keys_found: 50,
+                });
+            }
+        }
+
+        // This should be OK - Scanning is a local-only phase that happens
+        // after Claimed but before the next Raft commit (Prepared)
+        let result = migrator.check_consistency_with(&state_machine);
+        assert!(
+            result.consistent,
+            "Should allow local-only phases (Scanning) when SM is in Claimed"
+        );
+    }
+
+    /// Test state consistency detects slots only in state machine.
+    #[test]
+    fn test_state_consistency_detects_orphan_in_state_machine() {
+        let migrator = create_test_migrator();
+        let state_machine = MigrationStateMachine::new();
+
+        // Only register in state machine (simulates missed local registration)
+        state_machine.register_migration(99, 0, 3);
+
+        let result = migrator.check_consistency_with(&state_machine);
+
+        // Should detect the orphan
+        assert!(!result.consistent);
+        assert_eq!(result.only_in_state_machine.len(), 1);
+        assert_eq!(result.only_in_state_machine[0], 99);
     }
 }

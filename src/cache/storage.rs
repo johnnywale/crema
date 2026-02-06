@@ -6,7 +6,7 @@ use bytes::Bytes;
 use moka::future::Cache;
 use parking_lot::RwLock;
 use std::collections::{BTreeSet, HashMap};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU16, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -36,6 +36,9 @@ pub struct CacheStorage {
     /// Maps slot_id -> set of keys in that slot.
     /// This is only populated when slot indexing is enabled.
     slot_index: RwLock<Option<HashMap<SlotId, BTreeSet<Bytes>>>>,
+
+    /// Configurable total number of slots (default: TOTAL_SLOTS).
+    total_slots: AtomicU16,
 }
 
 impl CacheStorage {
@@ -68,6 +71,7 @@ impl CacheStorage {
             misses: AtomicU64::new(0),
             expirations: RwLock::new(HashMap::new()),
             slot_index: RwLock::new(None),
+            total_slots: AtomicU16::new(TOTAL_SLOTS),
         }
     }
 
@@ -85,7 +89,7 @@ impl CacheStorage {
             // Build index from existing data (O(N) once)
             for (key_arc, _) in self.cache.iter() {
                 let key = (*key_arc).clone();
-                let slot = Self::key_to_slot(&key);
+                let slot = self.instance_key_to_slot(&key);
                 index.entry(slot).or_default().insert(key);
             }
 
@@ -93,22 +97,35 @@ impl CacheStorage {
         }
     }
 
+    /// Set the total number of slots for this storage instance.
+    /// Must be called before `enable_slot_indexing()`.
+    pub fn set_total_slots(&self, total_slots: u16) {
+        self.total_slots.store(total_slots, Ordering::Relaxed);
+    }
+
     /// Check if slot indexing is enabled.
     pub fn has_slot_indexing(&self) -> bool {
         self.slot_index.read().is_some()
     }
 
-    /// Compute the slot for a key using CRC16 (XMODEM variant).
+    /// Compute the slot for a key using CRC16 (XMODEM variant) with the default TOTAL_SLOTS.
     #[inline]
     pub fn key_to_slot(key: &[u8]) -> SlotId {
         let crc = crc16(key);
         crc % TOTAL_SLOTS
     }
 
+    /// Compute the slot for a key using this instance's configured total_slots.
+    #[inline]
+    fn instance_key_to_slot(&self, key: &[u8]) -> SlotId {
+        let crc = crc16(key);
+        crc % self.total_slots.load(Ordering::Relaxed)
+    }
+
     /// Add a key to the slot index.
     fn add_to_slot_index(&self, key: &Bytes) {
         if let Some(ref mut index) = *self.slot_index.write() {
-            let slot = Self::key_to_slot(key);
+            let slot = self.instance_key_to_slot(key);
             index.entry(slot).or_default().insert(key.clone());
         }
     }
@@ -116,7 +133,7 @@ impl CacheStorage {
     /// Remove a key from the slot index.
     fn remove_from_slot_index(&self, key: &Bytes) {
         if let Some(ref mut index) = *self.slot_index.write() {
-            let slot = Self::key_to_slot(key);
+            let slot = self.instance_key_to_slot(key);
             if let Some(keys) = index.get_mut(&slot) {
                 keys.remove(key);
                 if keys.is_empty() {
@@ -196,7 +213,7 @@ impl CacheStorage {
             }
 
             // Check if key belongs to this slot
-            if Self::key_to_slot(&key) == slot_id {
+            if self.instance_key_to_slot(&key) == slot_id {
                 keys.push(key.clone());
                 if keys.len() >= limit {
                     next_cursor = Some(key);
@@ -215,9 +232,13 @@ impl CacheStorage {
             index.get(&slot_id).map(|s| s.len() as u64).unwrap_or(0)
         } else {
             // Slow path
+            let total_slots = self.total_slots.load(Ordering::Relaxed);
             self.cache
                 .iter()
-                .filter(|(k, _)| Self::key_to_slot(k) == slot_id)
+                .filter(|(k, _)| {
+                    let crc = crc16(k);
+                    crc % total_slots == slot_id
+                })
                 .count() as u64
         }
     }
@@ -231,9 +252,13 @@ impl CacheStorage {
                 .map(|s| s.iter().cloned().collect())
                 .unwrap_or_default()
         } else {
+            let total_slots = self.total_slots.load(Ordering::Relaxed);
             self.cache
                 .iter()
-                .filter(|(k, _)| Self::key_to_slot(k) == slot_id)
+                .filter(|(k, _)| {
+                    let crc = crc16(k);
+                    crc % total_slots == slot_id
+                })
                 .map(|(k, _)| (*k).clone())
                 .collect()
         }

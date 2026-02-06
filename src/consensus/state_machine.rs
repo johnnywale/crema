@@ -3,10 +3,18 @@
 use crate::cache::storage::CacheStorage;
 use crate::types::CacheCommand;
 use bytes::Bytes;
+use parking_lot::RwLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tracing::{debug, error};
+
+/// Callback type for handling migration commands.
+///
+/// When a migration command is detected during apply, this callback is invoked
+/// with the index, term, and raw data. The callback is responsible for parsing
+/// the migration command and applying it to the MigrationStateMachine.
+pub type MigrationCallback = Arc<dyn Fn(u64, u64, &[u8]) + Send + Sync>;
 
 /// The cache state machine that applies committed Raft entries.
 ///
@@ -28,6 +36,10 @@ pub struct CacheStateMachine {
     /// The last snapshot index that was installed.
     /// Used to track the snapshot boundary and prevent data loss during migration.
     last_snapshot_index: AtomicU64,
+
+    /// Optional callback for handling migration commands.
+    /// When set, migration commands are forwarded to this callback instead of being dropped.
+    migration_callback: RwLock<Option<MigrationCallback>>,
 }
 
 impl CacheStateMachine {
@@ -39,7 +51,17 @@ impl CacheStateMachine {
             applied_term: AtomicU64::new(0),
             commands_applied: AtomicU64::new(0),
             last_snapshot_index: AtomicU64::new(0),
+            migration_callback: RwLock::new(None),
         }
+    }
+
+    /// Set the callback for handling migration commands.
+    ///
+    /// When a migration command is detected during apply, it will be forwarded
+    /// to this callback instead of being dropped. This is used by ShardRaftNode
+    /// to route migration commands to the MigrationStateMachine.
+    pub fn set_migration_callback(&self, callback: MigrationCallback) {
+        *self.migration_callback.write() = Some(callback);
     }
 
     /// Apply a committed entry to the state machine.
@@ -81,10 +103,19 @@ impl CacheStateMachine {
         // (MigrationId alone is 10 bytes, plus 4 byte discriminant = 14+ bytes payload)
         const MIGRATION_COMMAND_TAG: u8 = 0x02;
         if data.len() > 4 && data[0] == MIGRATION_COMMAND_TAG {
-            debug!(
-                index,
-                "STATE_MACHINE: Skipping migration command (handled by MigrationStateMachine)"
-            );
+            // Forward to migration callback if set
+            if let Some(callback) = self.migration_callback.read().as_ref() {
+                debug!(
+                    index,
+                    "STATE_MACHINE: Forwarding migration command to MigrationStateMachine"
+                );
+                callback(index, term, data);
+            } else {
+                debug!(
+                    index,
+                    "STATE_MACHINE: Skipping migration command (no callback set)"
+                );
+            }
             self.update_applied(index, term);
             return;
         }

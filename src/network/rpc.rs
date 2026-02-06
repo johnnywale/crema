@@ -78,11 +78,32 @@ pub enum Message {
     /// Ack for shard creation broadcast.
     ShardCreationAck(ShardCreationAck),
 
+    /// Broadcast shard removal to cluster.
+    ShardRemovalBroadcast(ShardRemovalBroadcast),
+
+    /// Ack for shard removal broadcast.
+    ShardRemovalAck(ShardRemovalAck),
+
     /// Request current topology (for catch-up).
     GetTopology(GetTopologyRequest),
 
     /// Response with current topology.
     TopologyResponse(TopologyResponse),
+
+    /// Request shard info for dashboard comparison.
+    GetShardInfo(GetShardInfoRequest),
+
+    /// Response with shard info for dashboard comparison.
+    ShardInfoResponse(ShardInfoResponse),
+
+    // ==================== Slot Migration Scan Messages ====================
+    /// Request to scan keys in a specific slot from a shard.
+    /// Used when the migration driver (target shard leader) is on a different
+    /// node than the source shard.
+    SlotScanRequest(SlotScanRequest),
+
+    /// Response with keys from a slot scan.
+    SlotScanResponse(SlotScanResponse),
 }
 
 /// Wrapper for Raft messages (since RaftMessage uses protobuf).
@@ -912,6 +933,83 @@ impl ShardCreationAck {
     }
 }
 
+/// Broadcast shard removal to cluster.
+///
+/// Sent by the node that initiates `remove_shard_dynamic()` to inform all peers
+/// about the shard being removed and the slot reassignments. Peers should update
+/// their slot tables and mark the shard as removing.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ShardRemovalBroadcast {
+    /// Unique request ID for correlation.
+    pub request_id: u64,
+    /// The shard ID being removed.
+    pub shard_id: ShardId,
+    /// Slot reassignments: (slot_id, new_owner_shard_id).
+    /// These are the slots being moved from the removed shard to other shards.
+    pub slot_reassignments: Vec<(u16, ShardId)>,
+    /// The new epoch after this topology change.
+    pub new_epoch: u64,
+    /// Node ID of the originator of this broadcast.
+    pub originator_node: NodeId,
+}
+
+impl ShardRemovalBroadcast {
+    /// Create a new shard removal broadcast.
+    pub fn new(
+        request_id: u64,
+        shard_id: ShardId,
+        slot_reassignments: Vec<(u16, ShardId)>,
+        new_epoch: u64,
+        originator_node: NodeId,
+    ) -> Self {
+        Self {
+            request_id,
+            shard_id,
+            slot_reassignments,
+            new_epoch,
+            originator_node,
+        }
+    }
+}
+
+/// Acknowledgment for shard removal broadcast.
+///
+/// Sent by peers in response to `ShardRemovalBroadcast` to indicate
+/// whether they successfully applied the topology change.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ShardRemovalAck {
+    /// The request ID this is responding to.
+    pub request_id: u64,
+    /// Whether the broadcast was successfully applied.
+    pub success: bool,
+    /// The local epoch after processing.
+    pub local_epoch: u64,
+    /// Error message if failed.
+    pub error: Option<String>,
+}
+
+impl ShardRemovalAck {
+    /// Create a success response.
+    pub fn success(request_id: u64, local_epoch: u64) -> Self {
+        Self {
+            request_id,
+            success: true,
+            local_epoch,
+            error: None,
+        }
+    }
+
+    /// Create an error response.
+    pub fn error(request_id: u64, local_epoch: u64, error: impl Into<String>) -> Self {
+        Self {
+            request_id,
+            success: false,
+            local_epoch,
+            error: Some(error.into()),
+        }
+    }
+}
+
 /// Request current topology (for catch-up).
 ///
 /// Sent by a node that needs to synchronize its topology state,
@@ -967,6 +1065,161 @@ impl TopologyResponse {
             current_epoch,
             shard_ids,
             slot_assignments,
+        }
+    }
+}
+
+/// Request for shard information (for dashboard cluster comparison).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GetShardInfoRequest {
+    /// Unique request ID for correlation.
+    pub request_id: u64,
+    /// Node ID of the requesting node.
+    pub requesting_node: NodeId,
+}
+
+impl GetShardInfoRequest {
+    /// Create a new shard info request.
+    pub fn new(request_id: u64, requesting_node: NodeId) -> Self {
+        Self {
+            request_id,
+            requesting_node,
+        }
+    }
+}
+
+/// Shard information for a single shard (for dashboard comparison).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RemoteShardInfo {
+    /// Shard ID.
+    pub shard_id: ShardId,
+    /// Whether the shard is active.
+    pub is_active: bool,
+    /// Whether this node is the leader for this shard.
+    pub is_leader: bool,
+    /// Known leader ID for this shard (if any).
+    pub leader_id: Option<NodeId>,
+    /// Number of entries in this shard.
+    pub entry_count: u64,
+    /// Current Raft term.
+    pub term: u64,
+    /// Number of slots assigned to this shard.
+    pub slot_count: usize,
+    /// Number of slots being migrated to this shard.
+    pub incoming_slots: usize,
+    /// Number of slots being migrated from this shard.
+    pub outgoing_slots: usize,
+}
+
+/// Response with shard information (for dashboard cluster comparison).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ShardInfoResponse {
+    /// The request ID this is responding to.
+    pub request_id: u64,
+    /// Node ID of the responding node.
+    pub responding_node: NodeId,
+    /// List of shards on this node.
+    pub shards: Vec<RemoteShardInfo>,
+    /// Whether multiraft is enabled.
+    pub multiraft_enabled: bool,
+    /// Current slot table epoch (if slot routing enabled).
+    pub slot_epoch: Option<u64>,
+}
+
+impl ShardInfoResponse {
+    /// Create a new shard info response.
+    pub fn new(
+        request_id: u64,
+        responding_node: NodeId,
+        shards: Vec<RemoteShardInfo>,
+        multiraft_enabled: bool,
+        slot_epoch: Option<u64>,
+    ) -> Self {
+        Self {
+            request_id,
+            responding_node,
+            shards,
+            multiraft_enabled,
+            slot_epoch,
+        }
+    }
+}
+
+// ==================== Slot Migration Scan Message Types ====================
+
+/// Request to scan keys in a specific slot from a shard.
+///
+/// Used during slot migration when the migration driver (target shard leader)
+/// needs to scan keys from a source shard that is on a different node.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SlotScanRequest {
+    /// Unique request ID for correlation.
+    pub request_id: u64,
+    /// The shard to scan from.
+    pub shard_id: ShardId,
+    /// The slot to scan.
+    pub slot_id: u32,
+    /// Cursor from previous scan (for pagination).
+    /// None means start from the beginning.
+    pub cursor: Option<Vec<u8>>,
+    /// Maximum number of keys to return.
+    pub limit: usize,
+}
+
+impl SlotScanRequest {
+    /// Create a new slot scan request.
+    pub fn new(
+        request_id: u64,
+        shard_id: ShardId,
+        slot_id: u32,
+        cursor: Option<Vec<u8>>,
+        limit: usize,
+    ) -> Self {
+        Self {
+            request_id,
+            shard_id,
+            slot_id,
+            cursor,
+            limit: limit.clamp(1, 10_000),
+        }
+    }
+}
+
+/// Response to a slot scan request.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SlotScanResponse {
+    /// The request ID this is responding to.
+    pub request_id: u64,
+    /// Whether the scan succeeded.
+    pub success: bool,
+    /// Error message if failed.
+    pub error: Option<String>,
+    /// Keys found in the slot.
+    pub keys: Vec<Vec<u8>>,
+    /// Cursor for next scan (None if scan complete).
+    pub next_cursor: Option<Vec<u8>>,
+}
+
+impl SlotScanResponse {
+    /// Create a successful response.
+    pub fn success(request_id: u64, keys: Vec<Vec<u8>>, next_cursor: Option<Vec<u8>>) -> Self {
+        Self {
+            request_id,
+            success: true,
+            error: None,
+            keys,
+            next_cursor,
+        }
+    }
+
+    /// Create an error response.
+    pub fn error(request_id: u64, error: impl Into<String>) -> Self {
+        Self {
+            request_id,
+            success: false,
+            error: Some(error.into()),
+            keys: Vec::new(),
+            next_cursor: None,
         }
     }
 }

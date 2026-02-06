@@ -198,8 +198,44 @@ impl ShardRaftNode {
         transport: Arc<ShardTransportMultiplexer>,
         local_addr: String,
     ) -> Result<Arc<Self>> {
+        // Create migration state machine for this shard FIRST
+        // (needs to be set up before state_machine so callback can reference it)
+        let migration_state_machine = Arc::new(MigrationStateMachine::new());
+
         // Create state machine for this shard
         let state_machine = Arc::new(CacheStateMachine::new(storage.clone()));
+
+        // Set up migration callback to route migration commands to MigrationStateMachine
+        // The callback parses the tagged data and applies to the migration state machine
+        let migration_sm_for_callback = migration_state_machine.clone();
+        let shard_id_for_callback = shard_id;
+        state_machine.set_migration_callback(Arc::new(move |index, term, data| {
+            // Parse the migration command from the tagged data
+            // Data format: [0x02 tag][bincode MigrationRaftCommand]
+            if data.len() <= 1 {
+                tracing::warn!(
+                    shard_id = shard_id_for_callback,
+                    index,
+                    "Migration command data too short"
+                );
+                return;
+            }
+
+            // Skip the tag byte and deserialize the command
+            match bincode::deserialize::<MigrationRaftCommand>(&data[1..]) {
+                Ok(command) => {
+                    migration_sm_for_callback.apply(index, term, command);
+                }
+                Err(e) => {
+                    tracing::error!(
+                        shard_id = shard_id_for_callback,
+                        index,
+                        error = %e,
+                        "Failed to deserialize migration command"
+                    );
+                }
+            }
+        }));
 
         // Create shard-aware transport adapter
         // This ensures Raft messages are tagged with the shard_id so they
@@ -221,9 +257,6 @@ impl ShardRaftNode {
         let message_rx = transport.register_shard(shard_id);
 
         let peer_set: HashSet<NodeId> = peers.into_iter().collect();
-
-        // Create migration state machine for this shard
-        let migration_state_machine = Arc::new(MigrationStateMachine::new());
 
         let shard_node = Arc::new(Self {
             shard_id,

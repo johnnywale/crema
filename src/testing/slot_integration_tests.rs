@@ -16,7 +16,7 @@ mod slot_table_tests {
     #[test]
     fn test_st01_initial_distribution() {
         for num_shards in [1, 2, 4, 8, 16] {
-            let table = SlotTable::new(num_shards);
+            let table = SlotTable::new(num_shards, TOTAL_SLOTS);
             let expected_per_shard = TOTAL_SLOTS / num_shards;
 
             for shard_id in 0..num_shards as u32 {
@@ -69,7 +69,7 @@ mod slot_table_tests {
     /// ST-04: Verify route() returns correct shard for a key.
     #[test]
     fn test_st04_route_correctness() {
-        let table = SlotTable::new(4);
+        let table = SlotTable::new(4, TOTAL_SLOTS);
 
         // Route several keys and verify consistency
         for i in 0..100 {
@@ -87,10 +87,10 @@ mod slot_table_tests {
     /// ST-05: Verify epoch increments on slot table changes.
     #[test]
     fn test_st05_epoch_increments() {
-        let table = SlotTable::new(4);
+        let table = SlotTable::new(4, TOTAL_SLOTS);
         assert_eq!(table.epoch().value(), 1, "Initial epoch should be 1");
 
-        // Reassign slots
+        // Reassign slots - ownership changes, epoch should increment
         table.reassign_slots(&[0, 1, 2], 3);
         assert_eq!(
             table.epoch().value(),
@@ -98,20 +98,21 @@ mod slot_table_tests {
             "Epoch should increment after reassign"
         );
 
-        // Mark imported
+        // Mark imported - state change only, epoch should NOT increment
+        // (Epoch only changes when ownership changes, not state transitions)
         table.mark_imported(0);
         assert_eq!(
             table.epoch().value(),
-            3,
-            "Epoch should increment after mark_imported"
+            2,
+            "Epoch should NOT increment after mark_imported (state change only)"
         );
 
-        // Mark stable
+        // Mark stable - state change only, epoch should NOT increment
         table.mark_stable(0);
         assert_eq!(
             table.epoch().value(),
-            4,
-            "Epoch should increment after mark_stable"
+            2,
+            "Epoch should NOT increment after mark_stable (state change only)"
         );
     }
 
@@ -130,7 +131,7 @@ mod slot_table_tests {
     /// ST-07: Verify reassign_slots updates ownership correctly.
     #[test]
     fn test_st07_reassign_slots() {
-        let table = SlotTable::new(4);
+        let table = SlotTable::new(4, TOTAL_SLOTS);
 
         // Get slots 0-9 and reassign to shard 3
         // Note: With 4 shards and even distribution, some slots already belong to shard 3
@@ -160,7 +161,7 @@ mod slot_table_tests {
     /// ST-08: Verify compute_rebalance_for_new_shard calculates correct slots to steal.
     #[test]
     fn test_st08_rebalance_calculation() {
-        let table = SlotTable::new(4);
+        let table = SlotTable::new(4, TOTAL_SLOTS);
 
         // Each shard has 256 slots, adding 5th shard should steal ~204 slots
         let slots_to_move = table.compute_rebalance_for_new_shard(4);
@@ -178,7 +179,7 @@ mod slot_table_tests {
     /// ST-09: Verify compute_drain_for_shard redistributes all slots.
     #[test]
     fn test_st09_drain_calculation() {
-        let table = SlotTable::new(4);
+        let table = SlotTable::new(4, TOTAL_SLOTS);
 
         let drain_plan = table.compute_drain_for_shard(2);
 
@@ -196,7 +197,7 @@ mod slot_table_tests {
     /// ST-10: Verify snapshot captures complete state.
     #[test]
     fn test_st10_snapshot_completeness() {
-        let table = SlotTable::new(4);
+        let table = SlotTable::new(4, TOTAL_SLOTS);
 
         // Make some changes
         table.reassign_slots(&[0, 1], 3);
@@ -220,7 +221,7 @@ mod slot_table_tests {
     fn test_st11_concurrent_access() {
         use std::thread;
 
-        let table = Arc::new(SlotTable::new(4));
+        let table = Arc::new(SlotTable::new(4, TOTAL_SLOTS));
         let mut handles = vec![];
 
         // Spawn reader threads
@@ -251,7 +252,7 @@ mod slot_table_tests {
     /// ST-12: Verify slot state transitions are valid.
     #[test]
     fn test_st12_slot_state_transitions() {
-        let table = SlotTable::new(4);
+        let table = SlotTable::new(4, TOTAL_SLOTS);
 
         // Initial state should be Stable
         let initial = table.get_slot(0);
@@ -284,7 +285,7 @@ mod slot_control_plane_tests {
     use std::time::Duration;
 
     fn create_control_plane(num_shards: usize) -> SlotControlPlane {
-        let table = Arc::new(SlotTable::new(num_shards));
+        let table = Arc::new(SlotTable::new(num_shards, TOTAL_SLOTS));
         SlotControlPlane::with_defaults(table)
     }
 
@@ -387,7 +388,7 @@ mod slot_control_plane_tests {
     #[test]
     fn test_scp08_gc_candidates() {
         let cp = SlotControlPlane::new(
-            Arc::new(SlotTable::new(4)),
+            Arc::new(SlotTable::new(4, TOTAL_SLOTS)),
             ControlPlaneConfig {
                 tombstone_grace_period: Duration::from_millis(0),
                 ..Default::default()
@@ -405,7 +406,7 @@ mod slot_control_plane_tests {
     #[test]
     fn test_scp09_gc_shard() {
         let cp = SlotControlPlane::new(
-            Arc::new(SlotTable::new(4)),
+            Arc::new(SlotTable::new(4, TOTAL_SLOTS)),
             ControlPlaneConfig {
                 tombstone_grace_period: Duration::from_millis(0),
                 ..Default::default()
@@ -483,12 +484,12 @@ mod slot_control_plane_tests {
 #[cfg(test)]
 mod slot_migration_tests {
     use crate::multiraft::slot_migration::{MigrationPhase, SlotMigrationRecord, SlotMigrator};
-    use crate::multiraft::slot_table::SlotTable;
+    use crate::multiraft::slot_table::{SlotTable, TOTAL_SLOTS};
     use std::sync::Arc;
     use std::time::Duration;
 
     fn create_migrator() -> SlotMigrator {
-        let table = Arc::new(SlotTable::new(4));
+        let table = Arc::new(SlotTable::new(4, TOTAL_SLOTS));
         SlotMigrator::with_defaults(table)
     }
 
@@ -653,7 +654,7 @@ mod integration_tests {
     #[test]
     fn test_int01_add_shard_flow() {
         // Create components
-        let slot_table = Arc::new(SlotTable::new(4));
+        let slot_table = Arc::new(SlotTable::new(4, TOTAL_SLOTS));
         let control_plane = Arc::new(SlotControlPlane::new(
             slot_table.clone(),
             ControlPlaneConfig::default(),
@@ -690,7 +691,7 @@ mod integration_tests {
     /// INT-02: Verify remove_shard flow across all components.
     #[test]
     fn test_int02_remove_shard_flow() {
-        let slot_table = Arc::new(SlotTable::new(4));
+        let slot_table = Arc::new(SlotTable::new(4, TOTAL_SLOTS));
         let control_plane = Arc::new(SlotControlPlane::new(
             slot_table.clone(),
             ControlPlaneConfig::default(),
@@ -724,7 +725,7 @@ mod integration_tests {
     /// INT-03: Verify epoch consistency across components.
     #[test]
     fn test_int03_epoch_consistency() {
-        let slot_table = Arc::new(SlotTable::new(4));
+        let slot_table = Arc::new(SlotTable::new(4, TOTAL_SLOTS));
         let control_plane = Arc::new(SlotControlPlane::new(
             slot_table.clone(),
             ControlPlaneConfig::default(),
@@ -744,7 +745,7 @@ mod integration_tests {
     /// INT-04: Verify slot ownership tracking is consistent.
     #[test]
     fn test_int04_slot_ownership_consistency() {
-        let slot_table = Arc::new(SlotTable::new(4));
+        let slot_table = Arc::new(SlotTable::new(4, TOTAL_SLOTS));
         let control_plane = Arc::new(SlotControlPlane::new(
             slot_table.clone(),
             ControlPlaneConfig::default(),
@@ -773,7 +774,7 @@ mod integration_tests {
     /// INT-05: Verify drain progress updates control plane and slot table.
     #[test]
     fn test_int05_drain_progress_sync() {
-        let slot_table = Arc::new(SlotTable::new(4));
+        let slot_table = Arc::new(SlotTable::new(4, TOTAL_SLOTS));
         let control_plane = Arc::new(SlotControlPlane::new(
             slot_table.clone(),
             ControlPlaneConfig::default(),
@@ -798,7 +799,7 @@ mod integration_tests {
     /// INT-06: Verify routing uses correct epoch.
     #[test]
     fn test_int06_routing_epoch() {
-        let slot_table = Arc::new(SlotTable::new(4));
+        let slot_table = Arc::new(SlotTable::new(4, TOTAL_SLOTS));
 
         let result1 = slot_table.route(b"test-key");
         let initial_epoch = result1.epoch;
@@ -810,57 +811,5 @@ mod integration_tests {
 
         // Epoch should have changed
         assert!(result2.epoch > initial_epoch);
-    }
-}
-
-// Placeholder for E2E tests with DistributedCache
-// These would require the full cache infrastructure
-#[cfg(test)]
-mod e2e_tests {
-    /// E2E-01: Full add_shard with data migration.
-    /// This test requires the full DistributedCache and would be implemented
-    /// as an integration test that actually starts the cache.
-    #[test]
-    #[ignore = "Requires full cache infrastructure"]
-    fn test_e2e01_add_shard_with_migration() {
-        // Would test:
-        // 1. Start cache with 4 shards
-        // 2. Insert data
-        // 3. Add 5th shard
-        // 4. Verify data is accessible during and after migration
-        // 5. Verify slot distribution is balanced
-    }
-
-    /// E2E-02: Full remove_shard with data drain.
-    #[test]
-    #[ignore = "Requires full cache infrastructure"]
-    fn test_e2e02_remove_shard_with_drain() {
-        // Would test:
-        // 1. Start cache with 4 shards
-        // 2. Insert data
-        // 3. Remove shard 3
-        // 4. Verify data is accessible during drain
-        // 5. Verify shard reaches tombstone state
-    }
-
-    /// E2E-03: MOVED redirect handling.
-    #[test]
-    #[ignore = "Requires full cache infrastructure"]
-    fn test_e2e03_moved_redirect() {
-        // Would test client receiving MOVED redirect and updating slot cache
-    }
-
-    /// E2E-04: ASK redirect during migration.
-    #[test]
-    #[ignore = "Requires full cache infrastructure"]
-    fn test_e2e04_ask_redirect() {
-        // Would test client receiving ASK redirect during active migration
-    }
-
-    /// E2E-05: Concurrent add/remove operations.
-    #[test]
-    #[ignore = "Requires full cache infrastructure"]
-    fn test_e2e05_concurrent_operations() {
-        // Would test multiple add/remove operations happening concurrently
     }
 }

@@ -406,6 +406,45 @@ impl SlotControlPlane {
         })
     }
 
+    /// Register a shard that was created on another node.
+    ///
+    /// This is called when receiving a shard creation broadcast from another node.
+    /// It ensures the shard is registered in the control plane so it can be
+    /// removed later if needed.
+    pub fn register_remote_shard(&self, shard_id: ShardId, slot_count: usize) {
+        let mut states = self.shard_states.write();
+
+        // Only register if not already present
+        if states.contains_key(&shard_id) {
+            tracing::debug!(
+                shard_id,
+                "Shard already registered in control plane, skipping"
+            );
+            return;
+        }
+
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+
+        states.insert(
+            shard_id,
+            ShardControlInfo {
+                shard_id,
+                state: ShardState::Active,
+                slot_count,
+                created_at_ms: now_ms,
+            },
+        );
+
+        tracing::info!(
+            shard_id,
+            slot_count,
+            "Registered remote shard in control plane"
+        );
+    }
+
     /// Remove a shard from the cluster.
     ///
     /// This marks the shard as draining and computes a plan to redistribute
@@ -647,15 +686,16 @@ impl SlotControlPlane {
         }
 
         // Check total slots
-        let total_slots: usize = (0..TOTAL_SLOTS as SlotId)
+        let expected_total = self.slot_table.total_slots();
+        let total_slots: usize = (0..expected_total as SlotId)
             .map(|s| self.slot_table.slot_owner(s))
             .filter(|owner| states.contains_key(owner))
             .count();
 
-        if total_slots != TOTAL_SLOTS {
+        if total_slots != expected_total {
             errors.push(format!(
                 "Total slots mismatch: expected {}, got {}",
-                TOTAL_SLOTS, total_slots
+                expected_total, total_slots
             ));
         }
 
@@ -679,7 +719,7 @@ mod tests {
     use super::*;
 
     fn create_test_control_plane(num_shards: usize) -> SlotControlPlane {
-        let slot_table = Arc::new(SlotTable::new(num_shards));
+        let slot_table = Arc::new(SlotTable::new(num_shards, TOTAL_SLOTS));
         SlotControlPlane::with_defaults(slot_table)
     }
 
@@ -776,7 +816,7 @@ mod tests {
     #[test]
     fn test_gc_candidates() {
         let cp = SlotControlPlane::new(
-            Arc::new(SlotTable::new(4)),
+            Arc::new(SlotTable::new(4, TOTAL_SLOTS)),
             ControlPlaneConfig {
                 tombstone_grace_period: Duration::from_millis(0), // Immediate
                 ..Default::default()
@@ -793,7 +833,7 @@ mod tests {
     #[test]
     fn test_gc_shard() {
         let cp = SlotControlPlane::new(
-            Arc::new(SlotTable::new(4)),
+            Arc::new(SlotTable::new(4, TOTAL_SLOTS)),
             ControlPlaneConfig {
                 tombstone_grace_period: Duration::from_millis(0),
                 ..Default::default()

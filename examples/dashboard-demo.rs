@@ -280,44 +280,44 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Start traffic generator in background
     // All traffic goes to a single follower node (per-shard Raft forwards to leaders)
     // Generates ~1000 ops/sec (batch of 10 ops every 10ms)
-    let traffic_cache = caches[follower_idx].clone();
-    let mut shutdown_rx = shutdown_tx.subscribe();
-    let traffic_node_id = follower_idx + 1;
-
-    println!(
-        "Starting traffic generator targeting follower Node {}...",
-        traffic_node_id
-    );
-
-    tokio::spawn(async move {
-        let mut counter = 0u64;
-        loop {
-            tokio::select! {
-                _ = shutdown_rx.recv() => break,
-                _ = tokio::time::sleep(Duration::from_millis(10)) => {
-                    // Batch of 10 operations per tick for higher throughput
-                    for _ in 0..10 {
-                        counter += 1;
-
-                        // All traffic goes to the follower node
-                        // Per-shard Raft will forward writes to the appropriate shard leader
-
-                        // 80% reads, 20% writes
-                        if counter % 5 == 0 {
-                            // Write
-                            let key = format!("traffic:{}", counter % 200);
-                            let value = format!("val-{}-{}", counter, chrono_lite_timestamp());
-                            let _ = traffic_cache.put(key, value).await;
-                        } else {
-                            // Read
-                            let key = format!("key:{:03}", counter % 100);
-                            let _ = traffic_cache.get(key.as_bytes()).await;
-                        }
-                    }
-                }
-            }
-        }
-    });
+    // let traffic_cache = caches[follower_idx].clone();
+    // let mut shutdown_rx = shutdown_tx.subscribe();
+    // let traffic_node_id = follower_idx + 1;
+    //
+    // println!(
+    //     "Starting traffic generator targeting follower Node {}...",
+    //     traffic_node_id
+    // );
+    //
+    // tokio::spawn(async move {
+    //     let mut counter = 0u64;
+    //     loop {
+    //         tokio::select! {
+    //             _ = shutdown_rx.recv() => break,
+    //             _ = tokio::time::sleep(Duration::from_millis(10)) => {
+    //                 // Batch of 10 operations per tick for higher throughput
+    //                 for _ in 0..10 {
+    //                     counter += 1;
+    //
+    //                     // All traffic goes to the follower node
+    //                     // Per-shard Raft will forward writes to the appropriate shard leader
+    //
+    //                     // 80% reads, 20% writes
+    //                     if counter % 5 == 0 {
+    //                         // Write
+    //                         let key = format!("traffic:{}", counter % 200);
+    //                         let value = format!("val-{}-{}", counter, chrono_lite_timestamp());
+    //                         let _ = traffic_cache.put(key, value).await;
+    //                     } else {
+    //                         // Read
+    //                         let key = format!("key:{:03}", counter % 100);
+    //                         let _ = traffic_cache.get(key.as_bytes()).await;
+    //                     }
+    //                 }
+    //             }
+    //         }
+    //     }
+    // });
 
     println!();
     println!("===========================================");
@@ -328,10 +328,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("  Node 2: http://localhost:8082");
     println!("  Node 3: http://localhost:8083");
     println!();
-    println!(
-        "Traffic generator running (~1000 ops/sec via follower Node {})",
-        traffic_node_id
-    );
+    // println!(
+    //     "Traffic generator running (~1000 ops/sec via follower Node {})",
+    //     traffic_node_id
+    // );
     println!();
     println!("Press Ctrl+C to stop...");
     println!();

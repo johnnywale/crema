@@ -17,7 +17,7 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use crate::multiraft::migration_routing::DualWriteTracker;
-    use crate::multiraft::slot_table::SlotTable;
+    use crate::multiraft::slot_table::{SlotTable, TOTAL_SLOTS};
     use crate::testing::eventually;
     use crate::testing::utils::allocate_os_ports_with_memberlist;
     use crate::{
@@ -628,7 +628,7 @@ mod tests {
     /// Issue #18: Lock Ordering Consistency
     #[tokio::test]
     async fn fix_18_lock_ordering() {
-        let st = Arc::new(SlotTable::new(4));
+        let st = Arc::new(SlotTable::new(4, TOTAL_SLOTS));
         let mut handles = Vec::new();
 
         for i in 0..10 {
@@ -716,7 +716,7 @@ mod tests {
     /// Combined stress test
     #[tokio::test]
     async fn stress_combined() {
-        let st = Arc::new(SlotTable::new(4));
+        let st = Arc::new(SlotTable::new(4, TOTAL_SLOTS));
         let tracker = Arc::new(DualWriteTracker::new());
         let mut handles = Vec::new();
 

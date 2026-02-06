@@ -34,10 +34,21 @@ pub async fn get_shards(State(cache): State<AppState>) -> Json<ShardsResponse> {
     // Get slot table snapshot for slot info (if slot routing is enabled)
     let slot_snapshot = cache.slot_table();
 
-    // Calculate total entries for percentage
-    let total_entries: u64 = shard_infos.iter().map(|s| s.entry_count).sum();
+    // Filter out shards that are being removed or stopped - they should not appear in UI
+    let visible_shard_infos: Vec<_> = shard_infos
+        .into_iter()
+        .filter(|info| {
+            !matches!(
+                info.state,
+                crate::multiraft::ShardState::Removing | crate::multiraft::ShardState::Stopped
+            )
+        })
+        .collect();
 
-    let shards: Vec<ShardInfoResponse> = shard_infos
+    // Calculate total entries for percentage (only from visible shards)
+    let total_entries: u64 = visible_shard_infos.iter().map(|s| s.entry_count).sum();
+
+    let shards: Vec<ShardInfoResponse> = visible_shard_infos
         .iter()
         .map(|info| {
             let percentage = if total_entries > 0 {
@@ -161,7 +172,10 @@ pub async fn get_slot_status(State(cache): State<AppState>) -> Json<SlotRoutingS
         return Json(SlotRoutingStatusResponse {
             enabled: false,
             epoch: 0,
-            total_slots: TOTAL_SLOTS,
+            total_slots: cache
+                .multiraft_coordinator()
+                .and_then(|c| c.slot_table().map(|t| t.total_slots()))
+                .unwrap_or(TOTAL_SLOTS),
             active_migrations: 0,
             completed_migrations: 0,
             failed_migrations: 0,
@@ -187,7 +201,10 @@ pub async fn get_slot_status(State(cache): State<AppState>) -> Json<SlotRoutingS
     Json(SlotRoutingStatusResponse {
         enabled,
         epoch,
-        total_slots: TOTAL_SLOTS,
+        total_slots: cache
+            .multiraft_coordinator()
+            .and_then(|c| c.slot_table().map(|t| t.total_slots()))
+            .unwrap_or(TOTAL_SLOTS),
         active_migrations,
         completed_migrations,
         failed_migrations,
@@ -273,6 +290,11 @@ pub async fn remove_shard(
 pub async fn get_cluster_shards_comparison(
     State(cache): State<AppState>,
 ) -> Json<ClusterShardsComparisonResponse> {
+    use crate::network::rpc::{GetShardInfoRequest, Message};
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static REQUEST_COUNTER: AtomicU64 = AtomicU64::new(1);
+
     let local_node_id = cache.node_id();
 
     // Get local shard information
@@ -290,26 +312,105 @@ pub async fn get_cluster_shards_comparison(
     let all_members = cache.discovery_members();
     let healthy_members = cache.discovery_healthy_members();
 
-    // For each remote node, we'll include placeholder info since we can't
-    // directly fetch from other nodes without their dashboard addresses.
-    // In a real deployment, this would require the cluster to share dashboard addresses
-    // or use a shared registry. For now, we'll show what we know from discovery.
-    for &member_id in &all_members {
-        if member_id == local_node_id {
-            continue;
-        }
+    // For each remote node, try to fetch shard info via RPC
+    if let Some(coordinator) = cache.multiraft_coordinator() {
+        for &member_id in &all_members {
+            if member_id == local_node_id {
+                continue;
+            }
 
-        let is_healthy = healthy_members.contains(&member_id);
-        nodes.push(NodeShardInfo {
-            node_id: member_id,
-            reachable: is_healthy,
-            error: if is_healthy {
-                Some("Remote shard info not available (requires cluster coordination)".to_string())
+            let is_healthy = healthy_members.contains(&member_id);
+            if !is_healthy {
+                nodes.push(NodeShardInfo {
+                    node_id: member_id,
+                    reachable: false,
+                    error: Some("Node unreachable".to_string()),
+                    shards: vec![],
+                });
+                continue;
+            }
+
+            // Try to get the node's address and fetch shard info
+            if let Some(peer_addr) = coordinator.get_node_address(member_id) {
+                let request_id = REQUEST_COUNTER.fetch_add(1, Ordering::Relaxed);
+                let request = GetShardInfoRequest::new(request_id, local_node_id);
+                let msg = Message::GetShardInfo(request);
+
+                match coordinator
+                    .shard_forwarder()
+                    .send_raw_message_with_response(member_id, peer_addr, msg)
+                    .await
+                {
+                    Ok(Message::ShardInfoResponse(response)) => {
+                        // Convert RemoteShardInfo to ShardInfoResponse
+                        let shards: Vec<ShardInfoResponse> = response
+                            .shards
+                            .iter()
+                            .map(|s| ShardInfoResponse {
+                                shard_id: s.shard_id,
+                                is_active: s.is_active,
+                                is_leader: s.is_leader,
+                                leader_id: s.leader_id,
+                                entry_count: s.entry_count,
+                                percentage: 0.0, // Will be recalculated by frontend if needed
+                                term: s.term,
+                                slot_count: s.slot_count,
+                                incoming_slots: s.incoming_slots,
+                                outgoing_slots: s.outgoing_slots,
+                            })
+                            .collect();
+
+                        nodes.push(NodeShardInfo {
+                            node_id: member_id,
+                            reachable: true,
+                            error: None,
+                            shards,
+                        });
+                    }
+                    Ok(_) => {
+                        nodes.push(NodeShardInfo {
+                            node_id: member_id,
+                            reachable: true,
+                            error: Some("Unexpected response type".to_string()),
+                            shards: vec![],
+                        });
+                    }
+                    Err(e) => {
+                        nodes.push(NodeShardInfo {
+                            node_id: member_id,
+                            reachable: true,
+                            error: Some(format!("RPC error: {}", e)),
+                            shards: vec![],
+                        });
+                    }
+                }
             } else {
-                Some("Node unreachable".to_string())
-            },
-            shards: vec![], // Would be populated if we had direct access
-        });
+                nodes.push(NodeShardInfo {
+                    node_id: member_id,
+                    reachable: is_healthy,
+                    error: Some("Node address not known".to_string()),
+                    shards: vec![],
+                });
+            }
+        }
+    } else {
+        // No coordinator, fall back to old behavior
+        for &member_id in &all_members {
+            if member_id == local_node_id {
+                continue;
+            }
+            let is_healthy = healthy_members.contains(&member_id);
+            nodes.push(NodeShardInfo {
+                node_id: member_id,
+                reachable: is_healthy,
+                error: Some(if is_healthy {
+                    "Multi-Raft not enabled".to_string()
+                } else {
+                    "Node unreachable".to_string()
+                }),
+                shards: vec![],
+            });
+        }
     }
 
     // Compare shards and find differences
@@ -351,6 +452,10 @@ async fn get_local_shards(cache: &AppState) -> Vec<ShardInfoResponse> {
     };
     let shard_infos = coordinator.shard_info();
     let slot_snapshot = cache.slot_table();
+
+    // Note: Do NOT filter shards here - this function is used for cluster comparison
+    // which needs to see all shards (including Removing) to detect sync issues accurately.
+
     let total_entries: u64 = shard_infos.iter().map(|s| s.entry_count).sum();
 
     shard_infos

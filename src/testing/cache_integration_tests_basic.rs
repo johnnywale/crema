@@ -631,24 +631,47 @@ mod tests {
 
         // Wait for exactly one leader and all nodes to agree
         // Use 15 seconds as per CLAUDE.md guidelines
+        //
+        // NOTE: We collect each node's view of leadership atomically (is_leader + leader_id)
+        // to avoid TOCTOU race where leadership changes between checking is_leader() counts
+        // and checking leader_id() agreement.
         eventually(Duration::from_secs(15), || async {
-            let caches = [&cache1, &cache2, &cache3];
-            let leader_count = caches.iter().filter(|c| c.is_leader()).count();
+            // Collect each node's view atomically: (is_leader, leader_id)
+            let view1 = (cache1.is_leader(), cache1.leader_id());
+            let view2 = (cache2.is_leader(), cache2.leader_id());
+            let view3 = (cache3.is_leader(), cache3.leader_id());
+
+            // Count how many nodes think they are the leader
+            let leader_count = [view1.0, view2.0, view3.0]
+                .iter()
+                .filter(|&&is_leader| is_leader)
+                .count();
+
             if leader_count != 1 {
                 return false;
             }
 
-            // All nodes should agree on leader
-            let leader_id_1 = cache1.leader_id();
-            let leader_id_2 = cache2.leader_id();
-            let leader_id_3 = cache3.leader_id();
+            // All nodes should have Some leader_id
+            let (lid1, lid2, lid3) = match (view1.1, view2.1, view3.1) {
+                (Some(l1), Some(l2), Some(l3)) => (l1, l2, l3),
+                _ => return false,
+            };
 
-            // All should have Some leader and agree
-            leader_id_1.is_some()
-                && leader_id_2.is_some()
-                && leader_id_3.is_some()
-                && leader_id_1 == leader_id_2
-                && leader_id_2 == leader_id_3
+            // All nodes should agree on the same leader
+            if lid1 != lid2 || lid2 != lid3 {
+                return false;
+            }
+
+            // The agreed leader should match who thinks they're leader
+            let declared_leader = if view1.0 {
+                cache1.node_id()
+            } else if view2.0 {
+                cache2.node_id()
+            } else {
+                cache3.node_id()
+            };
+
+            lid1 == declared_leader
         })
         .await
         .expect("All nodes should agree on exactly one leader");

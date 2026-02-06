@@ -681,6 +681,10 @@ pub struct MultiRaftCacheConfig {
 
     /// Per-shard Raft configuration (only used when per_shard_raft_enabled is true).
     pub shard_raft_config: ShardRaftConfig,
+
+    /// Total number of slots for slot-based routing.
+    /// Defaults to 1024. Fewer slots means fewer migrations when adding/removing shards.
+    pub total_slots: usize,
 }
 
 /// Configuration for per-shard Raft replication (Phase 2).
@@ -780,6 +784,7 @@ impl Default for MultiRaftCacheConfig {
             leader_broadcast_debounce_ms: 200,
             per_shard_raft_enabled: false,
             shard_raft_config: ShardRaftConfig::default(),
+            total_slots: 1024,
         }
     }
 }
@@ -833,6 +838,12 @@ impl MultiRaftCacheConfig {
     /// Set the per-shard Raft configuration.
     pub fn with_shard_raft_config(mut self, config: ShardRaftConfig) -> Self {
         self.shard_raft_config = config;
+        self
+    }
+
+    /// Set the total number of slots for slot-based routing.
+    pub fn with_total_slots(mut self, total_slots: usize) -> Self {
+        self.total_slots = total_slots;
         self
     }
 

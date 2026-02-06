@@ -251,9 +251,10 @@ pub use slot_control_plane::{
     ShardState as SlotShardState, SlotControlPlane,
 };
 pub use slot_migration::{
-    MigrationDataAccessor, MigrationId, MigrationPhase as SlotMigrationPhase, MigrationRaftCommand,
-    MigrationStatus, NoOpDataAccessor, SlotLogEntry, SlotLogOperation, SlotMigrationRecord,
-    SlotMigrator, SlotMigratorConfig, ValidationResult,
+    MigrationDataAccessor, MigrationEvent, MigrationEventType, MigrationId,
+    MigrationPhase as SlotMigrationPhase, MigrationRaftCommand, MigrationStatus, NoOpDataAccessor,
+    SlotLogEntry, SlotLogOperation, SlotMigrationRecord, SlotMigrator, SlotMigratorConfig,
+    StateConsistencyResult, StateDivergence, ValidationResult,
 };
 pub use slot_table::{
     crc16, Epoch, EpochCheck, RouteResult, ShardSlotInfo, SlotAssignment, SlotId, SlotReassignment,

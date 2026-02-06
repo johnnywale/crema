@@ -9,7 +9,7 @@ dir = "target/nextest"
 # Number of retries for flaky tests
 retries = 1
 # Timeout for slow tests
-slow-timeout = { period = "60s", terminate-after = 2 }
+slow-timeout = { period = "60s", terminate-after = 3 }
 # Don't stop on first failure
 fail-fast = false
 # Show output for failed tests

@@ -28,14 +28,15 @@ use super::shard_registry::{ShardLifecycleState, ShardRegistry};
 use super::shard_storage::{PersistedShardMetadata, ShardStorageConfig, ShardStorageManager};
 use super::shard_transport::ShardTransportMultiplexer;
 use super::slot_control_plane::SlotControlPlane;
-use super::slot_migration::{ShardMigrationDataAccessor, SlotMigrator};
-use super::slot_table::{Epoch, SlotId, SlotTable, TOTAL_SLOTS};
+use super::slot_migration::{self, ShardMigrationDataAccessor, SlotMigrator};
+use super::slot_table::{Epoch, SlotId, SlotTable};
 use crate::consensus::transport::RaftTransport;
 use crate::error::{Error, Result};
 use crate::metrics::CacheMetrics;
 use crate::network::router::NodeMessageRouter;
 use crate::network::rpc::{
-    GetTopologyRequest, ShardCreationAck, ShardCreationBroadcast, TopologyResponse,
+    GetTopologyRequest, Message, ShardCreationAck, ShardCreationBroadcast, SlotScanRequest,
+    SlotScanResponse, TopologyResponse,
 };
 use crate::types::CacheCommand;
 use crate::types::NodeId;
@@ -69,6 +70,10 @@ pub struct MultiRaftConfig {
 
     /// Tick interval for background tasks.
     pub tick_interval: Duration,
+
+    /// Total number of slots for slot-based routing.
+    /// Defaults to 1024. Fewer slots means fewer migrations when adding/removing shards.
+    pub total_slots: usize,
 }
 
 impl Default for MultiRaftConfig {
@@ -80,6 +85,7 @@ impl Default for MultiRaftConfig {
             default_ttl: None,
             auto_init_shards: true,
             tick_interval: Duration::from_millis(100),
+            total_slots: super::slot_table::TOTAL_SLOTS,
         }
     }
 }
@@ -324,6 +330,11 @@ pub struct MultiRaftCoordinator {
 
     /// Request ID counter for RPC messages.
     next_request_id: AtomicU64,
+
+    /// Pending slot scan requests awaiting responses.
+    pending_slot_scans: Arc<
+        parking_lot::RwLock<HashMap<u64, tokio::sync::oneshot::Sender<Result<SlotScanResponse>>>>,
+    >,
 }
 
 impl MultiRaftCoordinator {
@@ -388,6 +399,7 @@ impl MultiRaftCoordinator {
             slot_control_plane: RwLock::new(None),
             slot_migrator: RwLock::new(None),
             next_request_id: AtomicU64::new(1),
+            pending_slot_scans: Arc::new(parking_lot::RwLock::new(HashMap::new())),
         }
     }
 
@@ -447,6 +459,7 @@ impl MultiRaftCoordinator {
             slot_control_plane: RwLock::new(None),
             slot_migrator: RwLock::new(None),
             next_request_id: AtomicU64::new(1),
+            pending_slot_scans: Arc::new(parking_lot::RwLock::new(HashMap::new())),
         }
     }
 
@@ -728,22 +741,6 @@ impl MultiRaftCoordinator {
                         .and_then(|n| n.leader_id())
                         .or_else(|| self.leader_tracker.get_leader(shard_id));
 
-                    // Debug: Log read forwarding decisions
-                    static READ_FWD_LOG: std::sync::atomic::AtomicU64 =
-                        std::sync::atomic::AtomicU64::new(0);
-                    let log_count = READ_FWD_LOG.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    if log_count < 20 {
-                        eprintln!(
-                            "[READ-FWD] #{} shard={} key={} local_leader={} leader={:?} self={}",
-                            log_count,
-                            shard_id,
-                            String::from_utf8_lossy(&key[..key.len().min(20)]),
-                            is_local_leader,
-                            leader_node,
-                            self.node_id
-                        );
-                    }
-
                     if !is_local_leader {
                         if let Some(leader_node) = leader_node {
                             if leader_node != self.node_id {
@@ -755,23 +752,12 @@ impl MultiRaftCoordinator {
                                     .await
                                 {
                                     Ok(forward_result) => {
-                                        if log_count < 20 {
-                                            eprintln!(
-                                                "[READ-FWD] #{} RESULT success={} has_value={}",
-                                                log_count,
-                                                forward_result.success,
-                                                forward_result.value.is_some()
-                                            );
-                                        }
                                         if forward_result.value.is_some() {
                                             self.metrics.record_get(true, start.elapsed());
                                             return Ok(forward_result.value);
                                         }
                                     }
                                     Err(e) => {
-                                        if log_count < 20 {
-                                            eprintln!("[READ-FWD] #{} ERROR: {}", log_count, e);
-                                        }
                                         tracing::debug!(
                                             shard_id,
                                             leader_node,
@@ -2246,15 +2232,17 @@ impl MultiRaftCoordinator {
     /// from ShardRaftNodes to the router and leader_tracker.
     fn start_leader_sync_task(&self) {
         let node_id = self.node_id;
-        let num_shards = self.config.num_shards;
+        let initial_num_shards = self.config.num_shards;
         let router = self.router.clone();
         let leader_tracker = self.leader_tracker.clone();
-        let shard_raft_manager = self.shard_raft_manager.read().clone();
+        // Clone the Arc<RwLock<...>> so we can read from it on each iteration
+        // This allows us to see shards added after the task started
+        let shard_raft_manager = self.shard_raft_manager.clone();
 
-        // Only start if we have a shard raft manager
-        let Some(manager) = shard_raft_manager else {
+        // Only start if we have a shard raft manager now
+        if shard_raft_manager.read().is_none() {
             return;
-        };
+        }
 
         tokio::spawn(async move {
             // Initial delay to allow leader elections to complete
@@ -2267,8 +2255,18 @@ impl MultiRaftCoordinator {
             loop {
                 interval.tick().await;
 
+                // Read manager on each iteration to see newly added shards
+                let Some(manager) = shard_raft_manager.read().clone() else {
+                    tracing::debug!(node_id, "Leader sync task stopping - no manager");
+                    break;
+                };
+
+                // Dynamically get all shard IDs to handle shards added at runtime
+                let shard_ids = manager.shard_ids();
+                let num_shards = shard_ids.len();
+
                 let mut synced_count = 0;
-                for shard_id in 0..num_shards {
+                for shard_id in shard_ids {
                     if let Some(shard_node) = manager.get_shard(shard_id) {
                         if let Some(leader_id) = shard_node.leader_id() {
                             // Update leader_tracker first (consistent ordering with set_shard_leader)
@@ -2302,7 +2300,12 @@ impl MultiRaftCoordinator {
                 }
 
                 // All shards have leaders, we can slow down the sync
-                if synced_count == num_shards as usize && !all_synced {
+                // Use initial_num_shards for this check to avoid premature slowdown
+                // when new shards are added (they need time for leader election)
+                if synced_count >= initial_num_shards as usize
+                    && synced_count == num_shards
+                    && !all_synced
+                {
                     all_synced = true;
                     tracing::info!(
                         node_id,
@@ -2310,6 +2313,16 @@ impl MultiRaftCoordinator {
                         "All shard leaders synced to router and leader_tracker, slowing sync interval"
                     );
                     interval = tokio::time::interval(Duration::from_secs(5));
+                } else if all_synced && synced_count < num_shards {
+                    // New shards were added, speed up sync again
+                    all_synced = false;
+                    interval = tokio::time::interval(Duration::from_millis(500));
+                    tracing::debug!(
+                        node_id,
+                        synced_count,
+                        num_shards,
+                        "New shards detected, speeding up sync interval"
+                    );
                 }
 
                 // If manager is not running anymore, stop the task
@@ -2733,8 +2746,11 @@ impl MultiRaftCoordinator {
         use super::slot_migration::{SlotMigrator, SlotMigratorConfig};
         use super::slot_table::SlotTable;
 
-        // Create slot table with current shard count
-        let slot_table = Arc::new(SlotTable::new(self.config.num_shards as usize));
+        // Create slot table with current shard count and configured total_slots
+        let slot_table = Arc::new(SlotTable::new(
+            self.config.num_shards as usize,
+            self.config.total_slots,
+        ));
 
         // Create control plane with node_id for globally unique shard IDs
         let control_plane = Arc::new(SlotControlPlane::new(
@@ -2790,6 +2806,34 @@ impl MultiRaftCoordinator {
     /// Get the slot migrator if slot routing is enabled.
     pub fn slot_migrator(&self) -> Option<Arc<super::slot_migration::SlotMigrator>> {
         self.slot_migrator.read().clone()
+    }
+
+    /// Get migration event log (for testing/debugging).
+    pub fn migration_events(&self) -> Vec<super::slot_migration::MigrationEvent> {
+        self.slot_migrator
+            .read()
+            .as_ref()
+            .map(|m| m.events())
+            .unwrap_or_default()
+    }
+
+    /// Get migration events for a specific slot.
+    pub fn migration_events_for_slot(
+        &self,
+        slot_id: SlotId,
+    ) -> Vec<super::slot_migration::MigrationEvent> {
+        self.slot_migrator
+            .read()
+            .as_ref()
+            .map(|m| m.events_for_slot(slot_id))
+            .unwrap_or_default()
+    }
+
+    /// Clear the migration event log (used between successive operations in tests).
+    pub fn clear_migration_events(&self) {
+        if let Some(migrator) = self.slot_migrator.read().as_ref() {
+            migrator.clear_events();
+        }
     }
 
     /// Get a snapshot of the slot table.
@@ -2904,6 +2948,26 @@ impl MultiRaftCoordinator {
             }
         }
 
+        // Broadcast shard removal to all peers so they update their slot tables
+        let slot_reassignments: Vec<(SlotId, ShardId)> = result
+            .reassignments
+            .iter()
+            .flat_map(|(target_shard, slots)| slots.iter().map(|slot| (*slot, *target_shard)))
+            .collect();
+
+        if let Err(e) = self
+            .broadcast_shard_removal(shard_id, slot_reassignments, result.new_epoch.value())
+            .await
+        {
+            // Log but don't fail - peers can catch up later
+            tracing::warn!(
+                node_id = self.node_id,
+                shard_id,
+                error = %e,
+                "Failed to broadcast shard removal (peers will catch up later)"
+            );
+        }
+
         tracing::info!(
             node_id = self.node_id,
             shard_id,
@@ -3002,13 +3066,103 @@ impl MultiRaftCoordinator {
 
         // Use real data accessor that interacts with actual shard storage.
         // Pass forwarding dependencies to enable migration with per-shard Raft.
-        let accessor = Arc::new(ShardMigrationDataAccessor::new(
+        let mut accessor = ShardMigrationDataAccessor::new(
             self.router.clone(),
             self.node_id,
             self.shard_forwarder.clone(),
             self.leader_tracker.clone(),
             self.shard_raft_manager.clone(),
-        ));
+        );
+
+        // Add remote scan callback for cross-node slot scanning (required for shard removal).
+        // This calls into the coordinator's remote_slot_scan method which handles the RPC.
+        if self.node_router.read().is_some() {
+            let pending_scans = self.pending_slot_scans.clone();
+            let node_router = self.node_router.read().clone();
+            // Use a separate atomic counter for the callback since we can't clone the struct's AtomicU64
+            let callback_request_id = Arc::new(AtomicU64::new(1_000_000)); // Start at 1M to avoid collision
+
+            let remote_scan_callback: slot_migration::RemoteScanCallback =
+                Arc::new(move |target_node, shard_id, slot_id, cursor, limit| {
+                    let pending_scans = pending_scans.clone();
+                    let node_router = node_router.clone();
+                    let callback_request_id = callback_request_id.clone();
+
+                    Box::pin(async move {
+                        // Get the node router
+                        let router = node_router
+                            .ok_or_else(|| Error::Config("Node router not configured".into()))?;
+
+                        let request_id = callback_request_id.fetch_add(1, Ordering::SeqCst);
+                        let (tx, rx) = tokio::sync::oneshot::channel();
+
+                        // Register the pending request
+                        pending_scans.write().insert(request_id, tx);
+
+                        // Create and send the request
+                        let request = SlotScanRequest::new(
+                            request_id,
+                            shard_id,
+                            slot_id as u32,
+                            cursor,
+                            limit,
+                        );
+
+                        tracing::debug!(
+                            request_id,
+                            shard_id,
+                            slot_id,
+                            target_node,
+                            "Sending SlotScanRequest"
+                        );
+
+                        if let Err(e) = router
+                            .send_message(target_node, Message::SlotScanRequest(request))
+                            .await
+                        {
+                            pending_scans.write().remove(&request_id);
+                            return Err(e);
+                        }
+
+                        // Wait for response with timeout
+                        let timeout = tokio::time::timeout(Duration::from_secs(30), rx).await;
+
+                        match timeout {
+                            Ok(Ok(Ok(response))) => {
+                                if response.success {
+                                    tracing::debug!(
+                                        request_id,
+                                        keys_found = response.keys.len(),
+                                        "SlotScanRequest completed"
+                                    );
+                                    Ok((response.keys, response.next_cursor))
+                                } else {
+                                    Err(Error::RemoteError(
+                                        response
+                                            .error
+                                            .unwrap_or_else(|| "Remote scan failed".into()),
+                                    ))
+                                }
+                            }
+                            Ok(Ok(Err(e))) => Err(e),
+                            Ok(Err(_)) => {
+                                pending_scans.write().remove(&request_id);
+                                Err(Error::Internal("Slot scan request cancelled".into()))
+                            }
+                            Err(_) => {
+                                pending_scans.write().remove(&request_id);
+                                Err(Error::Timeout)
+                            }
+                        }
+                    })
+                });
+
+            accessor = accessor.with_remote_scan_callback(remote_scan_callback);
+        }
+
+        accessor = accessor.with_total_slots(self.config.total_slots);
+
+        let accessor = Arc::new(accessor);
 
         tokio::spawn(async move {
             migrator.run(accessor, control_plane).await;
@@ -3059,7 +3213,7 @@ impl MultiRaftCoordinator {
             .read()
             .as_ref()
             .map(|table| {
-                (0..TOTAL_SLOTS as SlotId)
+                (0..table.total_slots() as SlotId)
                     .map(|slot_id| (slot_id, table.slot_owner(slot_id)))
                     .collect()
             })
@@ -3121,18 +3275,24 @@ impl MultiRaftCoordinator {
             }
         }
 
-        // Update slot table with new assignments
+        // Update slot table with new assignments using the broadcast epoch
+        // (not generating a new local epoch)
         if let Some(slot_table) = self.slot_table.read().as_ref() {
-            // Apply slot reassignments
-            let slots_to_reassign: Vec<SlotId> = broadcast
-                .slot_assignments
-                .iter()
-                .map(|(slot_id, _)| *slot_id)
-                .collect();
+            if !broadcast.slot_assignments.is_empty() {
+                // Build a SlotReassignment with the broadcast epoch
+                let mut reassignment = super::slot_table::SlotReassignment::new(
+                    super::slot_table::Epoch::new(broadcast.new_epoch),
+                );
 
-            if !slots_to_reassign.is_empty() {
-                let reassignment =
-                    slot_table.reassign_slots(&slots_to_reassign, broadcast.shard_id);
+                // For each slot, look up its current owner (from) and set new owner (to)
+                for (slot_id, _new_owner) in &broadcast.slot_assignments {
+                    let current_owner = slot_table.slot_owner(*slot_id);
+                    // The new owner is the new shard being created
+                    reassignment.add_move(*slot_id, current_owner, broadcast.shard_id);
+                }
+
+                // Apply the reassignment with the correct epoch
+                slot_table.apply_reassignment(&reassignment);
 
                 // Register migrations for affected slots
                 if let Some(migrator) = self.slot_migrator.read().as_ref() {
@@ -3141,14 +3301,11 @@ impl MultiRaftCoordinator {
             }
         }
 
-        // Update control plane if present
+        // Update control plane if present - register the remote shard
         if let Some(control_plane) = self.slot_control_plane.read().as_ref() {
-            // Ensure the shard is registered in control plane
-            let info = control_plane.get_shard_info(broadcast.shard_id);
-            if info.is_none() {
-                // The control plane may need to be updated separately
-                // For now, the slot table update handles the core routing
-            }
+            // Register the shard in control plane so it can be removed later
+            let slot_count = broadcast.slot_assignments.len();
+            control_plane.register_remote_shard(broadcast.shard_id, slot_count);
         }
 
         let new_epoch = self.get_slot_table_epoch();
@@ -3162,11 +3319,16 @@ impl MultiRaftCoordinator {
         Ok(ShardCreationAck::success(broadcast.request_id, new_epoch))
     }
 
-    /// Broadcast shard creation to all peers.
+    /// Broadcast shard creation to all peers and wait for acknowledgments.
     ///
     /// Called after creating a shard locally to notify all cluster nodes.
-    /// Best-effort: failures are logged but don't block the operation.
-    /// Peers can catch up later via sync_cluster_state().
+    /// This method waits for peers to acknowledge the shard creation to ensure
+    /// the new shard's Raft group can form properly before migrations begin.
+    ///
+    /// The wait ensures that:
+    /// 1. All peers have created the shard and registered transport handlers
+    /// 2. The new shard's Raft group can receive messages from all voters
+    /// 3. Leader election can proceed with a full quorum
     pub async fn broadcast_shard_creation(
         &self,
         shard_id: ShardId,
@@ -3194,28 +3356,290 @@ impl MultiRaftCoordinator {
 
         let msg = crate::network::rpc::Message::ShardCreationBroadcast(broadcast);
 
-        // Fan-out to all peers using shard forwarder's transport
+        // Fan-out to all peers and wait for acknowledgments
+        // This ensures peers have created the shard before migrations start
+        let broadcast_timeout = std::time::Duration::from_secs(10);
         let mut success_count = 0;
+
+        tracing::debug!(
+            node_id = self.node_id,
+            shard_id,
+            peer_count = peers.len(),
+            "Starting shard creation broadcast to peers (waiting for acks)"
+        );
+
+        // Send to all peers in parallel and collect results
+        let mut futures = Vec::new();
         for peer_id in &peers {
             if let Some(peer_addr) = self.get_node_address(*peer_id) {
-                match self
-                    .shard_forwarder
-                    .send_raw_message(*peer_id, peer_addr, msg.clone())
-                    .await
-                {
-                    Ok(_) => success_count += 1,
-                    Err(e) => {
+                let forwarder = self.shard_forwarder.clone();
+                let msg_clone = msg.clone();
+                let peer = *peer_id;
+                let node_id = self.node_id;
+
+                futures.push(async move {
+                    tracing::debug!(
+                        node_id,
+                        peer,
+                        %peer_addr,
+                        "Sending creation broadcast to peer (with response wait)"
+                    );
+
+                    let send_result = tokio::time::timeout(
+                        broadcast_timeout,
+                        forwarder.send_raw_message_with_response(peer, peer_addr, msg_clone),
+                    )
+                    .await;
+
+                    match send_result {
+                        Ok(Ok(response)) => {
+                            // Check if the ack indicates success
+                            if let crate::network::rpc::Message::ShardCreationAck(ack) = response {
+                                if ack.success {
+                                    tracing::debug!(
+                                        node_id,
+                                        peer,
+                                        peer_epoch = ack.local_epoch,
+                                        "Peer acknowledged shard creation"
+                                    );
+                                    return (peer, true);
+                                } else {
+                                    tracing::warn!(
+                                        peer,
+                                        error = ?ack.error,
+                                        "Peer failed to create shard"
+                                    );
+                                }
+                            } else {
+                                tracing::warn!(
+                                    peer,
+                                    "Unexpected response type to shard creation broadcast"
+                                );
+                            }
+                        }
+                        Ok(Err(e)) => {
+                            tracing::warn!(
+                                peer,
+                                error = %e,
+                                "Failed to send shard creation broadcast"
+                            );
+                        }
+                        Err(_) => {
+                            tracing::warn!(peer, "Timeout waiting for shard creation ack");
+                        }
+                    }
+                    (peer, false)
+                });
+            } else {
+                tracing::warn!(peer_id, "No address known for peer, skipping broadcast");
+            }
+        }
+
+        // Wait for all broadcasts to complete
+        let results = futures::future::join_all(futures).await;
+        for (peer, success) in results {
+            if success {
+                success_count += 1;
+            } else {
+                tracing::debug!(peer, "Peer did not successfully ack shard creation");
+            }
+        }
+
+        tracing::info!(
+            node_id = self.node_id,
+            shard_id,
+            new_epoch,
+            peers_acked = success_count,
+            total_peers = peers.len(),
+            "Broadcast shard creation completed"
+        );
+
+        // Wait a brief period for the new shard's leader election to complete
+        // This gives the Raft group time to elect a leader after all nodes have the shard
+        if success_count > 0 {
+            // Use the coordinator's tick interval as a baseline for election timeout
+            // A typical election timeout is ~10 ticks, so we wait for that duration
+            let election_wait = self.config.tick_interval * 10;
+            tracing::debug!(
+                node_id = self.node_id,
+                shard_id,
+                wait_ms = election_wait.as_millis(),
+                "Waiting for new shard leader election"
+            );
+            tokio::time::sleep(election_wait).await;
+        }
+
+        Ok(())
+    }
+
+    /// Handle incoming shard removal broadcast from another node.
+    ///
+    /// IMPORTANT: This handler is idempotent - safe to call multiple times.
+    /// Updates the local slot table and marks the shard as removing.
+    pub async fn handle_shard_removal_broadcast(
+        &self,
+        broadcast: crate::network::rpc::ShardRemovalBroadcast,
+    ) -> Result<crate::network::rpc::ShardRemovalAck> {
+        use crate::network::rpc::ShardRemovalAck;
+
+        // Epoch protection: reject stale broadcasts
+        let current_epoch = self.get_slot_table_epoch();
+        if broadcast.new_epoch <= current_epoch {
+            tracing::debug!(
+                node_id = self.node_id,
+                broadcast_epoch = broadcast.new_epoch,
+                current_epoch,
+                shard_id = broadcast.shard_id,
+                "Ignoring stale shard removal broadcast"
+            );
+            return Ok(ShardRemovalAck::success(
+                broadcast.request_id,
+                current_epoch,
+            ));
+        }
+
+        tracing::info!(
+            node_id = self.node_id,
+            shard_id = broadcast.shard_id,
+            new_epoch = broadcast.new_epoch,
+            originator = broadcast.originator_node,
+            slots_reassigned = broadcast.slot_reassignments.len(),
+            "Received shard removal broadcast"
+        );
+
+        // Update slot table with reassignments
+        if let Some(slot_table) = self.slot_table.read().as_ref() {
+            // Build a reassignment structure
+            let mut reassignment = super::slot_table::SlotReassignment::new(
+                super::slot_table::Epoch::new(broadcast.new_epoch),
+            );
+
+            for (slot_id, new_owner) in &broadcast.slot_reassignments {
+                // The "from" shard is the one being removed
+                reassignment.add_move(*slot_id, broadcast.shard_id, *new_owner);
+            }
+
+            // Apply the reassignment
+            slot_table.apply_reassignment(&reassignment);
+        }
+
+        // Mark shard as Removing in router (if we have it locally)
+        if let Some(shard) = self.router.get_shard(broadcast.shard_id) {
+            shard.set_state(ShardState::Removing);
+            tracing::info!(
+                node_id = self.node_id,
+                shard_id = broadcast.shard_id,
+                "Marked shard as Removing from broadcast"
+            );
+        }
+
+        // Note: We do NOT call control_plane.remove_shard() here because:
+        // 1. The originating node already computed and applied slot reassignments
+        // 2. We just applied those same reassignments via apply_reassignment above
+        // 3. Calling remove_shard() would try to redistribute slots AGAIN, causing conflicts
+        // The control plane on this node will be updated via migrations completing.
+        //
+        // Note: We also don't need to register migrations here because:
+        // - apply_reassignment() above marks slots as Migrating in the slot table
+        // - sync_from_slot_table() in the migration loop will pick these up and register them
+        // - Registering here could cause conflicts with existing migration records
+
+        let new_epoch = self.get_slot_table_epoch();
+        tracing::info!(
+            node_id = self.node_id,
+            shard_id = broadcast.shard_id,
+            new_epoch,
+            "Applied shard removal broadcast"
+        );
+
+        Ok(ShardRemovalAck::success(broadcast.request_id, new_epoch))
+    }
+
+    /// Broadcast shard removal to all peers.
+    ///
+    /// Called after initiating shard removal locally to notify all cluster nodes.
+    /// Best-effort: failures are logged but don't block the operation.
+    pub async fn broadcast_shard_removal(
+        &self,
+        shard_id: ShardId,
+        slot_reassignments: Vec<(SlotId, ShardId)>,
+        new_epoch: u64,
+    ) -> Result<()> {
+        use crate::network::rpc::ShardRemovalBroadcast;
+
+        let peers = self.get_known_peers();
+        if peers.is_empty() {
+            tracing::debug!(
+                node_id = self.node_id,
+                shard_id,
+                "No peers to broadcast shard removal to"
+            );
+            return Ok(());
+        }
+
+        let request_id = self.next_request_id();
+        let broadcast = ShardRemovalBroadcast::new(
+            request_id,
+            shard_id,
+            slot_reassignments,
+            new_epoch,
+            self.node_id,
+        );
+
+        let msg = crate::network::rpc::Message::ShardRemovalBroadcast(broadcast);
+
+        // Fan-out to all peers using shard forwarder's transport
+        // Use a timeout to prevent hanging if a peer is slow/unreachable
+        let broadcast_timeout = std::time::Duration::from_secs(5);
+        let mut success_count = 0;
+
+        tracing::debug!(
+            node_id = self.node_id,
+            shard_id,
+            peer_count = peers.len(),
+            "Starting shard removal broadcast to peers"
+        );
+
+        for peer_id in &peers {
+            if let Some(peer_addr) = self.get_node_address(*peer_id) {
+                tracing::debug!(
+                    node_id = self.node_id,
+                    peer = peer_id,
+                    %peer_addr,
+                    "Sending removal broadcast to peer"
+                );
+
+                let send_result = tokio::time::timeout(
+                    broadcast_timeout,
+                    self.shard_forwarder
+                        .send_raw_message(*peer_id, peer_addr, msg.clone()),
+                )
+                .await;
+
+                match send_result {
+                    Ok(Ok(_)) => {
+                        tracing::debug!(
+                            node_id = self.node_id,
+                            peer = peer_id,
+                            "Removal broadcast sent successfully"
+                        );
+                        success_count += 1;
+                    }
+                    Ok(Err(e)) => {
                         tracing::warn!(
                             peer = peer_id,
                             error = %e,
-                            "Failed to send shard creation broadcast"
+                            "Failed to send shard removal broadcast"
                         );
+                    }
+                    Err(_) => {
+                        tracing::warn!(peer = peer_id, "Timeout sending shard removal broadcast");
                     }
                 }
             } else {
                 tracing::warn!(
                     peer = peer_id,
-                    "No address known for peer, skipping broadcast"
+                    "No address known for peer, skipping removal broadcast"
                 );
             }
         }
@@ -3226,7 +3650,7 @@ impl MultiRaftCoordinator {
             new_epoch,
             peers_notified = success_count,
             total_peers = peers.len(),
-            "Broadcast shard creation"
+            "Broadcast shard removal"
         );
 
         Ok(())
@@ -3254,6 +3678,216 @@ impl MultiRaftCoordinator {
             shard_ids,
             slot_assignments,
         )
+    }
+
+    /// Handle a GetShardInfo request (for dashboard cluster comparison).
+    pub fn handle_get_shard_info(
+        &self,
+        request: crate::network::rpc::GetShardInfoRequest,
+    ) -> crate::network::rpc::ShardInfoResponse {
+        use crate::network::rpc::{RemoteShardInfo, ShardInfoResponse};
+
+        let slot_snapshot = self.slot_table_snapshot();
+        let slot_epoch = slot_snapshot.as_ref().map(|s| s.epoch.value());
+
+        let shards: Vec<RemoteShardInfo> = self
+            .shard_info()
+            .iter()
+            .map(|info| {
+                let (slot_count, incoming_slots, outgoing_slots) =
+                    if let Some(ref snapshot) = slot_snapshot {
+                        if let Some(shard_slot_info) = snapshot.shard_info.get(&info.shard_id) {
+                            (
+                                shard_slot_info.owned_slots.len(),
+                                shard_slot_info.incoming_slots.len(),
+                                shard_slot_info.outgoing_slots.len(),
+                            )
+                        } else {
+                            (0, 0, 0)
+                        }
+                    } else {
+                        (0, 0, 0)
+                    };
+
+                RemoteShardInfo {
+                    shard_id: info.shard_id,
+                    is_active: info.state == ShardState::Active,
+                    is_leader: info.leader == Some(self.node_id),
+                    leader_id: info.leader,
+                    entry_count: info.entry_count,
+                    term: info.term,
+                    slot_count,
+                    incoming_slots,
+                    outgoing_slots,
+                }
+            })
+            .collect();
+
+        tracing::debug!(
+            node_id = self.node_id,
+            requesting_node = request.requesting_node,
+            shards = shards.len(),
+            "Responding to shard info request"
+        );
+
+        ShardInfoResponse::new(request.request_id, self.node_id, shards, true, slot_epoch)
+    }
+
+    /// Handle a SlotScanRequest from another node.
+    ///
+    /// This is called when a node needs to scan keys from a shard that exists on this node.
+    /// Used during shard removal migrations where the source shard is remote.
+    pub fn handle_slot_scan_request(
+        &self,
+        request: crate::network::rpc::SlotScanRequest,
+    ) -> crate::network::rpc::SlotScanResponse {
+        use crate::network::rpc::SlotScanResponse;
+
+        let shard_id = request.shard_id;
+        let slot_id = request.slot_id as u16;
+
+        // Get the shard
+        let shard = match self.router.get_shard(shard_id) {
+            Some(s) => s,
+            None => {
+                tracing::warn!(
+                    shard_id,
+                    node_id = self.node_id,
+                    "SlotScanRequest for non-existent shard"
+                );
+                return SlotScanResponse::error(
+                    request.request_id,
+                    format!("Shard {} not found on node {}", shard_id, self.node_id),
+                );
+            }
+        };
+
+        // Scan the slot keys from local storage
+        let storage = shard.storage();
+
+        // Enable slot indexing if not already enabled
+        if !storage.has_slot_indexing() {
+            storage.set_total_slots(self.config.total_slots as u16);
+            storage.enable_slot_indexing();
+        }
+
+        let (keys, next_cursor) =
+            storage.scan_slot_keys(slot_id, request.cursor.as_deref(), request.limit);
+
+        let keys_vec: Vec<Vec<u8>> = keys.into_iter().map(|k| k.to_vec()).collect();
+        let next_cursor_vec = next_cursor.map(|c| c.to_vec());
+
+        tracing::debug!(
+            shard_id,
+            slot_id,
+            keys_found = keys_vec.len(),
+            "SlotScanRequest handled"
+        );
+
+        SlotScanResponse::success(request.request_id, keys_vec, next_cursor_vec)
+    }
+
+    /// Handle a SlotScanResponse from another node.
+    ///
+    /// This completes a pending remote slot scan request.
+    pub fn handle_slot_scan_response(&self, response: SlotScanResponse) {
+        if let Some(sender) = self.pending_slot_scans.write().remove(&response.request_id) {
+            let _ = sender.send(Ok(response));
+        } else {
+            tracing::warn!(
+                node_id = self.node_id,
+                request_id = response.request_id,
+                "Received SlotScanResponse for unknown request"
+            );
+        }
+    }
+
+    /// Send a remote slot scan request and wait for the response.
+    ///
+    /// This is used during slot migration when the source shard is on a remote node.
+    pub async fn remote_slot_scan(
+        &self,
+        target_node: NodeId,
+        shard_id: u32,
+        slot_id: u16,
+        cursor: Option<&[u8]>,
+        limit: usize,
+    ) -> Result<(Vec<Vec<u8>>, Option<Vec<u8>>)> {
+        // Get the node router
+        let router = self.node_router.read().clone().ok_or_else(|| {
+            Error::Config("Node router not configured for remote slot scanning".into())
+        })?;
+
+        let request_id = self.next_request_id();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+
+        // Register the pending request
+        self.pending_slot_scans.write().insert(request_id, tx);
+
+        // Create and send the request
+        let request = SlotScanRequest::new(
+            request_id,
+            shard_id,
+            slot_id as u32,
+            cursor.map(|c| c.to_vec()),
+            limit,
+        );
+
+        tracing::debug!(
+            request_id,
+            shard_id,
+            slot_id,
+            target_node,
+            "Sending SlotScanRequest"
+        );
+
+        if let Err(e) = router
+            .send_message(target_node, Message::SlotScanRequest(request))
+            .await
+        {
+            self.pending_slot_scans.write().remove(&request_id);
+            return Err(e);
+        }
+
+        // Wait for response with timeout
+        let timeout = tokio::time::timeout(Duration::from_secs(30), rx).await;
+
+        match timeout {
+            Ok(Ok(Ok(response))) => {
+                if response.success {
+                    tracing::debug!(
+                        request_id,
+                        keys_found = response.keys.len(),
+                        "SlotScanRequest completed"
+                    );
+                    Ok((response.keys, response.next_cursor))
+                } else {
+                    Err(Error::RemoteError(
+                        response
+                            .error
+                            .unwrap_or_else(|| "Remote scan failed".into()),
+                    ))
+                }
+            }
+            Ok(Ok(Err(e))) => Err(e),
+            Ok(Err(_)) => {
+                self.pending_slot_scans.write().remove(&request_id);
+                Err(Error::Internal("Slot scan request cancelled".into()))
+            }
+            Err(_) => {
+                self.pending_slot_scans.write().remove(&request_id);
+                Err(Error::Timeout)
+            }
+        }
+    }
+
+    /// Get the pending slot scans map (for accessor integration).
+    pub fn pending_slot_scans(
+        &self,
+    ) -> Arc<
+        parking_lot::RwLock<HashMap<u64, tokio::sync::oneshot::Sender<Result<SlotScanResponse>>>>,
+    > {
+        self.pending_slot_scans.clone()
     }
 
     /// Synchronize cluster state on startup or when detecting epoch mismatch.
@@ -3417,6 +4051,12 @@ impl MultiRaftBuilder {
     /// Set the number of shards.
     pub fn num_shards(mut self, num_shards: u32) -> Self {
         self.config.num_shards = num_shards;
+        self
+    }
+
+    /// Set the total number of slots for slot-based routing.
+    pub fn total_slots(mut self, total_slots: usize) -> Self {
+        self.config.total_slots = total_slots;
         self
     }
 

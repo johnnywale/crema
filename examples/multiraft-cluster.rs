@@ -289,6 +289,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
+    // Enable slot-based routing for dynamic shard management
+    // This allows adding/removing shards at runtime via dashboard
+    println!();
+    println!("===========================================");
+    println!("   Enabling Slot-Based Routing");
+    println!("===========================================");
+    match cache.enable_slot_routing().await {
+        Ok(()) => {
+            println!("  Slot routing: ENABLED");
+            println!("  - Slots: 1024 total");
+            println!("  - Distribution: ~{} slots per shard", 1024 / num_shards);
+            println!("  - Dynamic shard management: Available via dashboard");
+        }
+        Err(e) => {
+            println!("  Failed to enable slot routing: {}", e);
+        }
+    }
+
     // Show final status
     println!();
     println!("===========================================");
@@ -305,6 +323,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     if cache.is_multiraft_enabled() {
         println!("  Num Shards:     {}", num_shards);
+        println!(
+            "  Slot Routing:   {}",
+            if cache.is_slot_routing_enabled() {
+                "Enabled"
+            } else {
+                "Disabled"
+            }
+        );
     }
 
     let stats = cache.stats();

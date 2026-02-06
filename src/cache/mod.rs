@@ -273,7 +273,11 @@ impl DistributedCache {
             shard_forward_handler: parking_lot::RwLock::new(None),
             shard_forward_response_handler: parking_lot::RwLock::new(None),
             shard_creation_broadcast_handler: parking_lot::RwLock::new(None),
+            shard_removal_broadcast_handler: parking_lot::RwLock::new(None),
             get_topology_handler: parking_lot::RwLock::new(None),
+            get_shard_info_handler: parking_lot::RwLock::new(None),
+            slot_scan_handler: parking_lot::RwLock::new(None),
+            slot_scan_response_handler: parking_lot::RwLock::new(None),
             pending_shard_messages: parking_lot::Mutex::new(Vec::new()),
         });
 
@@ -389,6 +393,7 @@ impl DistributedCache {
             let builder = MultiRaftBuilder::new(config.node_id)
                 .num_shards(config.multiraft.num_shards)
                 .shard_capacity(config.multiraft.shard_capacity)
+                .total_slots(config.multiraft.total_slots)
                 .metrics(metrics.clone())
                 .local_raft_addr(config.raft_addr.to_string())
                 .per_shard_raft(config.multiraft.per_shard_raft_enabled)
@@ -578,12 +583,68 @@ impl DistributedCache {
                         "Shard creation broadcast handler installed"
                     );
 
+                    // 5b. Set up handler for ShardRemovalBroadcast messages (cluster-wide shard removal sync)
+                    let coord_for_removal = coordinator.clone();
+                    let removal_handler: ShardRemovalBroadcastHandler = Arc::new(
+                        move |broadcast| {
+                            let coord = coord_for_removal.clone();
+                            let request_id = broadcast.request_id;
+                            Box::pin(async move {
+                                match coord.handle_shard_removal_broadcast(broadcast).await {
+                                    Ok(ack) => ack,
+                                    Err(e) => {
+                                        tracing::warn!(error = %e, "Failed to handle shard removal broadcast");
+                                        crate::network::rpc::ShardRemovalAck {
+                                            request_id,
+                                            success: false,
+                                            local_epoch: 0,
+                                            error: Some(e.to_string()),
+                                        }
+                                    }
+                                }
+                            })
+                        },
+                    );
+                    handler.set_shard_removal_broadcast_handler(removal_handler);
+                    info!(
+                        node_id = config.node_id,
+                        "Shard removal broadcast handler installed"
+                    );
+
                     // 6. Set up handler for GetTopology messages (cluster state catch-up)
                     let coord_for_topology = coordinator.clone();
                     let topology_handler: GetTopologyHandler =
                         Arc::new(move |request| coord_for_topology.handle_get_topology(request));
                     handler.set_get_topology_handler(topology_handler);
                     info!(node_id = config.node_id, "Get topology handler installed");
+
+                    // 7. Set up handler for GetShardInfo messages (dashboard cluster comparison)
+                    let coord_for_shard_info = coordinator.clone();
+                    let shard_info_handler: GetShardInfoHandler = Arc::new(move |request| {
+                        coord_for_shard_info.handle_get_shard_info(request)
+                    });
+                    handler.set_get_shard_info_handler(shard_info_handler);
+                    info!(node_id = config.node_id, "Get shard info handler installed");
+
+                    // 8. Set up handler for SlotScanRequest messages (cross-node slot migration)
+                    let coord_for_slot_scan = coordinator.clone();
+                    let slot_scan_handler: SlotScanHandler = Arc::new(move |request| {
+                        coord_for_slot_scan.handle_slot_scan_request(request)
+                    });
+                    handler.set_slot_scan_handler(slot_scan_handler);
+                    info!(node_id = config.node_id, "Slot scan handler installed");
+
+                    // 9. Set up handler for SlotScanResponse messages (routes to coordinator)
+                    let coord_for_slot_scan_response = coordinator.clone();
+                    let slot_scan_response_handler: SlotScanResponseHandler =
+                        Arc::new(move |response| {
+                            coord_for_slot_scan_response.handle_slot_scan_response(response)
+                        });
+                    handler.set_slot_scan_response_handler(slot_scan_response_handler);
+                    info!(
+                        node_id = config.node_id,
+                        "Slot scan response handler installed"
+                    );
                 }
             }
         }
@@ -1961,6 +2022,33 @@ impl DistributedCache {
                     "Shard creation broadcast handler installed (via setup_shard_message_handler)"
                 );
 
+                // 4b. Set up handler for ShardRemovalBroadcast messages (cluster-wide shard removal sync)
+                let coord_for_removal = coordinator.clone();
+                let removal_handler: ShardRemovalBroadcastHandler = Arc::new(move |broadcast| {
+                    let coord = coord_for_removal.clone();
+                    let request_id = broadcast.request_id;
+                    Box::pin(async move {
+                        match coord.handle_shard_removal_broadcast(broadcast).await {
+                            Ok(ack) => ack,
+                            Err(e) => {
+                                tracing::warn!(error = %e, "Failed to handle shard removal broadcast");
+                                crate::network::rpc::ShardRemovalAck {
+                                    request_id,
+                                    success: false,
+                                    local_epoch: 0,
+                                    error: Some(e.to_string()),
+                                }
+                            }
+                        }
+                    })
+                });
+                self.message_handler
+                    .set_shard_removal_broadcast_handler(removal_handler);
+                debug!(
+                    node_id = self.config.node_id,
+                    "Shard removal broadcast handler installed (via setup_shard_message_handler)"
+                );
+
                 // 5. Set up handler for GetTopology messages (cluster state catch-up)
                 let coord_for_topology = coordinator.clone();
                 let topology_handler: GetTopologyHandler =
@@ -1970,6 +2058,41 @@ impl DistributedCache {
                 debug!(
                     node_id = self.config.node_id,
                     "Get topology handler installed (via setup_shard_message_handler)"
+                );
+
+                // 6. Set up handler for GetShardInfo messages (dashboard cluster comparison)
+                let coord_for_shard_info = coordinator.clone();
+                let shard_info_handler: GetShardInfoHandler =
+                    Arc::new(move |request| coord_for_shard_info.handle_get_shard_info(request));
+                self.message_handler
+                    .set_get_shard_info_handler(shard_info_handler);
+                debug!(
+                    node_id = self.config.node_id,
+                    "Get shard info handler installed (via setup_shard_message_handler)"
+                );
+
+                // 7. Set up handler for SlotScanRequest messages (cross-node slot migration)
+                let coord_for_slot_scan = coordinator.clone();
+                let slot_scan_handler: SlotScanHandler =
+                    Arc::new(move |request| coord_for_slot_scan.handle_slot_scan_request(request));
+                self.message_handler
+                    .set_slot_scan_handler(slot_scan_handler);
+                debug!(
+                    node_id = self.config.node_id,
+                    "Slot scan handler installed (via setup_shard_message_handler)"
+                );
+
+                // 8. Set up handler for SlotScanResponse messages (routes to coordinator)
+                let coord_for_slot_scan_response = coordinator.clone();
+                let slot_scan_response_handler: SlotScanResponseHandler =
+                    Arc::new(move |response| {
+                        coord_for_slot_scan_response.handle_slot_scan_response(response)
+                    });
+                self.message_handler
+                    .set_slot_scan_response_handler(slot_scan_response_handler);
+                debug!(
+                    node_id = self.config.node_id,
+                    "Slot scan response handler installed (via setup_shard_message_handler)"
                 );
             }
         }
@@ -2006,12 +2129,21 @@ impl DistributedCache {
     /// - Slots are assigned to shards
     /// - Epoch-based routing ensures consistency
     ///
+    /// This also installs the necessary message handlers for shard creation broadcasts
+    /// and topology synchronization if they haven't been installed yet.
+    ///
     /// Only available in Multi-Raft mode.
     pub async fn enable_slot_routing(&self) -> Result<()> {
         let coordinator = self
             .router
             .coordinator()
             .ok_or_else(|| Error::Internal("Multi-Raft not enabled".to_string()))?;
+
+        // Install shard message handlers if not already installed.
+        // This is needed for shard creation broadcasts and topology sync to work
+        // even when per_shard_raft is disabled.
+        self.setup_shard_message_handler();
+
         coordinator.enable_slot_routing().await
     }
 
@@ -2143,6 +2275,17 @@ pub type ShardCreationBroadcastHandler = Arc<
         + Sync,
 >;
 
+/// Callback type for handling shard removal broadcasts.
+/// Returns a ShardRemovalAck.
+pub type ShardRemovalBroadcastHandler = Arc<
+    dyn Fn(
+            crate::network::rpc::ShardRemovalBroadcast,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = crate::network::rpc::ShardRemovalAck> + Send>,
+        > + Send
+        + Sync,
+>;
+
 /// Callback type for handling topology requests.
 /// Returns a TopologyResponse.
 pub type GetTopologyHandler = Arc<
@@ -2150,6 +2293,23 @@ pub type GetTopologyHandler = Arc<
         + Send
         + Sync,
 >;
+
+/// Handler for GetShardInfo requests (for dashboard cluster comparison).
+pub type GetShardInfoHandler = Arc<
+    dyn Fn(crate::network::rpc::GetShardInfoRequest) -> crate::network::rpc::ShardInfoResponse
+        + Send
+        + Sync,
+>;
+
+/// Handler for SlotScanRequest requests (for cross-node slot migration).
+pub type SlotScanHandler = Arc<
+    dyn Fn(crate::network::rpc::SlotScanRequest) -> crate::network::rpc::SlotScanResponse
+        + Send
+        + Sync,
+>;
+
+/// Handler for SlotScanResponse responses (routes to coordinator's pending_slot_scans).
+pub type SlotScanResponseHandler = Arc<dyn Fn(crate::network::rpc::SlotScanResponse) + Send + Sync>;
 
 /// Message handler that routes messages to the Raft node.
 struct CacheMessageHandler {
@@ -2166,8 +2326,16 @@ struct CacheMessageHandler {
     shard_forward_response_handler: parking_lot::RwLock<Option<ShardForwardResponseHandler>>,
     /// Optional handler for shard creation broadcasts.
     shard_creation_broadcast_handler: parking_lot::RwLock<Option<ShardCreationBroadcastHandler>>,
+    /// Optional handler for shard removal broadcasts.
+    shard_removal_broadcast_handler: parking_lot::RwLock<Option<ShardRemovalBroadcastHandler>>,
     /// Optional handler for topology requests.
     get_topology_handler: parking_lot::RwLock<Option<GetTopologyHandler>>,
+    /// Optional handler for shard info requests (dashboard cluster comparison).
+    get_shard_info_handler: parking_lot::RwLock<Option<GetShardInfoHandler>>,
+    /// Optional handler for slot scan requests (cross-node migration).
+    slot_scan_handler: parking_lot::RwLock<Option<SlotScanHandler>>,
+    /// Optional handler for slot scan responses (routes to coordinator).
+    slot_scan_response_handler: parking_lot::RwLock<Option<SlotScanResponseHandler>>,
     /// Pending shard messages that arrived before handler was set (limited to avoid memory issues).
     pending_shard_messages: parking_lot::Mutex<Vec<crate::network::rpc::ShardRaftMessage>>,
 }
@@ -2215,9 +2383,29 @@ impl CacheMessageHandler {
         *self.shard_creation_broadcast_handler.write() = Some(handler);
     }
 
+    /// Set the shard removal broadcast handler for handling shard removal coordination.
+    pub fn set_shard_removal_broadcast_handler(&self, handler: ShardRemovalBroadcastHandler) {
+        *self.shard_removal_broadcast_handler.write() = Some(handler);
+    }
+
     /// Set the get topology handler for handling topology requests.
     pub fn set_get_topology_handler(&self, handler: GetTopologyHandler) {
         *self.get_topology_handler.write() = Some(handler);
+    }
+
+    /// Set the get shard info handler for handling dashboard cluster comparison requests.
+    pub fn set_get_shard_info_handler(&self, handler: GetShardInfoHandler) {
+        *self.get_shard_info_handler.write() = Some(handler);
+    }
+
+    /// Set the slot scan handler for handling cross-node migration scan requests.
+    pub fn set_slot_scan_handler(&self, handler: SlotScanHandler) {
+        *self.slot_scan_handler.write() = Some(handler);
+    }
+
+    /// Set the slot scan response handler for routing responses to the coordinator.
+    pub fn set_slot_scan_response_handler(&self, handler: SlotScanResponseHandler) {
+        *self.slot_scan_response_handler.write() = Some(handler);
     }
 }
 
@@ -2446,6 +2634,60 @@ impl MessageHandler for CacheMessageHandler {
             return None;
         }
 
+        // Handle shard removal broadcasts
+        if let Message::ShardRemovalBroadcast(broadcast) = msg {
+            debug!(
+                node_id = self.node_id,
+                request_id = broadcast.request_id,
+                shard_id = broadcast.shard_id,
+                originator = broadcast.originator_node,
+                "Received ShardRemovalBroadcast"
+            );
+
+            if let Some(handler) = self.shard_removal_broadcast_handler.read().clone() {
+                let transport = self.raft.transport().clone();
+                let node_id = self.node_id;
+                let request_id = broadcast.request_id;
+                let origin = broadcast.originator_node;
+
+                // Spawn task to process broadcast and send response
+                tokio::spawn(async move {
+                    let ack = handler(broadcast).await;
+                    let response = Message::ShardRemovalAck(ack);
+
+                    if let Err(e) = transport.send_message(origin, response).await {
+                        warn!(
+                            node_id = node_id,
+                            request_id = request_id,
+                            origin = origin,
+                            error = %e,
+                            "Failed to send ShardRemovalAck"
+                        );
+                    }
+                });
+            } else {
+                warn!(
+                    node_id = self.node_id,
+                    request_id = broadcast.request_id,
+                    "Received ShardRemovalBroadcast but no handler is set"
+                );
+            }
+            return None;
+        }
+
+        // Handle shard removal acks (just log for now - fire-and-forget broadcast)
+        if let Message::ShardRemovalAck(ref ack) = msg {
+            debug!(
+                node_id = self.node_id,
+                request_id = ack.request_id,
+                success = ack.success,
+                peer_epoch = ack.local_epoch,
+                "Received ShardRemovalAck"
+            );
+            // Acks are currently fire-and-forget, no action needed
+            return None;
+        }
+
         // Handle topology requests
         if let Message::GetTopology(request) = msg {
             debug!(
@@ -2477,6 +2719,82 @@ impl MessageHandler for CacheMessageHandler {
                 "Received TopologyResponse"
             );
             // Responses are handled by the requesting side via send_raw_message_with_response
+            return None;
+        }
+
+        // Handle shard info requests (for dashboard cluster comparison)
+        if let Message::GetShardInfo(request) = msg {
+            debug!(
+                node_id = self.node_id,
+                request_id = request.request_id,
+                requesting_node = request.requesting_node,
+                "Received GetShardInfo request"
+            );
+
+            if let Some(handler) = self.get_shard_info_handler.read().clone() {
+                let response = handler(request);
+                return Some(Message::ShardInfoResponse(response));
+            } else {
+                warn!(
+                    node_id = self.node_id,
+                    "Received GetShardInfo but no handler is set"
+                );
+            }
+            return None;
+        }
+
+        // Handle shard info responses (just log - handled by caller)
+        if let Message::ShardInfoResponse(ref response) = msg {
+            debug!(
+                node_id = self.node_id,
+                request_id = response.request_id,
+                responding_node = response.responding_node,
+                shards = response.shards.len(),
+                "Received ShardInfoResponse"
+            );
+            return None;
+        }
+
+        // Handle slot scan requests (for cross-node slot migration)
+        if let Message::SlotScanRequest(request) = msg {
+            debug!(
+                node_id = self.node_id,
+                request_id = request.request_id,
+                shard_id = request.shard_id,
+                slot_id = request.slot_id,
+                "Received SlotScanRequest"
+            );
+
+            if let Some(handler) = self.slot_scan_handler.read().clone() {
+                let response = handler(request);
+                return Some(Message::SlotScanResponse(response));
+            } else {
+                warn!(
+                    node_id = self.node_id,
+                    "Received SlotScanRequest but no handler is set"
+                );
+            }
+            return None;
+        }
+
+        // Handle slot scan responses (routed to coordinator)
+        if let Message::SlotScanResponse(response) = msg {
+            debug!(
+                node_id = self.node_id,
+                request_id = response.request_id,
+                success = response.success,
+                keys = response.keys.len(),
+                "Received SlotScanResponse"
+            );
+
+            if let Some(handler) = self.slot_scan_response_handler.read().clone() {
+                handler(response);
+            } else {
+                warn!(
+                    node_id = self.node_id,
+                    "Received SlotScanResponse but no handler is set"
+                );
+            }
             return None;
         }
 

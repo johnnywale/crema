@@ -213,6 +213,8 @@ impl MigrationStateMachine {
                 created_at: proposed_at,
                 updated_at: proposed_at,
                 last_progress_at: proposed_at,
+                keys_migrated: 0,
+                completed_by_node: None,
             };
             // We'll need the shard info, but for now just mark as claimed
             migrations.insert(slot_id, record);

@@ -94,10 +94,22 @@ pub async fn events_stream(
                 // Get slot table snapshot for slot info (if slot routing is enabled)
                 let slot_snapshot = cache.slot_table();
 
-                // Calculate total entries for percentage
-                let total_entries: u64 = shard_infos.iter().map(|s| s.entry_count).sum();
+                // Filter out shards that are being removed or stopped
+                let visible_shard_infos: Vec<_> = shard_infos
+                    .into_iter()
+                    .filter(|info| {
+                        !matches!(
+                            info.state,
+                            crate::multiraft::ShardState::Removing
+                                | crate::multiraft::ShardState::Stopped
+                        )
+                    })
+                    .collect();
 
-                let shards: Vec<ShardInfoResponse> = shard_infos
+                // Calculate total entries for percentage (only from visible shards)
+                let total_entries: u64 = visible_shard_infos.iter().map(|s| s.entry_count).sum();
+
+                let shards: Vec<ShardInfoResponse> = visible_shard_infos
                     .iter()
                     .map(|info| {
                         let percentage = if total_entries > 0 {

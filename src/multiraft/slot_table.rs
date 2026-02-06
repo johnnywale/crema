@@ -301,12 +301,15 @@ pub struct SlotTable {
 
     /// Number of shards (for distribution calculations).
     num_shards: RwLock<usize>,
+
+    /// Total number of slots in this table.
+    total_slots: usize,
 }
 
 impl SlotTable {
     /// Create a new slot table with even distribution across shards.
-    pub fn new(num_shards: usize) -> Self {
-        let slots: Vec<SlotAssignment> = (0..TOTAL_SLOTS)
+    pub fn new(num_shards: usize, total_slots: usize) -> Self {
+        let slots: Vec<SlotAssignment> = (0..total_slots)
             .map(|i| SlotAssignment::new((i % num_shards) as ShardId))
             .collect();
 
@@ -314,6 +317,7 @@ impl SlotTable {
             epoch: AtomicU64::new(1),
             slots: RwLock::new(slots),
             num_shards: RwLock::new(num_shards),
+            total_slots,
         }
     }
 
@@ -323,6 +327,7 @@ impl SlotTable {
             epoch: AtomicU64::new(1),
             slots: RwLock::new(vec![SlotAssignment::new(0); TOTAL_SLOTS]),
             num_shards: RwLock::new(0),
+            total_slots: TOTAL_SLOTS,
         }
     }
 
@@ -331,10 +336,12 @@ impl SlotTable {
     /// This restores the slot table state from a previously taken snapshot,
     /// preserving the epoch, slot assignments, and shard count.
     pub fn from_snapshot(snapshot: SlotTableSnapshot) -> Self {
+        let total_slots = snapshot.slots.len();
         Self {
             epoch: AtomicU64::new(snapshot.epoch.value()),
             slots: RwLock::new(snapshot.slots),
             num_shards: RwLock::new(snapshot.num_shards),
+            total_slots,
         }
     }
 
@@ -348,14 +355,24 @@ impl SlotTable {
         *self.num_shards.read()
     }
 
-    /// Compute slot ID for a key using CRC16.
+    /// Get the total number of slots in this table.
+    pub fn total_slots(&self) -> usize {
+        self.total_slots
+    }
+
+    /// Compute slot ID for a key using CRC16 with the default TOTAL_SLOTS.
     pub fn compute_slot(key: &[u8]) -> SlotId {
         crc16(key) % TOTAL_SLOTS as u16
     }
 
+    /// Compute slot ID for a key using CRC16 with a custom total_slots value.
+    pub fn compute_slot_for(key: &[u8], total_slots: usize) -> SlotId {
+        crc16(key) % total_slots as u16
+    }
+
     /// Route a key to its shard.
     pub fn route(&self, key: &[u8]) -> RouteResult {
-        let slot_id = Self::compute_slot(key);
+        let slot_id = Self::compute_slot_for(key, self.total_slots);
         let epoch = self.epoch();
         let slots = self.slots.read();
         let assignment = &slots[slot_id as usize];
@@ -441,21 +458,23 @@ impl SlotTable {
     }
 
     /// Mark a slot as imported (migration complete).
+    ///
+    /// Note: This does NOT increment the epoch because it's a state transition,
+    /// not an ownership change. The epoch should only change when slot ownership
+    /// changes, which happens in `reassign_slots` and `apply_reassignment`.
     pub fn mark_imported(&self, slot_id: SlotId) {
         let mut slots = self.slots.write();
         slots[slot_id as usize].mark_imported();
-
-        // Increment epoch for this state change
-        self.epoch.fetch_add(1, AtomicOrdering::SeqCst);
     }
 
     /// Mark a slot as stable (GC complete).
+    ///
+    /// Note: This does NOT increment the epoch because it's a state transition,
+    /// not an ownership change. The epoch should only change when slot ownership
+    /// changes, which happens in `reassign_slots` and `apply_reassignment`.
     pub fn mark_stable(&self, slot_id: SlotId) {
         let mut slots = self.slots.write();
         slots[slot_id as usize].mark_stable();
-
-        // Increment epoch for this state change
-        self.epoch.fetch_add(1, AtomicOrdering::SeqCst);
     }
 
     /// Update migration progress for a slot.
@@ -472,18 +491,18 @@ impl SlotTable {
 
     /// Compute a rebalance plan for adding a new shard.
     ///
-    /// Steals approximately `TOTAL_SLOTS / (num_shards + 1)` slots from existing shards.
+    /// Steals approximately `total_slots / (num_shards + 1)` slots from existing shards.
     pub fn compute_rebalance_for_new_shard(&self, _new_shard_id: ShardId) -> Vec<SlotId> {
         let slots = self.slots.read();
         let num_shards = *self.num_shards.read();
 
         if num_shards == 0 {
             // First shard gets all slots
-            return (0..TOTAL_SLOTS as SlotId).collect();
+            return (0..self.total_slots as SlotId).collect();
         }
 
         let new_num_shards = num_shards + 1;
-        let target_per_shard = TOTAL_SLOTS / new_num_shards;
+        let target_per_shard = self.total_slots / new_num_shards;
 
         // Count current slots per shard
         let mut shard_counts: HashMap<ShardId, usize> = HashMap::new();
@@ -611,6 +630,7 @@ impl SlotTable {
         // Build per-shard info
         let mut shard_info: HashMap<ShardId, ShardSlotInfo> = HashMap::new();
 
+        // Pre-create entries for known shards
         for i in 0..num_shards {
             shard_info.insert(
                 i as ShardId,
@@ -623,8 +643,21 @@ impl SlotTable {
             );
         }
 
+        // Helper to ensure shard entry exists (for new shards not yet in num_shards)
+        let ensure_shard_entry = |info: &mut HashMap<ShardId, ShardSlotInfo>, shard_id: ShardId| {
+            info.entry(shard_id).or_insert_with(|| ShardSlotInfo {
+                shard_id,
+                owned_slots: Vec::new(),
+                incoming_slots: Vec::new(),
+                outgoing_slots: Vec::new(),
+            });
+        };
+
         for (slot_id, assignment) in slots.iter().enumerate() {
             let slot_id = slot_id as SlotId;
+
+            // Ensure shard entry exists (handles new shards during migration)
+            ensure_shard_entry(&mut shard_info, assignment.owner);
 
             // Add to owned slots
             if let Some(info) = shard_info.get_mut(&assignment.owner) {
@@ -634,6 +667,9 @@ impl SlotTable {
             // Track migration
             match &assignment.state {
                 SlotState::Migrating { from, .. } => {
+                    // Ensure both source and target shard entries exist
+                    ensure_shard_entry(&mut shard_info, *from);
+
                     if let Some(info) = shard_info.get_mut(&assignment.owner) {
                         info.incoming_slots.push(slot_id);
                     }
@@ -642,6 +678,8 @@ impl SlotTable {
                     }
                 }
                 SlotState::Imported { from, .. } => {
+                    ensure_shard_entry(&mut shard_info, *from);
+
                     if let Some(info) = shard_info.get_mut(from) {
                         info.outgoing_slots.push(slot_id);
                     }
@@ -683,7 +721,7 @@ impl SlotTable {
 
 impl Default for SlotTable {
     fn default() -> Self {
-        Self::new(16)
+        Self::new(16, TOTAL_SLOTS)
     }
 }
 
@@ -739,10 +777,11 @@ mod tests {
 
     #[test]
     fn test_slot_table_creation() {
-        let table = SlotTable::new(4);
+        let table = SlotTable::new(4, TOTAL_SLOTS);
 
         assert_eq!(table.epoch().value(), 1);
         assert_eq!(table.num_shards(), 4);
+        assert_eq!(table.total_slots(), TOTAL_SLOTS);
 
         // Each shard should have ~256 slots
         for shard_id in 0..4 {
@@ -753,7 +792,7 @@ mod tests {
 
     #[test]
     fn test_route_consistency() {
-        let table = SlotTable::new(4);
+        let table = SlotTable::new(4, TOTAL_SLOTS);
 
         // Same key should always route to same shard
         let result1 = table.route(b"test-key");
@@ -765,7 +804,7 @@ mod tests {
 
     #[test]
     fn test_slot_distribution() {
-        let table = SlotTable::new(4);
+        let table = SlotTable::new(4, TOTAL_SLOTS);
 
         // Generate 1000 keys and count distribution
         let mut counts = [0usize; 4];
@@ -788,7 +827,7 @@ mod tests {
 
     #[test]
     fn test_reassign_slots() {
-        let table = SlotTable::new(4);
+        let table = SlotTable::new(4, TOTAL_SLOTS);
 
         // Get 10 slots - note that with even distribution, different slots belong
         // to different shards initially. Slots 0,4,8 belong to shard 0, etc.
@@ -815,7 +854,7 @@ mod tests {
 
     #[test]
     fn test_mark_imported_and_stable() {
-        let table = SlotTable::new(4);
+        let table = SlotTable::new(4, TOTAL_SLOTS);
 
         // Reassign a slot
         table.reassign_slots(&[0], 3);
@@ -833,7 +872,7 @@ mod tests {
 
     #[test]
     fn test_compute_rebalance_for_new_shard() {
-        let table = SlotTable::new(4);
+        let table = SlotTable::new(4, TOTAL_SLOTS);
 
         // Add a 5th shard
         let slots_to_move = table.compute_rebalance_for_new_shard(4);
@@ -848,7 +887,7 @@ mod tests {
 
     #[test]
     fn test_compute_drain_for_shard() {
-        let table = SlotTable::new(4);
+        let table = SlotTable::new(4, TOTAL_SLOTS);
 
         // Drain shard 3
         let drain_plan = table.compute_drain_for_shard(3);
@@ -863,7 +902,7 @@ mod tests {
 
     #[test]
     fn test_snapshot() {
-        let table = SlotTable::new(4);
+        let table = SlotTable::new(4, TOTAL_SLOTS);
 
         let snapshot = table.snapshot();
 
@@ -880,20 +919,20 @@ mod tests {
 
     #[test]
     fn test_epoch_increment_on_changes() {
-        let table = SlotTable::new(4);
+        let table = SlotTable::new(4, TOTAL_SLOTS);
 
         assert_eq!(table.epoch().value(), 1);
 
-        // Reassign
+        // Reassign - this changes ownership, so epoch increments
         table.reassign_slots(&[0], 3);
         assert_eq!(table.epoch().value(), 2);
 
-        // Mark imported
+        // Mark imported - state change only, no epoch increment
         table.mark_imported(0);
-        assert_eq!(table.epoch().value(), 3);
+        assert_eq!(table.epoch().value(), 2); // Epoch unchanged
 
-        // Mark stable
+        // Mark stable - state change only, no epoch increment
         table.mark_stable(0);
-        assert_eq!(table.epoch().value(), 4);
+        assert_eq!(table.epoch().value(), 2); // Epoch unchanged
     }
 }
