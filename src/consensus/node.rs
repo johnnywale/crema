@@ -1333,7 +1333,6 @@ impl RaftNode {
     /// This is called on the leader when it receives a ForwardedCommand.
     /// For write operations, the leader proposes the command to Raft.
     /// For GET operations, the leader performs a linearizable read using read_index.
-    #[allow(clippy::await_holding_lock)]
     fn handle_forwarded_command(&self, fwd: crate::network::rpc::ForwardedCommand) {
         use crate::network::rpc::ForwardResponse;
         use crate::types::CacheCommand;
@@ -1468,18 +1467,20 @@ impl RaftNode {
             pending.lock().insert(proposal_id, PendingProposal { tx });
 
             // Propose to Raft
-            {
+            let propose_err = {
                 let mut node = node_lock.lock();
                 let context = proposal_id.to_le_bytes().to_vec();
-                if let Err(e) = node.propose(context, data) {
-                    pending.lock().remove(&proposal_id);
-                    let response =
-                        Message::ForwardResponse(ForwardResponse::error(request_id, e.to_string()));
-                    if let Err(e) = transport.send_message(origin_node_id, response).await {
-                        warn!(error = %e, "Failed to send ForwardResponse (propose failed)");
-                    }
-                    return;
+                node.propose(context, data).err()
+            };
+
+            if let Some(e) = propose_err {
+                pending.lock().remove(&proposal_id);
+                let response =
+                    Message::ForwardResponse(ForwardResponse::error(request_id, e.to_string()));
+                if let Err(e) = transport.send_message(origin_node_id, response).await {
+                    warn!(error = %e, "Failed to send ForwardResponse (propose failed)");
                 }
+                return;
             }
 
             // Wait for commit with timeout
@@ -1618,17 +1619,7 @@ impl RaftNode {
     #[allow(clippy::await_holding_lock)]
     pub async fn process_ready(&self) {
         // Report unreachable peers to Raft before processing ready
-        let unreachable_peers = self.flow_control.unreachable_peers();
-        if !unreachable_peers.is_empty() {
-            let mut node = self.node.lock();
-            for peer_id in unreachable_peers {
-                node.report_unreachable(peer_id);
-                debug!(
-                    self.id,
-                    peer_id, "Reported peer as unreachable due to backpressure"
-                );
-            }
-        }
+        self.report_unreachable_peers();
 
         // CRITICAL: Hold the lock throughout ready -> persist -> advance cycle
         // to prevent race condition with step() that causes "not leader but has new msg" panic.
@@ -1668,61 +1659,14 @@ impl RaftNode {
                 ready.persisted_messages().len()
             );
 
-            // 1. Persist entries FIRST (must complete before sending messages)
-            // Storage uses internal locking, safe to call while holding node lock
-            let entries = ready.entries();
-            if !entries.is_empty() {
-                debug!(
-                    node_id = self.id,
-                    "PROCESS_READY: Persisting {} entries",
-                    entries.len()
-                );
-                if let Err(e) = self.storage.append(entries) {
-                    error!(error = %e, "CRITICAL: Failed to append entries, aborting ready processing");
-                    return;
-                }
-            }
-
-            // 2. Update hard state if changed
-            if let Some(hs) = ready.hs() {
-                debug!(node_id = self.id, "PROCESS_READY: Persisting hard state");
-                if let Err(e) = self.storage.set_hard_state(hs.clone()) {
-                    error!(error = %e, "CRITICAL: Failed to persist hard state, aborting ready processing");
-                    return;
-                }
-            }
-
-            // 3. Handle snapshot if any - extract data for async processing outside lock
-            let snapshot_data = if !ready.snapshot().is_empty() {
-                let snapshot = ready.snapshot().clone();
-                let index = snapshot.get_metadata().index;
-                let term = snapshot.get_metadata().term;
-                let data = snapshot.data.clone();
-
-                debug!(
-                    node_id = self.id,
-                    index,
-                    term,
-                    data_len = data.len(),
-                    "PROCESS_READY: Applying snapshot to Raft storage"
-                );
-
-                if let Err(e) = self.storage.apply_snapshot(snapshot) {
-                    error!(error = %e, "CRITICAL: Failed to apply snapshot, aborting ready processing");
-                    return;
-                }
-
-                // Return snapshot data for state machine restoration outside lock
-                if !data.is_empty() && is_valid_snapshot_data(&data) {
-                    Some((index, term, data))
-                } else {
-                    None
-                }
-            } else {
-                None
+            // Persist entries, hard state, and snapshot to stable storage.
+            // Must complete before sending messages per raft-rs guidelines.
+            let snapshot_data = match self.persist_ready_state(&ready) {
+                Ok(data) => data,
+                Err(()) => return,
             };
 
-            // 4. Extract messages to send (will send outside lock)
+            // Extract messages and committed entries (will process outside lock)
             let messages = ready.take_messages();
             debug!(
                 node_id = self.id,
@@ -1739,7 +1683,6 @@ impl RaftNode {
                 );
             }
 
-            // 5. Extract committed entries (will apply outside lock)
             let committed_entries = ready.take_committed_entries();
             if !committed_entries.is_empty() {
                 debug!(
@@ -1749,11 +1692,9 @@ impl RaftNode {
                 );
             }
 
-            // 6. CRITICAL: Call advance() while still holding the lock
-            // This prevents the "not leader but has new msg after advance" panic
+            // CRITICAL: Call advance() while still holding the lock.
+            // This prevents the "not leader but has new msg after advance" panic.
             let mut light_ready = node.advance(ready);
-
-            // Extract light_ready data
             let lr_messages = light_ready.take_messages();
             let lr_entries = light_ready.take_committed_entries();
 
@@ -1777,131 +1718,253 @@ impl RaftNode {
         };
         // Lock released here - now safe for step() to run
 
-        // 7. Apply snapshot data to state machine (outside of lock, async)
+        // Apply snapshot data to state machine (outside of lock, async)
         if let Some((index, term, data)) = snapshot_data_to_apply {
+            self.restore_snapshot_to_state_machine(index, term, &data)
+                .await;
+        }
+
+        // Send all Raft messages (outside of lock)
+        self.send_raft_messages(messages_to_send, persisted_messages_to_send);
+
+        // Update leader tracking and Raft state metrics
+        self.update_leader_tracking(new_leader, new_term);
+
+        // Apply committed entries to state machine (outside of lock)
+        self.apply_entries_with_yield(&committed_entries_to_apply)
+            .await;
+
+        // Process light_ready messages
+        if !light_ready_messages.is_empty() {
+            debug!(
+                node_id = self.id,
+                "PROCESS_READY: Sending {} light_ready messages",
+                light_ready_messages.len()
+            );
+            self.transport.send_messages(light_ready_messages);
+        }
+
+        // Apply light_ready committed entries
+        if !light_ready_entries.is_empty() {
+            debug!(
+                node_id = self.id,
+                "PROCESS_READY: Processing {} light_ready committed entries",
+                light_ready_entries.len()
+            );
+        }
+        self.apply_entries_with_yield(&light_ready_entries).await;
+    }
+
+    /// Report unreachable peers to Raft based on flow control backpressure.
+    fn report_unreachable_peers(&self) {
+        let unreachable_peers = self.flow_control.unreachable_peers();
+        if !unreachable_peers.is_empty() {
+            let mut node = self.node.lock();
+            for peer_id in unreachable_peers {
+                node.report_unreachable(peer_id);
+                debug!(
+                    self.id,
+                    peer_id, "Reported peer as unreachable due to backpressure"
+                );
+            }
+        }
+    }
+
+    /// Persist entries, hard state, and snapshot from the Ready struct to stable storage.
+    ///
+    /// Returns `Ok(Some(...))` with snapshot data for state machine restoration if a
+    /// snapshot was applied, `Ok(None)` if no snapshot, or `Err(())` if a critical
+    /// persistence failure occurred and ready processing should be aborted.
+    ///
+    /// Called within the locked section; storage uses internal locking so this is safe.
+    fn persist_ready_state(
+        &self,
+        ready: &raft::Ready,
+    ) -> std::result::Result<Option<(u64, u64, bytes::Bytes)>, ()> {
+        // 1. Persist entries FIRST (must complete before sending messages)
+        let entries = ready.entries();
+        if !entries.is_empty() {
+            debug!(
+                node_id = self.id,
+                "PROCESS_READY: Persisting {} entries",
+                entries.len()
+            );
+            if let Err(e) = self.storage.append(entries) {
+                error!(error = %e, "CRITICAL: Failed to append entries, aborting ready processing");
+                return Err(());
+            }
+        }
+
+        // 2. Update hard state if changed
+        if let Some(hs) = ready.hs() {
+            debug!(node_id = self.id, "PROCESS_READY: Persisting hard state");
+            if let Err(e) = self.storage.set_hard_state(hs.clone()) {
+                error!(error = %e, "CRITICAL: Failed to persist hard state, aborting ready processing");
+                return Err(());
+            }
+        }
+
+        // 3. Handle snapshot if any - extract data for async processing outside lock
+        if !ready.snapshot().is_empty() {
+            let snapshot = ready.snapshot().clone();
+            let index = snapshot.get_metadata().index;
+            let term = snapshot.get_metadata().term;
+            let data = snapshot.data.clone();
+
             debug!(
                 node_id = self.id,
                 index,
                 term,
                 data_len = data.len(),
-                "PROCESS_READY: Restoring state machine from snapshot"
+                "PROCESS_READY: Applying snapshot to Raft storage"
             );
 
-            match deserialize_snapshot_data(&data) {
-                Ok(entries) => {
-                    let total_entries = entries.len();
-                    let entries_before = self.state_machine.storage().entry_count();
+            if let Err(e) = self.storage.apply_snapshot(snapshot) {
+                error!(error = %e, "CRITICAL: Failed to apply snapshot, aborting ready processing");
+                return Err(());
+            }
 
-                    // Track the snapshot boundary - entries applied AFTER this index
-                    // should not be overwritten by this snapshot installation.
-                    // This prevents data loss during migrations when followers lag behind.
-                    self.state_machine.set_snapshot_index(index);
-
-                    // IMPORTANT: DO NOT call invalidate_all() here!
-                    // Calling invalidate_all() causes data loss during migration because:
-                    // 1. Per-shard Raft is enabled, heavy activity causes followers to lag
-                    // 2. Leader creates a snapshot for catch-up
-                    // 3. Follower installs snapshot: invalidate_all() clears ALL data
-                    // 4. Snapshot data is restored, but excludes writes made after snapshot
-                    // 5. Data written via shard.put() after snapshot was taken is lost
-                    //
-                    // Instead, we just overwrite with snapshot entries. Post-snapshot log
-                    // replay will handle any deletes that occurred after the snapshot.
-
-                    // Insert entries from snapshot, filtering expired ones
-                    let mut inserted_count = 0;
-                    let mut skipped_expired = 0;
-
-                    for entry in entries {
-                        // Skip expired entries
-                        if entry.is_expired() {
-                            skipped_expired += 1;
-                            debug!(
-                                node_id = self.id,
-                                key_len = entry.key.len(),
-                                expires_at_ms = ?entry.expires_at_ms,
-                                "PROCESS_READY: Skipping expired entry from snapshot"
-                            );
-                            continue;
-                        }
-
-                        // Insert with expiration if present, otherwise just insert
-                        // This overwrites existing entries if present
-                        if let Some(expires_at_ms) = entry.expires_at_ms {
-                            self.state_machine
-                                .storage()
-                                .insert_with_expiration(entry.key, entry.value, expires_at_ms)
-                                .await;
-                        } else {
-                            self.state_machine
-                                .storage()
-                                .insert(entry.key, entry.value)
-                                .await;
-                        }
-                        inserted_count += 1;
-                    }
-
-                    // Update state machine applied index/term
-                    // Note: The state machine will skip applying entries <= this index
-                    self.state_machine.set_recovered_state(index, term);
-                    self.state_machine.storage().run_pending_tasks().await;
-
-                    let entries_after = self.state_machine.storage().entry_count();
-
-                    // Safety invariant check - warn if significant data loss detected
-                    // This can indicate a problem with the snapshot or migration process
-                    if entries_after < inserted_count / 2 && inserted_count > 10 {
-                        warn!(
-                            node_id = self.id,
-                            snapshot_index = index,
-                            expected = inserted_count,
-                            actual = entries_after,
-                            "SNAPSHOT WARNING: Entry count significantly lower than expected after install"
-                        );
-                    }
-
-                    debug!(
-                        node_id = self.id,
-                        index,
-                        term,
-                        total_entries,
-                        inserted_count,
-                        skipped_expired,
-                        entries_before,
-                        entries_after,
-                        "PROCESS_READY: State machine restored from snapshot (incremental merge)"
-                    );
-                }
-                Err(e) => {
-                    error!(
-                        node_id = self.id,
-                        error = %e,
-                        "PROCESS_READY: Failed to deserialize snapshot data"
-                    );
-                }
+            // Return snapshot data for state machine restoration outside lock
+            if !data.is_empty() && is_valid_snapshot_data(&data) {
+                return Ok(Some((index, term, data)));
             }
         }
 
-        // 8. Send messages (outside of lock)
-        if !messages_to_send.is_empty() {
+        Ok(None)
+    }
+
+    /// Restore the state machine from snapshot data.
+    ///
+    /// Deserializes snapshot entries and inserts them into the cache storage,
+    /// skipping expired entries. Uses incremental merge (no invalidate_all)
+    /// to prevent data loss during migrations when followers lag behind.
+    ///
+    /// Must be called OUTSIDE the Raft node lock since it uses async storage ops.
+    async fn restore_snapshot_to_state_machine(&self, index: u64, term: u64, data: &[u8]) {
+        debug!(
+            node_id = self.id,
+            index,
+            term,
+            data_len = data.len(),
+            "PROCESS_READY: Restoring state machine from snapshot"
+        );
+
+        match deserialize_snapshot_data(data) {
+            Ok(entries) => {
+                let total_entries = entries.len();
+                let entries_before = self.state_machine.storage().entry_count();
+
+                // Track the snapshot boundary - entries applied AFTER this index
+                // should not be overwritten by this snapshot installation.
+                // This prevents data loss during migrations when followers lag behind.
+                self.state_machine.set_snapshot_index(index);
+
+                // IMPORTANT: DO NOT call invalidate_all() here!
+                // Calling invalidate_all() causes data loss during migration because:
+                // 1. Per-shard Raft is enabled, heavy activity causes followers to lag
+                // 2. Leader creates a snapshot for catch-up
+                // 3. Follower installs snapshot: invalidate_all() clears ALL data
+                // 4. Snapshot data is restored, but excludes writes made after snapshot
+                // 5. Data written via shard.put() after snapshot was taken is lost
+                //
+                // Instead, we just overwrite with snapshot entries. Post-snapshot log
+                // replay will handle any deletes that occurred after the snapshot.
+
+                // Insert entries from snapshot, filtering expired ones
+                let mut inserted_count = 0;
+                let mut skipped_expired = 0;
+
+                for entry in entries {
+                    if entry.is_expired() {
+                        skipped_expired += 1;
+                        debug!(
+                            node_id = self.id,
+                            key_len = entry.key.len(),
+                            expires_at_ms = ?entry.expires_at_ms,
+                            "PROCESS_READY: Skipping expired entry from snapshot"
+                        );
+                        continue;
+                    }
+
+                    if let Some(expires_at_ms) = entry.expires_at_ms {
+                        self.state_machine
+                            .storage()
+                            .insert_with_expiration(entry.key, entry.value, expires_at_ms)
+                            .await;
+                    } else {
+                        self.state_machine
+                            .storage()
+                            .insert(entry.key, entry.value)
+                            .await;
+                    }
+                    inserted_count += 1;
+                }
+
+                // Update state machine applied index/term
+                // Note: The state machine will skip applying entries <= this index
+                self.state_machine.set_recovered_state(index, term);
+                self.state_machine.storage().run_pending_tasks().await;
+
+                let entries_after = self.state_machine.storage().entry_count();
+
+                // Safety invariant check - warn if significant data loss detected
+                if entries_after < inserted_count / 2 && inserted_count > 10 {
+                    warn!(
+                        node_id = self.id,
+                        snapshot_index = index,
+                        expected = inserted_count,
+                        actual = entries_after,
+                        "SNAPSHOT WARNING: Entry count significantly lower than expected after install"
+                    );
+                }
+
+                debug!(
+                    node_id = self.id,
+                    index,
+                    term,
+                    total_entries,
+                    inserted_count,
+                    skipped_expired,
+                    entries_before,
+                    entries_after,
+                    "PROCESS_READY: State machine restored from snapshot (incremental merge)"
+                );
+            }
+            Err(e) => {
+                error!(
+                    node_id = self.id,
+                    error = %e,
+                    "PROCESS_READY: Failed to deserialize snapshot data"
+                );
+            }
+        }
+    }
+
+    /// Send Raft messages via transport. Called outside the node lock.
+    fn send_raft_messages(&self, messages: Vec<RaftMessage>, persisted_messages: Vec<RaftMessage>) {
+        if !messages.is_empty() {
             debug!(
                 node_id = self.id,
                 "PROCESS_READY: Sending {} immediate messages",
-                messages_to_send.len()
+                messages.len()
             );
-            self.transport.send_messages(messages_to_send);
+            self.transport.send_messages(messages);
         }
 
-        if !persisted_messages_to_send.is_empty() {
-            self.transport.send_messages(persisted_messages_to_send);
+        if !persisted_messages.is_empty() {
+            self.transport.send_messages(persisted_messages);
         }
+    }
 
-        // 9. Update leader tracking and Raft state metrics
+    /// Update leader tracking state and emit Raft metrics.
+    ///
+    /// Detects leader changes, logs transitions, and updates the `leader_id`,
+    /// `has_leader` atomics plus gauge/counter metrics.
+    fn update_leader_tracking(&self, new_leader: NodeId, new_term: u64) {
         let old_leader = self.leader_id.load(Ordering::Relaxed);
         let had_leader = self.has_leader.load(Ordering::Relaxed);
         let node_id_str = self.id.to_string();
 
-        // Update Raft state metrics
         gauge_set!(
             crate::metrics::descriptors::RAFT_TERM,
             new_term as f64,
@@ -1917,7 +1980,6 @@ impl RaftNode {
                         previous_leader = old_leader,
                         "LEADER_ELECTION: This node is now the LEADER"
                     );
-                    // Record election won
                     counter_inc!(
                         crate::metrics::descriptors::RAFT_ELECTIONS_TOTAL,
                         "node_id" => node_id_str.clone(),
@@ -1936,7 +1998,6 @@ impl RaftNode {
             self.leader_id.store(new_leader, Ordering::Relaxed);
             self.has_leader.store(true, Ordering::Relaxed);
 
-            // Update leader metrics
             gauge_set!(
                 crate::metrics::descriptors::RAFT_IS_LEADER,
                 if new_leader == self.id { 1.0 } else { 0.0 },
@@ -1961,38 +2022,16 @@ impl RaftNode {
                 "node_id" => node_id_str.clone()
             );
         }
+    }
 
-        // 10. Apply committed entries to state machine (outside of lock)
-        // Yield periodically to prevent stalling the Raft tick loop when
-        // processing many entries. This allows heartbeats and other critical
-        // Raft messages to be processed, preventing election timeouts.
+    /// Apply a slice of committed entries to the state machine, yielding
+    /// periodically to prevent stalling the Raft tick loop.
+    ///
+    /// Yields every 10 entries so heartbeats and other critical Raft messages
+    /// can be processed, preventing election timeouts under heavy load.
+    async fn apply_entries_with_yield(&self, entries: &[raft::prelude::Entry]) {
         const YIELD_INTERVAL: usize = 10;
-        for (i, entry) in committed_entries_to_apply.iter().enumerate() {
-            self.apply_entry(entry).await;
-            if (i + 1) % YIELD_INTERVAL == 0 {
-                tokio::task::yield_now().await;
-            }
-        }
-
-        // 11. Process light_ready messages (outside of lock)
-        if !light_ready_messages.is_empty() {
-            debug!(
-                node_id = self.id,
-                "PROCESS_READY: Sending {} light_ready messages",
-                light_ready_messages.len()
-            );
-            self.transport.send_messages(light_ready_messages);
-        }
-
-        // 12. Apply light_ready committed entries (with same yield pattern)
-        if !light_ready_entries.is_empty() {
-            debug!(
-                node_id = self.id,
-                "PROCESS_READY: Processing {} light_ready committed entries",
-                light_ready_entries.len()
-            );
-        }
-        for (i, entry) in light_ready_entries.iter().enumerate() {
+        for (i, entry) in entries.iter().enumerate() {
             self.apply_entry(entry).await;
             if (i + 1) % YIELD_INTERVAL == 0 {
                 tokio::task::yield_now().await;
@@ -2185,7 +2224,7 @@ impl RaftNode {
                 _ = interval.tick() => {
                     self.tick();
                     self.process_ready().await;
-                    // 关键：强制 yield，让异步发送任务有机会运行
+                    // Force yield so async send tasks get a chance to run
                     tokio::task::yield_now().await;
                 }
                 _ = shutdown_rx.recv() => {

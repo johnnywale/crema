@@ -725,7 +725,7 @@ pub struct SlotLogEntry {
     pub key: Vec<u8>,
     /// Operation type.
     pub operation: SlotLogOperation,
-    /// Value (for puts) - stored as Vec<u8> for serialization.
+    /// Value (for puts) - stored as `Vec<u8>` for serialization.
     pub value: Option<Vec<u8>>,
 }
 

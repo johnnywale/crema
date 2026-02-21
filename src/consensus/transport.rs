@@ -91,38 +91,38 @@ pub trait RaftMessageSender: Send + Sync + 'static {
     fn shutdown(&self) -> BoxFuture<'_, ()>;
 }
 
-/// 消息优先级
+/// Message priority
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MessagePriority {
-    High,   // 心跳、投票
-    Normal, // 日志追加、快照
+    High,   // heartbeat, vote
+    Normal, // log append, snapshot
 }
 
-/// 背压事件类型
+/// Backpressure event type
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BackpressureEvent {
-    /// 队列已满，消息被丢弃
+    /// Queue is full, message was dropped
     QueueFull {
         peer_id: NodeId,
         priority: MessagePriority,
     },
-    /// 队列接近满（达到 80% 容量）
+    /// Queue is nearly full (reached 80% capacity)
     QueueHighWatermark {
         peer_id: NodeId,
         priority: MessagePriority,
         current_size: usize,
     },
-    /// 队列恢复正常（低于 50% 容量）
+    /// Queue returned to normal (below 50% capacity)
     QueueNormal {
         peer_id: NodeId,
         priority: MessagePriority,
     },
 }
 
-/// 背压回调函数类型
+/// Backpressure callback function type
 pub type BackpressureCallback = Arc<dyn Fn(BackpressureEvent) + Send + Sync>;
 
-/// 待发送的消息
+/// Pending message to be sent
 #[derive(Debug)]
 struct PendingMessage {
     #[allow(dead_code)]
@@ -198,10 +198,10 @@ impl PendingMessage {
     }
 }
 
-/// RAII 封装：连接 + Permit 绑定，防止泄露
+/// RAII wrapper: connection + permit binding to prevent leaks
 struct TiedConnection {
     stream: TcpStream,
-    _permit: OwnedSemaphorePermit, // Drop 时自动释放
+    _permit: OwnedSemaphorePermit, // automatically released on Drop
 }
 
 impl TiedConnection {
@@ -213,7 +213,7 @@ impl TiedConnection {
     }
 }
 
-/// 传输配置
+/// Transport configuration
 #[derive(Debug, Clone)]
 pub struct TransportConfig {
     pub max_retries: usize,
@@ -229,29 +229,33 @@ pub struct TransportConfig {
     pub per_peer_queue_size: usize,
     pub enable_connection_prewarming: bool,
     pub enable_retry_jitter: bool,
-    /// 空闲连接超时时间。如果连接在此时间内没有消息往来，将自动断开以释放资源。
-    /// 设置为 None 禁用空闲超时。
+    /// Idle connection timeout. If no messages are sent/received within this duration,
+    /// the connection is automatically closed to free resources.
+    /// Set to None to disable idle timeout.
     pub idle_timeout: Option<Duration>,
-    /// 消息批处理延迟。启用后，会等待此时间收集多条消息后一起发送。
-    /// 设置为 None 禁用批处理。
+    /// Message batching delay. When enabled, messages are collected for this duration
+    /// before being sent together.
+    /// Set to None to disable batching.
     pub batch_delay: Option<Duration>,
-    /// 批处理最大消息数量
+    /// Maximum number of messages per batch
     pub batch_max_messages: usize,
-    /// 批处理最大字节数。防止大消息导致OOM。
-    /// 当批次大小达到此限制时立即发送，即使消息数量未达到 batch_max_messages。
+    /// Maximum batch size in bytes. Prevents OOM from large messages.
+    /// When the batch size reaches this limit, it is sent immediately even if
+    /// the message count has not reached batch_max_messages.
     pub batch_max_bytes: usize,
-    /// 连接建立阶段的最大重试次数
+    /// Maximum retries during connection establishment
     pub max_connect_retries: usize,
-    /// 连接重试的初始延迟
+    /// Initial delay for connection retries
     pub initial_connect_retry_delay: Duration,
-    /// 连接重试的最大延迟
+    /// Maximum delay for connection retries
     pub max_connect_retry_delay: Duration,
-    /// 每个 peer 的待重试消息队列大小
+    /// Pending retry message queue size per peer
     pub max_pending_retries: usize,
-    /// 新增：连接失败后的持续重连间隔（针对 tc18 问题）
-    /// 即使没有新消息，worker 也会定期尝试重新建立连接
+    /// Background reconnect interval after connection failure (for tc18 fix).
+    /// Even without new messages, the worker will periodically attempt to re-establish the connection.
     pub background_reconnect_interval: Option<Duration>,
-    /// 新增：连接失败标记持续时间，在此期间强制尝试重连
+    /// Duration of the forced reconnect window after a connection failure.
+    /// During this window, reconnection is attempted aggressively.
     pub force_reconnect_window: Duration,
     /// Worker shutdown timeout - how long to wait for each worker to flush during shutdown.
     /// Use a shorter value for tests (e.g., 50ms) vs production (1s).
@@ -283,7 +287,7 @@ impl Default for TransportConfig {
             initial_connect_retry_delay: Duration::from_millis(50),
             max_connect_retry_delay: Duration::from_millis(500),
             max_pending_retries: 10,
-            // 新增：每500ms尝试重连，直到成功
+            // Attempt reconnection every 500ms until successful
             background_reconnect_interval: Some(Duration::from_millis(500)),
             force_reconnect_window: Duration::from_secs(30),
             worker_shutdown_timeout: Duration::from_secs(1),
@@ -311,14 +315,14 @@ impl TransportConfig {
     }
 }
 
-/// Worker 控制命令
+/// Worker control command
 #[derive(Debug)]
 enum WorkerCommand {
-    /// 优雅停止（刷完队列）
+    /// Graceful stop (flush the queue first)
     Stop(oneshot::Sender<()>),
 }
 
-/// 传输层控制命令
+/// Transport layer control command
 #[derive(Debug)]
 enum TransportCommand {
     UpdatePeer {
@@ -331,7 +335,7 @@ enum TransportCommand {
     Shutdown(oneshot::Sender<()>),
 }
 
-/// 详细的传输指标
+/// Detailed transport metrics
 #[derive(Debug, Default)]
 pub struct TransportMetrics {
     pub messages_sent: AtomicU64,
@@ -341,16 +345,16 @@ pub struct TransportMetrics {
     pub connections_created: AtomicU64,
     pub connections_failed: AtomicU64,
     pub active_connections: AtomicUsize,
-    /// 总发送延迟（微秒），用于计算平均延迟
+    /// Total send latency in microseconds, used to compute average latency
     pub total_send_latency_us: AtomicU64,
     pub send_count_for_latency: AtomicU64,
-    /// 连接建立阶段的重试次数
+    /// Retry count during connection establishment
     pub connection_retries: AtomicU64,
-    /// 因队列满而丢弃的消息数
+    /// Messages dropped due to full queue
     pub messages_dropped_queue_full: AtomicU64,
-    /// 当前待重试的消息总数
+    /// Current total number of pending retry messages
     pub pending_retries: AtomicUsize,
-    /// 新增：后台重连尝试次数
+    /// Background reconnection attempt count
     pub background_reconnect_attempts: AtomicU64,
 }
 
@@ -482,19 +486,19 @@ pub struct TransportMetricsSnapshot {
     pub connections_created: u64,
     pub connections_failed: u64,
     pub active_connections: usize,
-    /// 平均发送延迟（微秒）
+    /// Average send latency in microseconds
     pub average_send_latency_us: u64,
-    /// 连接建立阶段的重试次数
+    /// Retry count during connection establishment
     pub connection_retries: u64,
-    /// 因队列满而丢弃的消息数
+    /// Messages dropped due to full queue
     pub messages_dropped_queue_full: u64,
-    /// 当前待重试的消息总数
+    /// Current total number of pending retry messages
     pub pending_retries: usize,
-    /// 新增：后台重连尝试次数
+    /// Background reconnection attempt count
     pub background_reconnect_attempts: u64,
 }
 
-/// Per-Peer Worker 状态
+/// Per-peer worker state
 struct PeerWorker {
     peer_id: NodeId,
     #[allow(dead_code)]
@@ -505,7 +509,7 @@ struct PeerWorker {
     handle: tokio::task::JoinHandle<()>,
 }
 
-/// Raft 消息传输层
+/// Raft message transport layer
 pub struct RaftTransport {
     node_id: NodeId,
     peers: Arc<RwLock<HashMap<NodeId, SocketAddr>>>,
@@ -516,9 +520,9 @@ pub struct RaftTransport {
     config: TransportConfig,
     metrics: Arc<TransportMetrics>,
     connection_semaphore: Arc<Semaphore>,
-    /// 背压回调，用于通知 Raft 状态机减缓发送速度
+    /// Backpressure callback to notify the Raft state machine to slow down sending
     backpressure_callback: Option<BackpressureCallback>,
-    /// 待发送消息队列：用于 peer 在 peers 中但 worker 尚未就绪时缓存消息
+    /// Pending message queue: buffers messages when a peer is known but its worker is not yet ready
     pending_messages: Arc<RwLock<HashMap<NodeId, VecDeque<PendingMessage>>>>,
 }
 
@@ -570,13 +574,13 @@ impl RaftTransport {
         }
     }
 
-    /// 设置背压回调函数
-    /// 当队列满或达到高水位时会调用此回调，用于通知上层减缓发送速度
+    /// Set the backpressure callback.
+    /// Called when the queue is full or reaches high watermark, to notify upper layers to slow down.
     pub fn set_backpressure_callback(&mut self, callback: BackpressureCallback) {
         self.backpressure_callback = Some(callback);
     }
 
-    /// 创建带背压回调的 Transport
+    /// Create a Transport with a backpressure callback
     pub fn with_backpressure_callback(
         node_id: NodeId,
         config: TransportConfig,
@@ -653,7 +657,7 @@ impl RaftTransport {
         self.metrics.snapshot()
     }
 
-    /// 发送 Raft 消息（带优先级判断和背压反馈）
+    /// Send a Raft message (with priority routing and backpressure feedback)
     pub fn send(&self, msg: RaftMessage) -> Result<()> {
         let to = msg.to;
         let msg_type = msg.msg_type;
@@ -665,7 +669,7 @@ impl RaftTransport {
         let message = Message::Raft(wrapper);
         let pending = PendingMessage::new(to, message);
 
-        // 根据优先级选择队列
+        // Select queue based on priority
         let worker = {
             let workers = self.workers.read();
             workers
@@ -679,13 +683,13 @@ impl RaftTransport {
                 MessagePriority::Normal => &np_tx,
             };
 
-            // 计算队列使用率并触发背压回调
+            // Calculate queue utilization and trigger backpressure callback
             let capacity = tx.capacity();
             let max_capacity = tx.max_capacity();
             let current_size = max_capacity - capacity;
             let usage_percent = (current_size * 100) / max_capacity;
 
-            // 检查背压状态
+            // Check backpressure state
             if let Some(ref callback) = self.backpressure_callback {
                 if usage_percent >= 80 {
                     callback(BackpressureEvent::QueueHighWatermark {
@@ -694,7 +698,7 @@ impl RaftTransport {
                         current_size,
                     });
                 } else if usage_percent < 50 && current_size > 0 {
-                    // 只在队列有数据但低于 50% 时通知恢复
+                    // Only notify recovery when queue has data but is below 50%
                     callback(BackpressureEvent::QueueNormal {
                         peer_id: to,
                         priority,
@@ -705,7 +709,7 @@ impl RaftTransport {
             match tx.try_send(pending) {
                 Ok(_) => {}
                 Err(_) => {
-                    // 队列满，触发背压回调
+                    // Queue full, trigger backpressure callback
                     if let Some(ref callback) = self.backpressure_callback {
                         callback(BackpressureEvent::QueueFull {
                             peer_id: to,
@@ -718,14 +722,14 @@ impl RaftTransport {
                 }
             }
         } else {
-            // Worker 不存在，检查 peer 是否已知
+            // Worker does not exist, check if peer is known
             let peer_known = self.peers.read().contains_key(&to);
             if peer_known {
-                // Peer 已知但 worker 尚未就绪，将消息放入待发送队列
+                // Peer is known but worker is not ready yet; queue the message for later
                 let mut pending_map = self.pending_messages.write();
                 let queue = pending_map.entry(to).or_default();
 
-                // 限制待发送队列大小，防止内存膨胀
+                // Limit pending queue size to prevent memory bloat
                 if queue.len() < self.config.max_pending_retries {
                     queue.push_back(pending);
                     debug!(
@@ -735,7 +739,7 @@ impl RaftTransport {
                         "Message queued for pending peer"
                     );
                 } else {
-                    // 队列满，丢弃消息
+                    // Queue full, drop message
                     self.metrics
                         .messages_dropped_queue_full
                         .fetch_add(1, Ordering::Relaxed);
@@ -885,7 +889,7 @@ impl RaftTransport {
             debug!(node_id = self.node_id, peer_id, "Peer worker created");
         }
 
-        // Worker 创建后，立即将待发送队列中的消息转发给 worker
+        // After worker creation, immediately forward queued pending messages to the worker
         let pending_msgs: Vec<PendingMessage> = {
             let mut pending_map = self.pending_messages.write();
             pending_map
@@ -897,7 +901,7 @@ impl RaftTransport {
         if !pending_msgs.is_empty() {
             let count = pending_msgs.len();
             for msg in pending_msgs {
-                // 将待发送消息发送到高优先级队列（因为这些是早期关键消息）
+                // Send pending messages to the high-priority queue (these are early critical messages)
                 if hp_tx_clone.try_send(msg).is_err() {
                     debug!(
                         node_id = self.node_id,
@@ -912,7 +916,7 @@ impl RaftTransport {
         }
     }
 
-    /// Dispatcher：处理控制命令，支持优雅停机
+    /// Dispatcher: processes control commands, supports graceful shutdown
     async fn dispatcher_loop(
         node_id: NodeId,
         workers: Arc<RwLock<HashMap<NodeId, PeerWorker>>>,
@@ -927,25 +931,25 @@ impl RaftTransport {
         while let Some(cmd) = command_rx.recv().await {
             match cmd {
                 TransportCommand::UpdatePeer { peer_id, new_addr } => {
-                    // 1. 异步清理旧 Worker，不阻塞当前 Dispatcher 循环
+                    // 1. Clean up old worker asynchronously without blocking the dispatcher loop
                     if let Some(worker) = workers.write().remove(&peer_id) {
                         tokio::spawn(async move {
                             let (tx, rx) = oneshot::channel();
-                            // 1. 发送停止信号
+                            // 1. Send stop signal
                             if worker.control_tx.send(WorkerCommand::Stop(tx)).is_ok() {
-                                // 2. 给一段较短的优雅时间（例如 200ms，测试环境下可以更短）
+                                // 2. Allow a short grace period (e.g., 200ms; can be shorter in test environments)
                                 if (tokio::time::timeout(Duration::from_millis(200), rx).await)
                                     .is_err()
                                 {
                                     debug!(peer_id, "Worker graceful stop timeout, forcing abort");
                                 }
                             }
-                            // 3. 无论如何，最后确保 handle 被 abort 以释放所有资源（包括 Permit）
+                            // 3. Regardless of the outcome, abort the handle to release all resources (including the permit)
                             worker.handle.abort();
                         });
                     }
 
-                    // 2. 立即更新地址并创建新 Worker
+                    // 2. Update address immediately and create new worker
                     peers.write().insert(peer_id, new_addr);
 
                     let (hp_tx, hp_rx) = mpsc::channel(config.per_peer_queue_size);
@@ -984,7 +988,7 @@ impl RaftTransport {
                 TransportCommand::RemovePeer { peer_id } => {
                     peers.write().remove(&peer_id);
                     if let Some(worker) = workers.write().remove(&peer_id) {
-                        // 同样异步清理
+                        // Also clean up asynchronously
                         tokio::spawn(async move {
                             let (tx, rx) = oneshot::channel();
                             let _ = worker.control_tx.send(WorkerCommand::Stop(tx));
@@ -996,7 +1000,7 @@ impl RaftTransport {
                 TransportCommand::Shutdown(ack) => {
                     info!(node_id, "Initiating global shutdown");
 
-                    // 关键点 1：立即取出所有 Worker 并释放锁，防止锁竞争
+                    // Key point 1: Drain all workers immediately and release the lock to avoid contention
                     let worker_list: Vec<PeerWorker> = {
                         let mut current_workers = workers.write();
                         current_workers.drain().map(|(_, v)| v).collect()
@@ -1013,13 +1017,13 @@ impl RaftTransport {
                             if (tokio::time::timeout(shutdown_timeout, rx).await).is_err() {
                                 debug!(peer_id = worker.peer_id, "Worker stop timeout, aborting");
                             }
-                            // 关键点 2：显式调用 abort 确保 handle 结束
+                            // Key point 2: Explicitly abort the handle to ensure it terminates
                             worker.handle.abort();
                             let _ = worker.handle.await;
                         });
                     }
 
-                    // 关键点 3：总控超时，确保 Dispatcher 一定能退出
+                    // Key point 3: Overall timeout to ensure the dispatcher can always exit
                     let _ = tokio::time::timeout(
                         Duration::from_secs(3),
                         futures::future::join_all(drain_futures),
@@ -1034,361 +1038,296 @@ impl RaftTransport {
         info!(node_id, "Dispatcher loop exited");
     }
 
-    /// Per-Peer Worker：双队列优先级调度 + 缓冲区复用 + 空闲超时 + 批处理 + 连接预热 + 消息重试
+    /// Handle background reconnection attempt.
     ///
-    /// **关键改进（针对 tc18_stale_leader_replacement）：**
-    /// 1. 增加后台重连机制：即使没有新消息，也会定期尝试重新建立连接
-    /// 2. 连接失败后强制标记需要重连，避免 Pre-Vote 死循环
-    /// 3. 确保连接失败时完全清除旧连接，下次发送时触发重连
+    /// For tc18 fix: proactively attempt reconnection even without new messages.
     #[allow(clippy::too_many_arguments)]
-    async fn peer_worker_loop(
+    async fn handle_background_reconnect(
         peer_id: NodeId,
         addr: SocketAddr,
-        mut high_priority_rx: mpsc::Receiver<PendingMessage>,
-        mut normal_priority_rx: mpsc::Receiver<PendingMessage>,
-        mut control_rx: mpsc::UnboundedReceiver<WorkerCommand>,
-        config: TransportConfig,
-        metrics: Arc<TransportMetrics>,
-        semaphore: Arc<Semaphore>,
-        prewarm: bool,
+        connection: &mut Option<TiedConnection>,
+        pending_retry: &VecDeque<PendingMessage>,
+        last_connection_failure: &mut Option<Instant>,
+        config: &TransportConfig,
+        metrics: &Arc<TransportMetrics>,
+        semaphore: &Arc<Semaphore>,
     ) {
-        debug!(peer_id, %addr, prewarm, "Peer worker started with enhanced reconnection");
+        debug!(peer_id, "Attempting background reconnection");
+        metrics
+            .background_reconnect_attempts
+            .fetch_add(1, Ordering::Relaxed);
 
-        let mut connection: Option<TiedConnection> = None;
-        let mut buffer = BytesMut::with_capacity(4096); // 复用缓冲区
-        let mut last_activity = Instant::now();
+        *connection =
+            Self::establish_connection_with_retry(peer_id, addr, config, metrics, semaphore).await;
 
-        // 新增：追踪最后一次连接失败的时间
-        let mut last_connection_failure: Option<Instant> = None;
+        if connection.is_some() {
+            info!(peer_id, "Background reconnection successful");
+            *last_connection_failure = None;
 
-        // 新增：待重试消息队列
-        let mut pending_retry: VecDeque<PendingMessage> = VecDeque::new();
-
-        // 连接预热：在 worker 启动时立即尝试建立连接（使用带重试的版本）
-        if prewarm {
-            debug!(peer_id, "Pre-warming connection");
-            connection =
-                Self::establish_connection_with_retry(peer_id, addr, &config, &metrics, &semaphore)
-                    .await;
-            if connection.is_some() {
-                debug!(peer_id, "Connection pre-warmed successfully");
-                last_connection_failure = None; // 连接成功，清除失败标记
-            } else {
+            if !pending_retry.is_empty() {
                 debug!(
                     peer_id,
-                    "Connection pre-warm failed, will retry on first message"
+                    pending_count = pending_retry.len(),
+                    "Processing pending retry queue after reconnection"
                 );
-                last_connection_failure = Some(Instant::now()); // 标记连接失败
             }
+        } else {
+            debug!(peer_id, "Background reconnection failed, will retry");
+            *last_connection_failure = Some(Instant::now());
+        }
+    }
+
+    /// Process one message from the pending retry queue.
+    #[allow(clippy::too_many_arguments)]
+    async fn handle_retry_message(
+        peer_id: NodeId,
+        addr: SocketAddr,
+        pending_retry: &mut VecDeque<PendingMessage>,
+        last_activity: &mut Instant,
+        connection: &mut Option<TiedConnection>,
+        buffer: &mut BytesMut,
+        last_connection_failure: &mut Option<Instant>,
+        config: &TransportConfig,
+        metrics: &Arc<TransportMetrics>,
+        semaphore: &Arc<Semaphore>,
+    ) {
+        if let Some(msg) = pending_retry.pop_front() {
+            metrics.pending_retries.fetch_sub(1, Ordering::Relaxed);
+            *last_activity = Instant::now();
+            Self::process_message(
+                peer_id,
+                addr,
+                msg,
+                connection,
+                buffer,
+                config,
+                metrics,
+                semaphore,
+                MessagePriority::High, // retry messages treated as high priority
+                last_connection_failure,
+            )
+            .await;
+        }
+    }
+
+    /// Try to establish a connection if disconnected, queuing the message for retry on failure.
+    ///
+    /// Returns `true` if a connection is available (existing or newly established),
+    /// `false` if connection failed and the message was queued/dropped.
+    #[allow(clippy::too_many_arguments)]
+    async fn ensure_connected_or_queue(
+        peer_id: NodeId,
+        addr: SocketAddr,
+        msg: PendingMessage,
+        connection: &mut Option<TiedConnection>,
+        pending_retry: &mut VecDeque<PendingMessage>,
+        last_connection_failure: &mut Option<Instant>,
+        config: &TransportConfig,
+        metrics: &Arc<TransportMetrics>,
+        semaphore: &Arc<Semaphore>,
+        label: &str,
+    ) -> Option<PendingMessage> {
+        if connection.is_some() {
+            return Some(msg);
         }
 
-        // 批处理缓冲区
-        let mut batch_buffer: Vec<PendingMessage> = Vec::with_capacity(config.batch_max_messages);
-        let mut batch_bytes: usize = 0; // Track current batch size in bytes
-        let batch_delay = config.batch_delay;
+        debug!(peer_id, "{} triggered connection attempt", label);
+        *connection =
+            Self::establish_connection_with_retry(peer_id, addr, config, metrics, semaphore).await;
+
+        if connection.is_none() {
+            *last_connection_failure = Some(Instant::now());
+            if pending_retry.len() < config.max_pending_retries {
+                pending_retry.push_back(msg);
+                metrics.pending_retries.fetch_add(1, Ordering::Relaxed);
+                debug!(
+                    peer_id,
+                    pending_count = pending_retry.len(),
+                    "{} queued for retry",
+                    label
+                );
+            } else {
+                metrics
+                    .messages_dropped_queue_full
+                    .fetch_add(1, Ordering::Relaxed);
+                metrics.messages_failed.fetch_add(1, Ordering::Relaxed);
+                warn!(peer_id, "Pending retry queue full, {} dropped", label);
+            }
+            None
+        } else {
+            *last_connection_failure = None;
+            Some(msg)
+        }
+    }
+
+    /// Handle a normal-priority message: batch or send immediately depending on config.
+    #[allow(clippy::too_many_arguments)]
+    async fn handle_normal_message_send(
+        peer_id: NodeId,
+        addr: SocketAddr,
+        msg: PendingMessage,
+        batch_delay: Option<Duration>,
+        batch_buffer: &mut Vec<PendingMessage>,
+        batch_bytes: &mut usize,
+        connection: &mut Option<TiedConnection>,
+        buffer: &mut BytesMut,
+        last_connection_failure: &mut Option<Instant>,
+        config: &TransportConfig,
+        metrics: &Arc<TransportMetrics>,
+        semaphore: &Arc<Semaphore>,
+    ) {
+        if batch_delay.is_some() {
+            // Batching enabled: collect messages
+            *batch_bytes += msg.estimated_size;
+            batch_buffer.push(msg);
+
+            // If batch limit reached (message count or byte size), send immediately
+            if batch_buffer.len() >= config.batch_max_messages
+                || *batch_bytes >= config.batch_max_bytes
+            {
+                Self::process_batch(
+                    peer_id,
+                    addr,
+                    batch_buffer,
+                    batch_bytes,
+                    connection,
+                    buffer,
+                    config,
+                    metrics,
+                    semaphore,
+                    last_connection_failure,
+                )
+                .await;
+            }
+        } else {
+            // Batching disabled: send immediately
+            Self::process_message(
+                peer_id,
+                addr,
+                msg,
+                connection,
+                buffer,
+                config,
+                metrics,
+                semaphore,
+                MessagePriority::Normal,
+                last_connection_failure,
+            )
+            .await;
+        }
+    }
+
+    /// Handle idle timeout: close the connection to free resources.
+    async fn handle_idle_timeout(
+        peer_id: NodeId,
+        connection: &mut Option<TiedConnection>,
+        metrics: &Arc<TransportMetrics>,
+    ) {
+        debug!(peer_id, "Connection idle timeout, closing");
+        if let Some(mut conn) = connection.take() {
+            let _ = conn.stream.shutdown().await;
+            metrics.active_connections.fetch_sub(1, Ordering::Relaxed);
+        }
+    }
+
+    /// Handle graceful shutdown: flush batch buffer, retry queue, and remaining channel messages.
+    #[allow(clippy::too_many_arguments)]
+    async fn handle_graceful_shutdown(
+        peer_id: NodeId,
+        addr: SocketAddr,
+        ack: oneshot::Sender<()>,
+        high_priority_rx: &mut mpsc::Receiver<PendingMessage>,
+        normal_priority_rx: &mut mpsc::Receiver<PendingMessage>,
+        batch_buffer: &mut Vec<PendingMessage>,
+        batch_bytes: &mut usize,
+        pending_retry: &mut VecDeque<PendingMessage>,
+        connection: &mut Option<TiedConnection>,
+        buffer: &mut BytesMut,
+        last_connection_failure: &mut Option<Instant>,
+        config: &TransportConfig,
+        metrics: &Arc<TransportMetrics>,
+        semaphore: &Arc<Semaphore>,
+    ) {
+        debug!(peer_id, "Flushing remaining messages before stop");
+
+        // First, send messages in the batch buffer
+        if !batch_buffer.is_empty() {
+            Self::process_batch(
+                peer_id,
+                addr,
+                batch_buffer,
+                batch_bytes,
+                connection,
+                buffer,
+                config,
+                metrics,
+                semaphore,
+                last_connection_failure,
+            )
+            .await;
+        }
+
+        // Process messages in the retry queue
+        while let Some(msg) = pending_retry.pop_front() {
+            metrics.pending_retries.fetch_sub(1, Ordering::Relaxed);
+            Self::process_message(
+                peer_id,
+                addr,
+                msg,
+                connection,
+                buffer,
+                config,
+                metrics,
+                semaphore,
+                MessagePriority::High,
+                last_connection_failure,
+            )
+            .await;
+        }
+
+        // Flush all remaining messages (with timeout)
+        let flush_timeout = tokio::time::sleep(Duration::from_secs(1));
+        tokio::pin!(flush_timeout);
 
         loop {
-            // 计算空闲超时
-            let idle_timeout_fut = if let Some(idle_timeout) = config.idle_timeout {
-                let elapsed = last_activity.elapsed();
-                if elapsed >= idle_timeout {
-                    // 已经超时，立即触发
-                    tokio::time::sleep(Duration::ZERO)
-                } else {
-                    tokio::time::sleep(idle_timeout - elapsed)
-                }
-            } else {
-                // 禁用空闲超时，使用一个永远不会触发的 future
-                tokio::time::sleep(Duration::from_secs(86400 * 365)) // 1 year
-            };
-
-            // 计算批处理超时（如果有待处理的批次）
-            let batch_timeout_fut = if !batch_buffer.is_empty() {
-                if let Some(delay) = batch_delay {
-                    tokio::time::sleep(delay)
-                } else {
-                    tokio::time::sleep(Duration::ZERO) // 立即发送
-                }
-            } else {
-                tokio::time::sleep(Duration::from_secs(86400 * 365)) // 永不触发
-            };
-
-            // 计算重试队列处理超时（有连接且有待重试消息时触发）
-            let retry_timeout_fut = if !pending_retry.is_empty() && connection.is_some() {
-                tokio::time::sleep(Duration::from_millis(100))
-            } else {
-                tokio::time::sleep(Duration::from_secs(86400 * 365)) // 永不触发
-            };
-
-            // **关键新增：后台重连定时器**
-            // 如果连接断开且在强制重连窗口内，定期尝试重连
-            let background_reconnect_fut = if connection.is_none()
-                && last_connection_failure.is_some()
-                && last_connection_failure.unwrap().elapsed() < config.force_reconnect_window
-            {
-                if let Some(interval) = config.background_reconnect_interval {
-                    tokio::time::sleep(interval)
-                } else {
-                    tokio::time::sleep(Duration::from_secs(86400 * 365))
-                }
-            } else {
-                tokio::time::sleep(Duration::from_secs(86400 * 365))
-            };
-
             tokio::select! {
-                biased; // 使用有偏选择，确保优先级顺序
-
-                // **新增：后台重连逻辑（最高优先级）**
-                // 针对 tc18 问题：即使没有新消息，也主动尝试重连
-                _ = background_reconnect_fut, if connection.is_none() && last_connection_failure.is_some() => {
-                    debug!(peer_id, "Attempting background reconnection");
-                    metrics.background_reconnect_attempts.fetch_add(1, Ordering::Relaxed);
-
-                    connection = Self::establish_connection_with_retry(
-                        peer_id, addr, &config, &metrics, &semaphore
-                    ).await;
-
-                    if connection.is_some() {
-                        info!(peer_id, "Background reconnection successful");
-                        last_connection_failure = None; // 连接成功，清除失败标记
-
-                        // 连接恢复后，立即尝试处理待重试队列
-                        if !pending_retry.is_empty() {
-                            debug!(peer_id, pending_count = pending_retry.len(),
-                                "Processing pending retry queue after reconnection");
-                        }
-                    } else {
-                        debug!(peer_id, "Background reconnection failed, will retry");
-                        last_connection_failure = Some(Instant::now());
-                    }
-                }
-
-                // 0. 优先处理重试队列中的消息（当有连接时）
-                _ = retry_timeout_fut, if !pending_retry.is_empty() && connection.is_some() => {
-                    if let Some(msg) = pending_retry.pop_front() {
-                        metrics.pending_retries.fetch_sub(1, Ordering::Relaxed);
-                        last_activity = Instant::now();
-                        Self::process_message(
-                            peer_id,
-                            addr,
-                            msg,
-                            &mut connection,
-                            &mut buffer,
-                            &config,
-                            &metrics,
-                            &semaphore,
-                            MessagePriority::High, // 重试消息视为高优先级
-                            &mut last_connection_failure,
-                        ).await;
-                    }
-                }
-
-                // 1. 优先处理高优先级消息（不参与批处理，立即发送）
                 Some(msg) = high_priority_rx.recv() => {
-                    last_activity = Instant::now();
-
-                    // 如果没有连接，尝试建立（使用带重试的版本）
-                    if connection.is_none() {
-                        debug!(peer_id, "High-priority message triggered connection attempt");
-                        connection = Self::establish_connection_with_retry(peer_id, addr, &config, &metrics, &semaphore).await;
-
-                        // 连接仍然失败，将消息放入重试队列
-                        if connection.is_none() {
-                            last_connection_failure = Some(Instant::now()); // 标记连接失败
-                            if pending_retry.len() < config.max_pending_retries {
-                                pending_retry.push_back(msg);
-                                metrics.pending_retries.fetch_add(1, Ordering::Relaxed);
-                                debug!(peer_id, pending_count = pending_retry.len(), "High-priority message queued for retry");
-                            } else {
-                                // 队列满，丢弃消息
-                                metrics.messages_dropped_queue_full.fetch_add(1, Ordering::Relaxed);
-                                metrics.messages_failed.fetch_add(1, Ordering::Relaxed);
-                                warn!(peer_id, "Pending retry queue full, high-priority message dropped");
-                            }
-                            continue;
-                        } else {
-                            last_connection_failure = None; // 连接成功，清除失败标记
-                        }
-                    }
-
-                    // 立即发送（不批处理）
                     Self::process_message(
-                        peer_id,
-                        addr,
-                        msg,
-                        &mut connection,
-                        &mut buffer,
-                        &config,
-                        &metrics,
-                        &semaphore,
-                        MessagePriority::High,
-                        &mut last_connection_failure,
+                        peer_id, addr, msg, connection, buffer,
+                        config, metrics, semaphore, MessagePriority::High,
+                        last_connection_failure,
                     ).await;
                 }
-
-                // 2. 处理普通优先级消息（可批处理）
-                Some(msg) = normal_priority_rx.recv(), if high_priority_rx.is_empty() => {
-                    last_activity = Instant::now();
-
-                    // 如果没有连接，尝试建立（使用带重试的版本）
-                    if connection.is_none() {
-                        connection = Self::establish_connection_with_retry(peer_id, addr, &config, &metrics, &semaphore).await;
-
-                        // 连接仍然失败，将消息放入重试队列
-                        if connection.is_none() {
-                            last_connection_failure = Some(Instant::now()); // 标记连接失败
-                            if pending_retry.len() < config.max_pending_retries {
-                                pending_retry.push_back(msg);
-                                metrics.pending_retries.fetch_add(1, Ordering::Relaxed);
-                                debug!(peer_id, pending_count = pending_retry.len(), "Message queued for retry");
-                            } else {
-                                // 队列满，丢弃消息
-                                metrics.messages_dropped_queue_full.fetch_add(1, Ordering::Relaxed);
-                                metrics.messages_failed.fetch_add(1, Ordering::Relaxed);
-                                warn!(peer_id, "Pending retry queue full, message dropped");
-                            }
-                            continue;
-                        } else {
-                            last_connection_failure = None; // 连接成功，清除失败标记
-                        }
-                    }
-
-                    if batch_delay.is_some() {
-                        // 启用批处理：收集消息
-                        batch_bytes += msg.estimated_size;
-                        batch_buffer.push(msg);
-
-                        // 如果达到批处理上限（消息数量或字节数），立即发送
-                        if batch_buffer.len() >= config.batch_max_messages
-                            || batch_bytes >= config.batch_max_bytes
-                        {
-                            Self::process_batch(
-                                peer_id,
-                                addr,
-                                &mut batch_buffer,
-                                &mut batch_bytes,
-                                &mut connection,
-                                &mut buffer,
-                                &config,
-                                &metrics,
-                                &semaphore,
-                                &mut last_connection_failure,
-                            ).await;
-                        }
-                    } else {
-                        // 禁用批处理：立即发送
-                        Self::process_message(
-                            peer_id,
-                            addr,
-                            msg,
-                            &mut connection,
-                            &mut buffer,
-                            &config,
-                            &metrics,
-                            &semaphore,
-                            MessagePriority::Normal,
-                            &mut last_connection_failure,
-                        ).await;
-                    }
-                }
-
-                // 3. 批处理超时：发送累积的消息
-                _ = batch_timeout_fut, if !batch_buffer.is_empty() => {
-                    Self::process_batch(
-                        peer_id,
-                        addr,
-                        &mut batch_buffer,
-                        &mut batch_bytes,
-                        &mut connection,
-                        &mut buffer,
-                        &config,
-                        &metrics,
-                        &semaphore,
-                        &mut last_connection_failure,
+                Some(msg) = normal_priority_rx.recv() => {
+                    Self::process_message(
+                        peer_id, addr, msg, connection, buffer,
+                        config, metrics, semaphore, MessagePriority::Normal,
+                        last_connection_failure,
                     ).await;
                 }
-
-                // 4. 空闲超时：关闭连接以释放资源
-                _ = idle_timeout_fut, if connection.is_some() => {
-                    debug!(peer_id, "Connection idle timeout, closing");
-                    if let Some(mut conn) = connection.take() {
-                        let _ = conn.stream.shutdown().await;
-                        metrics.active_connections.fetch_sub(1, Ordering::Relaxed);
-                    }
-                    // 不退出 worker，等待新消息时重新连接
-                }
-
-                // 5. 优雅停机：刷完队列
-                Some(WorkerCommand::Stop(ack)) = control_rx.recv() => {
-                    debug!(peer_id, "Flushing remaining messages before stop");
-
-                    // 先发送批处理缓冲区中的消息
-                    if !batch_buffer.is_empty() {
-                        Self::process_batch(
-                            peer_id,
-                            addr,
-                            &mut batch_buffer,
-                            &mut batch_bytes,
-                            &mut connection,
-                            &mut buffer,
-                            &config,
-                            &metrics,
-                            &semaphore,
-                            &mut last_connection_failure,
-                        ).await;
-                    }
-
-                    // 处理重试队列中的消息
-                    while let Some(msg) = pending_retry.pop_front() {
-                        metrics.pending_retries.fetch_sub(1, Ordering::Relaxed);
-                        Self::process_message(
-                            peer_id, addr, msg, &mut connection, &mut buffer,
-                            &config, &metrics, &semaphore, MessagePriority::High,
-                            &mut last_connection_failure,
-                        ).await;
-                    }
-
-                    // 刷完所有消息（带超时）
-                    let flush_timeout = tokio::time::sleep(Duration::from_secs(1));
-                    tokio::pin!(flush_timeout);
-
-                    loop {
-                        tokio::select! {
-                            Some(msg) = high_priority_rx.recv() => {
-                                Self::process_message(
-                                    peer_id, addr, msg, &mut connection, &mut buffer,
-                                    &config, &metrics, &semaphore, MessagePriority::High,
-                                    &mut last_connection_failure,
-                                ).await;
-                            }
-                            Some(msg) = normal_priority_rx.recv() => {
-                                Self::process_message(
-                                    peer_id, addr, msg, &mut connection, &mut buffer,
-                                    &config, &metrics, &semaphore, MessagePriority::Normal,
-                                    &mut last_connection_failure,
-                                ).await;
-                            }
-                            _ = &mut flush_timeout => {
-                                warn!(peer_id, "Flush timeout, forcing stop");
-                                break;
-                            }
-                            else => break,
-                        }
-                    }
-
-                    let _ = ack.send(());
+                _ = &mut flush_timeout => {
+                    warn!(peer_id, "Flush timeout, forcing stop");
                     break;
                 }
+                else => break,
             }
         }
 
-        // 清理连接
+        let _ = ack.send(());
+    }
+
+    /// Clean up connection and pending retry queue on worker exit.
+    async fn cleanup_worker(
+        peer_id: NodeId,
+        connection: &mut Option<TiedConnection>,
+        pending_retry: &VecDeque<PendingMessage>,
+        metrics: &Arc<TransportMetrics>,
+    ) {
         if let Some(mut conn) = connection.take() {
             let _ = conn.stream.shutdown().await;
             metrics.active_connections.fetch_sub(1, Ordering::Relaxed);
         }
 
-        // 清理待重试队列的指标
         let remaining = pending_retry.len();
         if remaining > 0 {
             metrics
@@ -1406,9 +1345,176 @@ impl RaftTransport {
         debug!(peer_id, "Worker exited");
     }
 
-    /// 批量处理消息（零拷贝优化）
+    /// Create a sleep future that fires never (used as a disabled timer).
+    fn never_fire_sleep() -> tokio::time::Sleep {
+        tokio::time::sleep(Duration::from_secs(86400 * 365))
+    }
+
+    /// Per-peer worker: dual-queue priority scheduling + buffer reuse + idle timeout + batching + connection prewarming + message retry
     ///
-    /// **关键改进：增加连接失败追踪和字节大小限制**
+    /// **Key improvements (for tc18_stale_leader_replacement):**
+    /// 1. Added background reconnect mechanism: periodically attempts reconnection even without new messages
+    /// 2. Force-marks reconnection needed after connection failure to avoid Pre-Vote deadloop
+    /// 3. Ensures old connection is fully removed on failure so the next send triggers reconnection
+    #[allow(clippy::too_many_arguments)]
+    async fn peer_worker_loop(
+        peer_id: NodeId,
+        addr: SocketAddr,
+        mut high_priority_rx: mpsc::Receiver<PendingMessage>,
+        mut normal_priority_rx: mpsc::Receiver<PendingMessage>,
+        mut control_rx: mpsc::UnboundedReceiver<WorkerCommand>,
+        config: TransportConfig,
+        metrics: Arc<TransportMetrics>,
+        semaphore: Arc<Semaphore>,
+        prewarm: bool,
+    ) {
+        debug!(peer_id, %addr, prewarm, "Peer worker started with enhanced reconnection");
+
+        let mut connection: Option<TiedConnection> = None;
+        let mut buffer = BytesMut::with_capacity(4096); // reused buffer
+        let mut last_activity = Instant::now();
+        let mut last_connection_failure: Option<Instant> = None;
+        let mut pending_retry: VecDeque<PendingMessage> = VecDeque::new();
+
+        // Connection prewarming
+        if prewarm {
+            debug!(peer_id, "Pre-warming connection");
+            connection =
+                Self::establish_connection_with_retry(peer_id, addr, &config, &metrics, &semaphore)
+                    .await;
+            if connection.is_some() {
+                debug!(peer_id, "Connection pre-warmed successfully");
+                last_connection_failure = None;
+            } else {
+                debug!(
+                    peer_id,
+                    "Connection pre-warm failed, will retry on first message"
+                );
+                last_connection_failure = Some(Instant::now());
+            }
+        }
+
+        let mut batch_buffer: Vec<PendingMessage> = Vec::with_capacity(config.batch_max_messages);
+        let mut batch_bytes: usize = 0;
+        let batch_delay = config.batch_delay;
+
+        loop {
+            // Calculate timeout futures
+            let idle_timeout_fut = match config.idle_timeout {
+                Some(idle_timeout) => {
+                    let elapsed = last_activity.elapsed();
+                    if elapsed >= idle_timeout {
+                        tokio::time::sleep(Duration::ZERO)
+                    } else {
+                        tokio::time::sleep(idle_timeout - elapsed)
+                    }
+                }
+                None => Self::never_fire_sleep(),
+            };
+
+            let batch_timeout_fut = if !batch_buffer.is_empty() {
+                batch_delay.map_or_else(|| tokio::time::sleep(Duration::ZERO), tokio::time::sleep)
+            } else {
+                Self::never_fire_sleep()
+            };
+
+            let retry_timeout_fut = if !pending_retry.is_empty() && connection.is_some() {
+                tokio::time::sleep(Duration::from_millis(100))
+            } else {
+                Self::never_fire_sleep()
+            };
+
+            let background_reconnect_fut = if connection.is_none()
+                && last_connection_failure
+                    .is_some_and(|t| t.elapsed() < config.force_reconnect_window)
+            {
+                config
+                    .background_reconnect_interval
+                    .map_or_else(Self::never_fire_sleep, tokio::time::sleep)
+            } else {
+                Self::never_fire_sleep()
+            };
+
+            tokio::select! {
+                biased; // use biased select to ensure priority ordering
+
+                _ = background_reconnect_fut, if connection.is_none() && last_connection_failure.is_some() => {
+                    Self::handle_background_reconnect(
+                        peer_id, addr, &mut connection, &pending_retry,
+                        &mut last_connection_failure, &config, &metrics, &semaphore,
+                    ).await;
+                }
+
+                _ = retry_timeout_fut, if !pending_retry.is_empty() && connection.is_some() => {
+                    Self::handle_retry_message(
+                        peer_id, addr, &mut pending_retry, &mut last_activity,
+                        &mut connection, &mut buffer, &mut last_connection_failure,
+                        &config, &metrics, &semaphore,
+                    ).await;
+                }
+
+                Some(msg) = high_priority_rx.recv() => {
+                    last_activity = Instant::now();
+                    let msg = Self::ensure_connected_or_queue(
+                        peer_id, addr, msg, &mut connection, &mut pending_retry,
+                        &mut last_connection_failure, &config, &metrics, &semaphore,
+                        "High-priority message",
+                    ).await;
+                    if let Some(msg) = msg {
+                        Self::process_message(
+                            peer_id, addr, msg, &mut connection, &mut buffer,
+                            &config, &metrics, &semaphore, MessagePriority::High,
+                            &mut last_connection_failure,
+                        ).await;
+                    }
+                }
+
+                Some(msg) = normal_priority_rx.recv(), if high_priority_rx.is_empty() => {
+                    last_activity = Instant::now();
+                    let msg = Self::ensure_connected_or_queue(
+                        peer_id, addr, msg, &mut connection, &mut pending_retry,
+                        &mut last_connection_failure, &config, &metrics, &semaphore,
+                        "Normal-priority message",
+                    ).await;
+                    if let Some(msg) = msg {
+                        Self::handle_normal_message_send(
+                            peer_id, addr, msg, batch_delay, &mut batch_buffer,
+                            &mut batch_bytes, &mut connection, &mut buffer,
+                            &mut last_connection_failure, &config, &metrics, &semaphore,
+                        ).await;
+                    }
+                }
+
+                _ = batch_timeout_fut, if !batch_buffer.is_empty() => {
+                    Self::process_batch(
+                        peer_id, addr, &mut batch_buffer, &mut batch_bytes,
+                        &mut connection, &mut buffer, &config, &metrics, &semaphore,
+                        &mut last_connection_failure,
+                    ).await;
+                }
+
+                _ = idle_timeout_fut, if connection.is_some() => {
+                    Self::handle_idle_timeout(peer_id, &mut connection, &metrics).await;
+                }
+
+                Some(WorkerCommand::Stop(ack)) = control_rx.recv() => {
+                    Self::handle_graceful_shutdown(
+                        peer_id, addr, ack, &mut high_priority_rx, &mut normal_priority_rx,
+                        &mut batch_buffer, &mut batch_bytes, &mut pending_retry,
+                        &mut connection, &mut buffer, &mut last_connection_failure,
+                        &config, &metrics, &semaphore,
+                    ).await;
+                    break;
+                }
+            }
+        }
+
+        Self::cleanup_worker(peer_id, &mut connection, &pending_retry, &metrics).await;
+    }
+
+    /// Process messages in batch (zero-copy optimization)
+    ///
+    /// **Key improvement: added connection failure tracking and byte size limits**
     #[allow(clippy::too_many_arguments)]
     async fn process_batch(
         peer_id: NodeId,
@@ -1433,7 +1539,7 @@ impl RaftTransport {
             "Processing message batch"
         );
 
-        // 确保有连接（使用带重试的版本）
+        // Ensure a connection exists (with retries)
         if connection.is_none() {
             *connection =
                 Self::establish_connection_with_retry(peer_id, addr, config, metrics, semaphore)
@@ -1448,7 +1554,7 @@ impl RaftTransport {
         if let Some(ref mut conn) = connection {
             buffer.clear();
 
-            // 零拷贝：将所有消息直接编码到同一个缓冲区
+            // Zero-copy: encode all messages directly into the same buffer
             for pending in batch.iter() {
                 let send_start = Instant::now();
                 match encode_message_into(&pending.msg, buffer) {
@@ -1462,12 +1568,12 @@ impl RaftTransport {
                 }
             }
 
-            // 一次性发送所有数据
+            // Send all data at once
             match tokio::time::timeout(config.write_timeout, conn.stream.write_all(buffer)).await {
                 Ok(Ok(_)) => {
                     if let Err(e) = conn.stream.flush().await {
                         warn!(peer_id, error = %e, "Batch flush failed");
-                        // **关键：连接失效，完全移除并标记**
+                        // **Critical: connection invalid, fully remove and mark failure**
                         if let Some(mut conn) = connection.take() {
                             let _ = conn.stream.shutdown().await;
                             metrics.active_connections.fetch_sub(1, Ordering::Relaxed);
@@ -1484,12 +1590,12 @@ impl RaftTransport {
                             .normal_priority_sent
                             .fetch_add(batch.len() as u64, Ordering::Relaxed);
                         trace!(peer_id, count = batch.len(), "Batch sent successfully");
-                        *last_connection_failure = None; // 发送成功，清除失败标记
+                        *last_connection_failure = None; // send succeeded, clear failure marker
                     }
                 }
                 Ok(Err(e)) => {
                     warn!(peer_id, error = %e, "Batch write failed");
-                    // **关键：连接失效，完全移除并标记**
+                    // **Critical: connection invalid, fully remove and mark failure**
                     if let Some(mut conn) = connection.take() {
                         let _ = conn.stream.shutdown().await;
                         metrics.active_connections.fetch_sub(1, Ordering::Relaxed);
@@ -1501,7 +1607,7 @@ impl RaftTransport {
                 }
                 Err(_) => {
                     warn!(peer_id, "Batch write timeout");
-                    // **关键：连接失效，完全移除并标记**
+                    // **Critical: connection invalid, fully remove and mark failure**
                     if let Some(mut conn) = connection.take() {
                         let _ = conn.stream.shutdown().await;
                         metrics.active_connections.fetch_sub(1, Ordering::Relaxed);
@@ -1523,9 +1629,9 @@ impl RaftTransport {
         *batch_bytes = 0;
     }
 
-    /// 处理单条消息（带指数退避 + Jitter）
+    /// Process a single message (with exponential backoff + jitter)
     ///
-    /// **关键改进：增加连接失败追踪参数**
+    /// **Key improvement: added connection failure tracking parameter**
     #[allow(clippy::too_many_arguments)]
     async fn process_message(
         peer_id: NodeId,
@@ -1548,7 +1654,7 @@ impl RaftTransport {
         while attempts < config.max_retries && !success {
             attempts += 1;
 
-            // 确保有连接（使用带重试的版本）
+            // Ensure a connection exists (with retries)
             if connection.is_none() {
                 *connection = Self::establish_connection_with_retry(
                     peer_id, addr, config, metrics, semaphore,
@@ -1562,7 +1668,7 @@ impl RaftTransport {
             }
 
             if let Some(ref mut conn) = connection {
-                buffer.clear(); // 复用缓冲区
+                buffer.clear(); // reuse buffer
 
                 match Self::send_message_to_stream(&mut conn.stream, &pending.msg, buffer, config)
                     .await
@@ -1582,12 +1688,12 @@ impl RaftTransport {
 
                         metrics.record_send_latency(send_start.elapsed());
                         trace!(peer_id, priority = ?priority, "Message sent");
-                        *last_connection_failure = None; // 发送成功，清除失败标记
+                        *last_connection_failure = None; // send succeeded, clear failure marker
                     }
                     Err(e) => {
                         warn!(peer_id, error = %e, attempt = attempts, "Send failed");
 
-                        // **关键改进：连接失效时，必须完全移除旧连接并标记失败**
+                        // **Key improvement: on connection failure, must fully remove old connection and mark failure**
                         if let Some(mut conn) = connection.take() {
                             let _ = conn.stream.shutdown().await;
                             metrics.active_connections.fetch_sub(1, Ordering::Relaxed);
@@ -1597,7 +1703,7 @@ impl RaftTransport {
                         metrics.connections_failed.fetch_add(1, Ordering::Relaxed);
 
                         if attempts < config.max_retries {
-                            // 指数退避 + Jitter
+                            // Exponential backoff + jitter
                             if config.enable_retry_jitter {
                                 let jitter = Duration::from_millis(rand::random::<u64>() % 50);
                                 retry_delay =
@@ -1620,7 +1726,7 @@ impl RaftTransport {
         }
     }
 
-    /// 建立连接（返回 TiedConnection，自动管理 Permit）
+    /// Establish a connection (returns TiedConnection with automatic permit management)
     #[allow(dead_code)]
     async fn establish_connection(
         peer_id: NodeId,
@@ -1629,7 +1735,7 @@ impl RaftTransport {
         metrics: &Arc<TransportMetrics>,
         semaphore: &Arc<Semaphore>,
     ) -> Option<TiedConnection> {
-        // 获取 Owned Permit
+        // Acquire owned permit
         let permit = match semaphore.clone().try_acquire_owned() {
             Ok(p) => p,
             Err(_) => {
@@ -1644,7 +1750,7 @@ impl RaftTransport {
 
         match tokio::time::timeout(config.connect_timeout, TcpStream::connect(addr)).await {
             Ok(Ok(stream)) => {
-                // TCP 优化
+                // TCP optimization
                 if let Err(e) = Self::configure_tcp(&stream, config) {
                     warn!(peer_id, error = %e, "Failed to configure TCP");
                 }
@@ -1668,10 +1774,10 @@ impl RaftTransport {
         }
     }
 
-    /// 建立连接（带重试机制）
+    /// Establish a connection (with retry mechanism)
     ///
-    /// 针对瞬时网络错误（如 ConnectionRefused）进行重试，
-    /// 使用指数退避 + Jitter 策略。
+    /// Retries on transient network errors (e.g., ConnectionRefused)
+    /// using exponential backoff + jitter strategy.
     async fn establish_connection_with_retry(
         peer_id: NodeId,
         addr: SocketAddr,
@@ -1685,7 +1791,7 @@ impl RaftTransport {
         while retry_count < config.max_connect_retries {
             retry_count += 1;
 
-            // 获取连接许可
+            // Acquire connection permit
             let permit = match semaphore.clone().try_acquire_owned() {
                 Ok(p) => p,
                 Err(_) => {
@@ -1698,7 +1804,7 @@ impl RaftTransport {
                 }
             };
 
-            // 尝试连接
+            // Attempt connection
             match tokio::time::timeout(config.connect_timeout, TcpStream::connect(addr)).await {
                 Ok(Ok(stream)) => {
                     if let Err(e) = Self::configure_tcp(&stream, config) {
@@ -1710,7 +1816,7 @@ impl RaftTransport {
                     return Some(TiedConnection::new(stream, permit));
                 }
                 Ok(Err(e)) => {
-                    // 判断是否为可重试的错误
+                    // Determine if the error is retryable
                     let should_retry = matches!(
                         e.kind(),
                         std::io::ErrorKind::ConnectionRefused
@@ -1727,7 +1833,7 @@ impl RaftTransport {
                         );
                         metrics.connection_retries.fetch_add(1, Ordering::Relaxed);
 
-                        // 指数退避 + Jitter
+                        // Exponential backoff + jitter
                         if config.enable_retry_jitter {
                             let jitter = Duration::from_millis(rand::random::<u64>() % 20);
                             retry_delay =
@@ -1755,14 +1861,14 @@ impl RaftTransport {
         None
     }
 
-    /// 配置 TCP 参数（增强 Keep-Alive）
+    /// Configure TCP parameters (enhanced Keep-Alive)
     fn configure_tcp(stream: &TcpStream, config: &TransportConfig) -> std::io::Result<()> {
-        // 禁用 Nagle
+        // Disable Nagle's algorithm
         if config.enable_tcp_nodelay {
             stream.set_nodelay(true)?;
         }
 
-        // 设置增强的 TCP Keep-Alive
+        // Set enhanced TCP Keep-Alive
         let socket_ref = SockRef::from(stream);
         let keepalive = TcpKeepalive::new()
             .with_time(config.tcp_keepalive_time)
@@ -1776,17 +1882,17 @@ impl RaftTransport {
         Ok(())
     }
 
-    /// 发送消息（零拷贝优化）
+    /// Send a message (zero-copy optimization)
     ///
-    /// 使用 encode_message_into 直接写入复用的 BytesMut 缓冲区，
-    /// 避免中间 Vec<u8> 分配。
+    /// Uses encode_message_into to write directly into the reused BytesMut buffer,
+    /// avoiding intermediate Vec<u8> allocation.
     async fn send_message_to_stream(
         stream: &mut TcpStream,
         msg: &Message,
         buffer: &mut BytesMut,
         config: &TransportConfig,
     ) -> Result<()> {
-        // 零拷贝：直接编码到 buffer，避免中间 Vec 分配
+        // Zero-copy: encode directly into buffer, avoiding intermediate Vec allocation
         buffer.clear();
         encode_message_into(msg, buffer)?;
 
@@ -1818,13 +1924,13 @@ impl RaftTransport {
 
 impl Drop for RaftTransport {
     fn drop(&mut self) {
-        // 仅在 command_tx 还没关闭时尝试发送，不阻塞
+        // Only attempt to send if command_tx is not yet closed; non-blocking
         let (tx, _) = oneshot::channel();
         let _ = self.command_tx.send(TransportCommand::Shutdown(tx));
 
-        // 关键点：不要在这里 await dispatcher_handle，
-        // Drop 是同步的，Dispatcher 是异步的。
-        // 让 tokio runtime 在 handle 失去引用时自动清理任务。
+        // Key point: do not await dispatcher_handle here.
+        // Drop is synchronous, but the dispatcher is async.
+        // Let the tokio runtime clean up the task when the handle is dropped.
     }
 }
 

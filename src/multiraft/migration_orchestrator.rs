@@ -222,7 +222,7 @@ pub struct MigrationOrchestrator {
     running: AtomicBool,
     /// Active orchestrations by shard.
     ///
-    /// Uses DashMap instead of RwLock<HashMap> for per-shard lock granularity.
+    /// Uses `DashMap` instead of `RwLock<HashMap>` for per-shard lock granularity.
     /// This avoids a global lock bottleneck when multiple shards are being
     /// migrated concurrently.
     active_orchestrations: DashMap<ShardId, OrchestrationState>,

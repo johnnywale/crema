@@ -56,7 +56,7 @@ where
     P: Fn(&T) -> bool,
 {
     let start = Instant::now();
-    let interval = Duration::from_millis(100); // 每次重试间隔 100ms
+    let interval = Duration::from_millis(100); // 100ms between retries
 
     while start.elapsed() < timeout {
         let result = action().await;
@@ -65,7 +65,7 @@ where
         }
         tokio::time::sleep(interval).await;
     }
-    None // 超时未达成条件
+    None // Timed out without meeting condition
 }
 /// Create a cache config for a node in a multi-node cluster using pre-allocated ports.
 #[allow(dead_code)]

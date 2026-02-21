@@ -198,7 +198,7 @@ mod multi_node_tests {
     }
 
     // ========================================================================
-    // TC-16: Node Rejoin (节点重新加入)
+    // TC-16: Node Rejoin (node rejoining the cluster)
     // ========================================================================
     #[test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
     async fn tc27_node_rejoin() {
@@ -303,7 +303,7 @@ mod multi_node_tests {
     }
 
     // ========================================================================
-    // TC-18: Stale Leader Replacement (旧Leader回归)
+    // TC-18: Stale Leader Replacement (stale leader returns)
     // ========================================================================
     #[test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
     async fn tc18_stale_leader_replacement() {
@@ -320,10 +320,10 @@ mod multi_node_tests {
             .unwrap();
         let caches = [&cache1, &cache2, &cache3];
 
-        // 缩短等待时间，因为 tick 小了，选举会非常快
+        // Short wait time since low tick counts make elections very fast
         utils::wait_for_single_leader(&caches, Duration::from_secs(10)).await;
 
-        // 2. 确认初始 Leader 并关闭它 (TC18 fix: use retry logic)
+        // 2. Identify the initial leader and shut it down (TC18 fix: use retry logic)
         let initial_leader = find_leader_with_retry(&caches, Duration::from_secs(10))
             .await
             .expect("Leader should be elected quickly with low tick counts");
@@ -332,18 +332,18 @@ mod multi_node_tests {
 
         initial_leader.shutdown().await;
 
-        // 【关键修复】等待端口完全释放和网络清理
-        // 确保旧的 TCP 连接已完全关闭，避免新节点启动时端口冲突
+        // Wait for port release and network cleanup
+        // Ensure old TCP connections are fully closed to avoid port conflicts on restart
         sleep(Duration::from_millis(500)).await;
 
-        // 3. 等待新 Leader 选举
+        // 3. Wait for new leader election
         let remaining: Vec<&DistributedCache> = caches
             .iter()
             .filter(|c| c.node_id() != initial_leader_id)
             .copied()
             .collect();
 
-        // 给予足够的时间让剩余节点触发新的选举 (TC18 fix: use retry logic)
+        // Give remaining nodes enough time to trigger a new election (TC18 fix: use retry logic)
         let new_leader = find_leader_with_retry(&remaining, Duration::from_secs(10))
             .await
             .expect("New leader should be elected from remaining nodes");
@@ -355,23 +355,22 @@ mod multi_node_tests {
             term2
         );
 
-        // 4. 写入新数据
+        // 4. Write new data under new leader
         new_leader
             .put("new-leader-key", "new-leader-value")
             .await
             .unwrap();
 
-        // 5. 【关键点】重启旧 Leader 时调大其选举超时
-        // 这样它回归后会更"耐心"地等待心跳，而不是立即发起 Pre-Vote
-        // CacheConfig is not Clone, so create a new config with modified election_tick
-        let mut config1_reconnected = utils::cluster_node_config(1, &port_configs);
-        config1_reconnected.raft.election_tick = 50; // 调大回归节点的 tick
+        // 5. Restart the OLD LEADER (not always node 1!) with a high election tick
+        // so it will patiently wait for heartbeats instead of immediately starting Pre-Vote
+        let mut reconnected_config = utils::cluster_node_config(initial_leader_id, &port_configs);
+        reconnected_config.raft.election_tick = 50;
 
         sleep(Duration::from_millis(500)).await;
-        let cache1_reconnected = DistributedCache::new(config1_reconnected).await.unwrap();
+        let cache_reconnected = DistributedCache::new(reconnected_config).await.unwrap();
 
-        // 【调试验证】确认重启节点的 voters 配置正确
-        let reconnected_voters = cache1_reconnected.voters();
+        // Verify the reconnected node's voter configuration is correct
+        let reconnected_voters = cache_reconnected.voters();
         info!(
             "Reconnected node {} has voters: {:?}",
             initial_leader_id, reconnected_voters
@@ -384,27 +383,28 @@ mod multi_node_tests {
             reconnected_voters
         );
 
-        // 验证新 Leader 也知道所有 voters
+        // Verify the current leader also knows about the reconnected node
         let leader_voters = new_leader.voters();
         info!("Current leader has voters: {:?}", leader_voters);
         assert!(
-            leader_voters.contains(&1),
-            "Leader should know about node 1. Got: {:?}",
+            leader_voters.contains(&initial_leader_id),
+            "Leader should know about node {}. Got: {:?}",
+            initial_leader_id,
             leader_voters
         );
 
-        // 持续触发写操作，强制新 Leader 发送携带新 Term 的 MsgAppend
+        // Trigger writes to force the new leader to send MsgAppend with the new term
         for _ in 0..5 {
             let _ = new_leader.put("trigger-sync", "val").await;
             sleep(Duration::from_millis(200)).await;
         }
 
-        // 6. 验证旧 Leader 降级并追平 Term
+        // 6. Verify old leader stepped down and caught up to the current term
         let success = utils::wait_for(
             || {
-                let status = cache1_reconnected.cluster_status();
-                // 核心检查：Term 是否追上，且角色是否变为 Follower (is_leader == false)
-                status.term >= term2 && !cache1_reconnected.is_leader()
+                let status = cache_reconnected.cluster_status();
+                // Core check: term caught up and role changed to follower (is_leader == false)
+                status.term >= term2 && !cache_reconnected.is_leader()
             },
             Duration::from_secs(10),
             Duration::from_millis(200),
@@ -412,18 +412,18 @@ mod multi_node_tests {
         .await;
 
         if !success {
-            let status = cache1_reconnected.cluster_status();
+            let status = cache_reconnected.cluster_status();
             panic!(
                 "Sync failed! Node {} is at Term {}, Leader: {}",
                 initial_leader_id,
                 status.term,
-                cache1_reconnected.is_leader()
+                cache_reconnected.is_leader()
             );
         }
 
-        // 7. 验证数据同步
+        // 7. Verify data synchronization
         let synced_value = utils::wait_for_result(
-            || async { cache1_reconnected.get(b"new-leader-key").await },
+            || async { cache_reconnected.get(b"new-leader-key").await },
             |res| res.as_ref().map(|b| b.as_ref()) == Some("new-leader-value".as_bytes()),
             Duration::from_secs(5),
         )
@@ -434,8 +434,8 @@ mod multi_node_tests {
             "Old leader should have synced data from the current cluster"
         );
 
-        // 8. 清理
-        cache1_reconnected.shutdown().await;
+        // 8. Cleanup
+        cache_reconnected.shutdown().await;
         for cache in remaining {
             cache.shutdown().await;
         }

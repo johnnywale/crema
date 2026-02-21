@@ -54,6 +54,7 @@ use tracing::{debug, info, warn};
 
 use crate::cluster::discovery::{
     ClusterDiscovery, ClusterDiscoveryError, ClusterEvent, NodeMetadata as GenericNodeMetadata,
+    ShardLeaderInfo,
 };
 use crate::types::NodeId;
 
@@ -92,23 +93,6 @@ pub struct RaftNodeMetadata {
     pub version: String,
     /// Optional tags for node classification
     pub tags: HashMap<String, String>,
-}
-
-/// Shard leader information with epoch for ordering out-of-order gossip updates.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct ShardLeaderInfo {
-    /// The leader's node ID.
-    pub leader_id: NodeId,
-    /// Monotonically increasing epoch for version ordering.
-    /// Higher epochs supersede lower ones for the same shard.
-    pub epoch: u64,
-}
-
-impl ShardLeaderInfo {
-    /// Create a new shard leader info.
-    pub fn new(leader_id: NodeId, epoch: u64) -> Self {
-        Self { leader_id, epoch }
-    }
 }
 
 impl RaftNodeMetadata {

@@ -220,7 +220,7 @@ impl SnapshotReader {
         Ok(Some(SnapshotEntry {
             key,
             value,
-            expires_at,
+            expires_at_ns: expires_at,
         }))
     }
 
@@ -443,7 +443,7 @@ mod tests {
 
         assert_eq!(read_entry.key, b"key");
         assert_eq!(read_entry.value, b"value");
-        assert!(read_entry.expires_at.is_some());
+        assert!(read_entry.expires_at_ns.is_some());
         assert!(!read_entry.is_expired());
     }
 }

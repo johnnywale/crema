@@ -1102,7 +1102,6 @@ impl ShardMigrationCoordinator {
     }
 
     /// Update streaming progress.
-    #[allow(clippy::await_holding_lock)]
     pub async fn update_progress(
         &self,
         shard_id: ShardId,
@@ -1111,25 +1110,30 @@ impl ShardMigrationCoordinator {
         rate: f64,
         last_key: Option<Vec<u8>>,
     ) -> Result<Option<MigrationCheckpoint>> {
-        let mut migrations = self.active_migrations.write();
-        let migration = migrations
-            .get_mut(&shard_id)
-            .ok_or(Error::MigrationNotFound(shard_id))?;
+        // Update progress and extract checkpoint under lock, then drop before async I/O
+        let checkpoint = {
+            let mut migrations = self.active_migrations.write();
+            let migration = migrations
+                .get_mut(&shard_id)
+                .ok_or(Error::MigrationNotFound(shard_id))?;
 
-        migration.progress.update(entries, bytes, rate);
-        migration.last_key = last_key;
+            migration.progress.update(entries, bytes, rate);
+            migration.last_key = last_key;
 
-        // Checkpoint periodically
-        let should_checkpoint =
-            migration.progress.transferred_entries % self.config.checkpoint_interval == 0;
+            let should_checkpoint =
+                migration.progress.transferred_entries % self.config.checkpoint_interval == 0;
 
-        let checkpoint = if should_checkpoint {
-            let cp = migration.checkpoint();
-            self.state_store.save_checkpoint(&cp).await?;
-            Some(cp)
-        } else {
-            None
+            if should_checkpoint {
+                Some(migration.checkpoint())
+            } else {
+                None
+            }
         };
+
+        // Persist checkpoint outside the lock
+        if let Some(ref cp) = checkpoint {
+            self.state_store.save_checkpoint(cp).await?;
+        }
 
         Ok(checkpoint)
     }

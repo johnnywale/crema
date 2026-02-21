@@ -1534,7 +1534,6 @@ impl DistributedCache {
     }
 
     /// Shutdown the distributed cache with a custom timeout for pending operations.
-    #[allow(clippy::await_holding_lock)]
     pub async fn shutdown_with_timeout(&self, timeout: Duration) {
         info!(
             node_id = self.config.node_id,
@@ -1579,24 +1578,20 @@ impl DistributedCache {
         }
 
         // 5. Leave cluster discovery gracefully
-        // Note: We hold the parking_lot mutex across await points here. This is generally
-        // discouraged, but is acceptable for shutdown-only code because:
-        // 1. Shutdown is single-threaded (no concurrent access expected)
-        // 2. Discovery implementations should not acquire locks that could deadlock
-        // 3. Converting to tokio::sync::Mutex would require making non-async methods async
+        // Swap the real discovery out of the mutex so we can call async methods without
+        // holding the parking_lot lock across await points.
         let discovery_active = self.discovery.lock().is_active();
         if discovery_active {
-            {
-                let mut disc = self.discovery.lock();
-                if let Err(e) = disc.leave().await {
-                    warn!(node_id = self.config.node_id, error = %e, "Error leaving cluster discovery");
-                }
+            let placeholder: Box<dyn ClusterDiscovery> = Box::new(NoOpClusterDiscovery::new(
+                self.config.node_id,
+                self.config.raft_addr,
+            ));
+            let mut disc = std::mem::replace(&mut *self.discovery.lock(), placeholder);
+            if let Err(e) = disc.leave().await {
+                warn!(node_id = self.config.node_id, error = %e, "Error leaving cluster discovery");
             }
-            {
-                let mut disc = self.discovery.lock();
-                if let Err(e) = disc.shutdown().await {
-                    warn!(node_id = self.config.node_id, error = %e, "Error shutting down cluster discovery");
-                }
+            if let Err(e) = disc.shutdown().await {
+                warn!(node_id = self.config.node_id, error = %e, "Error shutting down cluster discovery");
             }
         }
 

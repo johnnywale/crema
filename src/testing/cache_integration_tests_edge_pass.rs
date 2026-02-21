@@ -67,7 +67,7 @@ pub(crate) mod multi_node_tests {
     }
 
     // ========================================================================
-    // TC-11: Standard Quorum Election (多数派存在时的选举)
+    // TC-11: Standard Quorum Election (election with majority present)
     // ========================================================================
     #[test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
     async fn tc28_standard_quorum_election() {
@@ -123,7 +123,7 @@ pub(crate) mod multi_node_tests {
     }
 
     // ========================================================================
-    // TC-13: Heartbeat Stability (Leader自动续期)
+    // TC-13: Heartbeat Stability (leader auto-renewal)
     // ========================================================================
     #[test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
     #[cfg(test)]
@@ -172,7 +172,7 @@ pub(crate) mod multi_node_tests {
     }
 
     // ========================================================================
-    // TC-14: Minority Failure (少数派故障)
+    // TC-14: Minority Failure (minority node failure)
     // ========================================================================
     #[test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
     async fn tc25_minority_failure() {
@@ -262,7 +262,7 @@ pub(crate) mod multi_node_tests {
         }
     }
     // // ========================================================================
-    // // TC-15: Leader Failover (Leader宕机切换)
+    // // TC-15: Leader Failover (leader crash failover)
     // // ========================================================================
     #[test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
     async fn tc26_leader_failover() {
@@ -353,7 +353,7 @@ pub(crate) mod multi_node_tests {
     }
 
     // ========================================================================
-    // TC-17: Network Partition - Majority/Minority Split (对称分区)
+    // TC-17: Network Partition - Majority/Minority Split (symmetric partition)
     // ========================================================================
     #[test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
     async fn tc17_network_partition_majority_minority() {
@@ -459,7 +459,7 @@ pub(crate) mod multi_node_tests {
     }
 
     // ========================================================================
-    // TC-19: Split Vote Recovery (选票瓜分)
+    // TC-19: Split Vote Recovery (split vote)
     // ========================================================================
     #[test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
     async fn tc19_split_vote_recovery() {
@@ -500,7 +500,7 @@ pub(crate) mod multi_node_tests {
     }
 
     // ========================================================================
-    // TC-20: No Dual Leader (验证不会出现双Leader)
+    // TC-20: No Dual Leader (verify no dual-leader scenario)
     // ========================================================================
     #[test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
     async fn tc20_no_dual_leader() {
@@ -571,7 +571,7 @@ pub(crate) mod multi_node_tests {
     }
 
     // ========================================================================
-    // TC-21: Disk IO Stall Simulation (磁盘IO阻塞)
+    // TC-21: Disk IO Stall Simulation (disk I/O stall)
     // ========================================================================
     #[test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
     async fn tc21_disk_io_stall() {

@@ -144,9 +144,23 @@ impl MetricsRegistry {
     /// Describe all metrics with their help text and units.
     #[cfg(feature = "metrics")]
     fn describe_all_metrics(&self) {
+        self.describe_cache_metrics();
+        self.describe_raft_metrics();
+        self.describe_transport_metrics();
+        self.describe_cluster_metrics();
+        self.describe_network_metrics();
+        self.describe_shard_metrics();
+        self.describe_migration_metrics();
+        self.describe_checkpoint_metrics();
+        self.describe_slot_metrics();
+        self.describe_error_metrics();
+    }
+
+    /// Describe cache subsystem metrics.
+    #[cfg(feature = "metrics")]
+    fn describe_cache_metrics(&self) {
         use metrics::{describe_counter, describe_gauge, describe_histogram, Unit};
 
-        // Cache metrics
         describe_counter!(CACHE_GET_TOTAL, CACHE_GET_TOTAL_DESC);
         describe_histogram!(
             CACHE_GET_DURATION_SECONDS,
@@ -177,8 +191,13 @@ impl MetricsRegistry {
             CACHE_VALUE_SIZE_BYTES_DESC
         );
         describe_histogram!(CACHE_TTL_SECONDS, Unit::Seconds, CACHE_TTL_SECONDS_DESC);
+    }
 
-        // Raft metrics
+    /// Describe Raft consensus subsystem metrics.
+    #[cfg(feature = "metrics")]
+    fn describe_raft_metrics(&self) {
+        use metrics::{describe_counter, describe_gauge, describe_histogram, Unit};
+
         describe_counter!(RAFT_PROPOSALS_TOTAL, RAFT_PROPOSALS_TOTAL_DESC);
         describe_histogram!(
             RAFT_PROPOSAL_DURATION_SECONDS,
@@ -224,8 +243,13 @@ impl MetricsRegistry {
             RAFT_HEARTBEAT_LATENCY_SECONDS_DESC
         );
         describe_gauge!(RAFT_LOG_ENTRIES, RAFT_LOG_ENTRIES_DESC);
+    }
 
-        // Transport metrics
+    /// Describe transport subsystem metrics.
+    #[cfg(feature = "metrics")]
+    fn describe_transport_metrics(&self) {
+        use metrics::{describe_counter, describe_gauge, describe_histogram, Unit};
+
         describe_counter!(
             TRANSPORT_MESSAGES_SENT_TOTAL,
             TRANSPORT_MESSAGES_SENT_TOTAL_DESC
@@ -271,8 +295,13 @@ impl MetricsRegistry {
             Unit::Seconds,
             TRANSPORT_ENCODE_DURATION_SECONDS_DESC
         );
+    }
 
-        // Cluster metrics
+    /// Describe cluster subsystem metrics.
+    #[cfg(feature = "metrics")]
+    fn describe_cluster_metrics(&self) {
+        use metrics::{describe_counter, describe_gauge, describe_histogram, Unit};
+
         describe_gauge!(CLUSTER_NODES_TOTAL, CLUSTER_NODES_TOTAL_DESC);
         describe_gauge!(CLUSTER_NODES_HEALTHY, CLUSTER_NODES_HEALTHY_DESC);
         describe_counter!(CLUSTER_NODE_JOINS_TOTAL, CLUSTER_NODE_JOINS_TOTAL_DESC);
@@ -307,8 +336,13 @@ impl MetricsRegistry {
             CLUSTER_DISCOVERY_DURATION_SECONDS_DESC
         );
         describe_counter!(CLUSTER_EVENTS_TOTAL, CLUSTER_EVENTS_TOTAL_DESC);
+    }
 
-        // Network metrics
+    /// Describe network subsystem metrics.
+    #[cfg(feature = "metrics")]
+    fn describe_network_metrics(&self) {
+        use metrics::{describe_counter, describe_gauge, describe_histogram, Unit};
+
         describe_gauge!(NETWORK_CONNECTIONS_ACTIVE, NETWORK_CONNECTIONS_ACTIVE_DESC);
         describe_counter!(NETWORK_CONNECTIONS_TOTAL, NETWORK_CONNECTIONS_TOTAL_DESC);
         describe_counter!(
@@ -339,8 +373,13 @@ impl MetricsRegistry {
             NETWORK_PROTOCOL_ERRORS_TOTAL,
             NETWORK_PROTOCOL_ERRORS_TOTAL_DESC
         );
+    }
 
-        // Shard metrics
+    /// Describe shard subsystem metrics.
+    #[cfg(feature = "metrics")]
+    fn describe_shard_metrics(&self) {
+        use metrics::{describe_counter, describe_gauge, describe_histogram, Unit};
+
         describe_counter!(SHARD_OPERATIONS_TOTAL, SHARD_OPERATIONS_TOTAL_DESC);
         describe_histogram!(
             SHARD_OPERATION_DURATION_SECONDS,
@@ -372,8 +411,13 @@ impl MetricsRegistry {
         describe_gauge!(SHARD_COUNT, SHARD_COUNT_DESC);
         describe_counter!(SHARD_CREATED_TOTAL, SHARD_CREATED_TOTAL_DESC);
         describe_counter!(SHARD_DELETED_TOTAL, SHARD_DELETED_TOTAL_DESC);
+    }
 
-        // Migration metrics
+    /// Describe migration subsystem metrics.
+    #[cfg(feature = "metrics")]
+    fn describe_migration_metrics(&self) {
+        use metrics::{describe_counter, describe_gauge, describe_histogram, Unit};
+
         describe_gauge!(MIGRATION_ACTIVE, MIGRATION_ACTIVE_DESC);
         describe_counter!(MIGRATION_TOTAL, MIGRATION_TOTAL_DESC);
         describe_histogram!(
@@ -403,8 +447,13 @@ impl MetricsRegistry {
             Unit::Seconds,
             MIGRATION_PHASE_DURATION_SECONDS_DESC
         );
+    }
 
-        // Checkpoint metrics
+    /// Describe checkpoint subsystem metrics.
+    #[cfg(feature = "metrics")]
+    fn describe_checkpoint_metrics(&self) {
+        use metrics::{describe_counter, describe_gauge, describe_histogram, Unit};
+
         describe_counter!(CHECKPOINT_CREATED_TOTAL, CHECKPOINT_CREATED_TOTAL_DESC);
         describe_histogram!(
             CHECKPOINT_CREATE_DURATION_SECONDS,
@@ -433,8 +482,13 @@ impl MetricsRegistry {
             CHECKPOINT_BACKPRESSURE_TOTAL_DESC
         );
         describe_counter!(CHECKPOINT_CLEANUP_TOTAL, CHECKPOINT_CLEANUP_TOTAL_DESC);
+    }
 
-        // Slot metrics
+    /// Describe slot routing subsystem metrics.
+    #[cfg(feature = "metrics")]
+    fn describe_slot_metrics(&self) {
+        use metrics::{describe_counter, describe_gauge, describe_histogram, Unit};
+
         describe_counter!(SLOT_LOOKUPS_TOTAL, SLOT_LOOKUPS_TOTAL_DESC);
         describe_histogram!(
             SLOT_LOOKUP_DURATION_SECONDS,
@@ -449,8 +503,13 @@ impl MetricsRegistry {
         describe_gauge!(SLOT_DISTRIBUTION, SLOT_DISTRIBUTION_DESC);
         describe_gauge!(SLOT_TOTAL, SLOT_TOTAL_DESC);
         describe_gauge!(SLOT_OWNED, SLOT_OWNED_DESC);
+    }
 
-        // Error metrics
+    /// Describe error and retry metrics.
+    #[cfg(feature = "metrics")]
+    fn describe_error_metrics(&self) {
+        use metrics::describe_counter;
+
         describe_counter!(ERRORS_TOTAL, ERRORS_TOTAL_DESC);
         describe_counter!(RETRIES_TOTAL, RETRIES_TOTAL_DESC);
         describe_counter!(RETRY_SUCCESS_TOTAL, RETRY_SUCCESS_TOTAL_DESC);

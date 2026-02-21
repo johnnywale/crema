@@ -5,6 +5,7 @@
 
 #![cfg(test)]
 
+use crate::testing::eventually;
 use crate::testing::recovery::{
     FailpointAction, FailpointRegistry, NodeState, RecoveryTestCluster, RecoveryTestConfig,
 };
@@ -112,14 +113,12 @@ async fn test_snapshot_only_recovery() {
     cluster.recover_node(leader).await.unwrap();
     info!(leader, "Node recovered");
 
-    // Wait for the recovered node to catch up
-    tokio::time::sleep(Duration::from_secs(2)).await;
-
-    // Verify data on recovered node
-    assert!(
-        verify_test_data(&cluster, leader, 100, "snapshot").await,
-        "Recovered node should have all data from snapshot"
-    );
+    // Wait for the recovered node to catch up and verify data
+    eventually(Duration::from_secs(10), || async {
+        verify_test_data(&cluster, leader, 100, "snapshot").await
+    })
+    .await
+    .expect("Recovered node should have all data from snapshot");
 
     cluster.shutdown().await;
 }
@@ -163,14 +162,12 @@ async fn test_log_replay_only_recovery() {
     cluster.recover_node(follower).await.unwrap();
     info!(follower, "Follower recovered");
 
-    // Wait for catch-up via log replay
-    tokio::time::sleep(Duration::from_secs(2)).await;
-
-    // Verify data on recovered node
-    assert!(
-        verify_test_data(&cluster, follower, 20, "logonly").await,
-        "Recovered node should have all data from log replay"
-    );
+    // Wait for catch-up via log replay and verify data
+    eventually(Duration::from_secs(10), || async {
+        verify_test_data(&cluster, follower, 20, "logonly").await
+    })
+    .await
+    .expect("Recovered node should have all data from log replay");
 
     cluster.shutdown().await;
 }
@@ -213,18 +210,13 @@ async fn test_snapshot_plus_log_recovery() {
     cluster.crash_node(follower).await.unwrap();
     cluster.recover_node(follower).await.unwrap();
 
-    // Wait for catch-up
-    tokio::time::sleep(Duration::from_secs(2)).await;
-
-    // Verify both pre and post-snapshot data
-    assert!(
-        verify_test_data(&cluster, follower, 60, "before").await,
-        "Should have pre-snapshot data"
-    );
-    assert!(
-        verify_test_data(&cluster, follower, 30, "after").await,
-        "Should have post-snapshot data"
-    );
+    // Wait for catch-up and verify both pre and post-snapshot data
+    eventually(Duration::from_secs(10), || async {
+        verify_test_data(&cluster, follower, 60, "before").await
+            && verify_test_data(&cluster, follower, 30, "after").await
+    })
+    .await
+    .expect("Should have pre and post-snapshot data");
 
     cluster.shutdown().await;
 }
@@ -300,30 +292,21 @@ async fn test_recovery_with_expired_entries() {
     // Crash and recover the follower
     cluster.crash_node(follower).await.unwrap();
     cluster.recover_node(follower).await.unwrap();
-    tokio::time::sleep(Duration::from_secs(2)).await;
 
-    // The expired entry should not be restored
-    let result1 = cluster.read(follower, "ttl_key_1").await.unwrap();
-    assert!(
-        result1.is_none(),
-        "Expired TTL entry should not be restored"
-    );
-
-    // The long-TTL entry should still exist
-    let result2 = cluster.read(follower, "ttl_key_2").await.unwrap();
-    assert_eq!(
-        result2,
-        Some("value2".to_string()),
-        "Long TTL entry should be restored"
-    );
-
-    // Permanent entry should exist
-    let result3 = cluster.read(follower, "permanent_key").await.unwrap();
-    assert_eq!(
-        result3,
-        Some("permanent_value".to_string()),
-        "Permanent entry should be restored"
-    );
+    // Wait for recovery and verify expired/permanent entries
+    eventually(Duration::from_secs(10), || async {
+        let result1 = cluster
+            .read(follower, "ttl_key_1")
+            .await
+            .unwrap_or(Some("placeholder".into()));
+        let result2 = cluster.read(follower, "ttl_key_2").await.ok().flatten();
+        let result3 = cluster.read(follower, "permanent_key").await.ok().flatten();
+        result1.is_none()
+            && result2.as_deref() == Some("value2")
+            && result3.as_deref() == Some("permanent_value")
+    })
+    .await
+    .expect("Expired TTL entry should not be restored; long-TTL and permanent entries should be");
 
     cluster.shutdown().await;
 }
@@ -358,17 +341,16 @@ async fn test_recovery_preserves_applied_index() {
         .unwrap();
 
     cluster.recover_node(leader).await.unwrap();
-    tokio::time::sleep(Duration::from_secs(2)).await;
 
-    // Check applied index after recovery
+    // Wait for recovery and verify applied index is preserved
+    eventually(Duration::from_secs(10), || async {
+        cluster.get_applied_index(leader).unwrap_or(0) >= index_before
+    })
+    .await
+    .expect("Applied index should be preserved or advanced");
+
     let index_after = cluster.get_applied_index(leader).unwrap();
     info!(index_after, "Applied index after recovery");
-
-    // Applied index should be at least what it was before (may be higher due to catch-up)
-    assert!(
-        index_after >= index_before,
-        "Applied index should be preserved or advanced"
-    );
 
     cluster.shutdown().await;
 }
@@ -413,12 +395,14 @@ async fn test_crash_during_snapshot_write() {
         .await
         .unwrap();
 
-    // Recover the crashed node
+    // Recover the crashed node and verify consistency
     cluster.recover_node(leader).await.unwrap();
-    tokio::time::sleep(Duration::from_secs(2)).await;
 
-    // Data should be consistent
-    cluster.verify_consistency().await.unwrap();
+    eventually(Duration::from_secs(10), || async {
+        cluster.verify_consistency().await.is_ok()
+    })
+    .await
+    .expect("Data should be consistent after snapshot crash recovery");
 
     cluster.shutdown().await;
 }
@@ -454,15 +438,14 @@ async fn test_crash_during_log_append() {
         .await
         .unwrap();
 
-    // Recover
+    // Recover and verify initial data is intact
     cluster.recover_node(leader).await.unwrap();
-    tokio::time::sleep(Duration::from_secs(2)).await;
 
-    // The initial data should be intact
-    assert!(
-        verify_test_data(&cluster, new_leader, 20, "append").await,
-        "Pre-crash data should be preserved"
-    );
+    eventually(Duration::from_secs(10), || async {
+        verify_test_data(&cluster, new_leader, 20, "append").await
+    })
+    .await
+    .expect("Pre-crash data should be preserved");
 
     cluster.shutdown().await;
 }
@@ -500,19 +483,15 @@ async fn test_crash_after_commit_before_apply() {
     // Write more data while follower is down
     write_test_data(&cluster, 10, "during_down").await;
 
-    // Recover follower
+    // Recover follower and verify all data
     cluster.recover_node(follower).await.unwrap();
-    tokio::time::sleep(Duration::from_secs(2)).await;
 
-    // Follower should have all data (idempotent replay)
-    assert!(
-        verify_test_data(&cluster, follower, 30, "commit").await,
-        "Pre-crash data should be available"
-    );
-    assert!(
-        verify_test_data(&cluster, follower, 10, "during_down").await,
-        "Data written during downtime should be replicated"
-    );
+    eventually(Duration::from_secs(10), || async {
+        verify_test_data(&cluster, follower, 30, "commit").await
+            && verify_test_data(&cluster, follower, 10, "during_down").await
+    })
+    .await
+    .expect("Pre-crash data and data written during downtime should be available");
 
     cluster.shutdown().await;
 }
@@ -544,12 +523,14 @@ async fn test_crash_during_apply() {
         .await
         .unwrap();
 
-    // Recover
+    // Recover and verify consistency
     cluster.recover_node(leader).await.unwrap();
-    tokio::time::sleep(Duration::from_secs(2)).await;
 
-    // Verify consistency - all committed entries should be applied
-    cluster.verify_consistency().await.unwrap();
+    eventually(Duration::from_secs(10), || async {
+        cluster.verify_consistency().await.is_ok()
+    })
+    .await
+    .expect("All committed entries should be applied after recovery");
 
     cluster.shutdown().await;
 }
@@ -581,15 +562,14 @@ async fn test_crash_during_compaction() {
         .await
         .unwrap();
 
-    // Recover
+    // Recover and verify data survives compaction crash
     cluster.recover_node(leader).await.unwrap();
-    tokio::time::sleep(Duration::from_secs(2)).await;
 
-    // Data should be consistent
-    assert!(
-        verify_test_data(&cluster, leader, 100, "compact").await,
-        "Data should survive compaction crash"
-    );
+    eventually(Duration::from_secs(10), || async {
+        verify_test_data(&cluster, leader, 100, "compact").await
+    })
+    .await
+    .expect("Data should survive compaction crash");
 
     cluster.shutdown().await;
 }
@@ -634,18 +614,13 @@ async fn test_leader_crash_and_recovery() {
     cluster.recover_node(original_leader).await.unwrap();
     info!(original_leader, "Old leader recovered");
 
-    // Wait for catch-up
-    tokio::time::sleep(Duration::from_secs(2)).await;
-
-    // Old leader should now be a follower and have all data
-    assert!(
-        verify_test_data(&cluster, original_leader, 50, "leader_crash").await,
-        "Recovered node should have pre-crash data"
-    );
-    assert!(
-        verify_test_data(&cluster, original_leader, 20, "after_leader_crash").await,
-        "Recovered node should have post-crash data"
-    );
+    // Wait for catch-up and verify old leader has all data
+    eventually(Duration::from_secs(10), || async {
+        verify_test_data(&cluster, original_leader, 50, "leader_crash").await
+            && verify_test_data(&cluster, original_leader, 20, "after_leader_crash").await
+    })
+    .await
+    .expect("Recovered node should have pre-crash and post-crash data");
 
     cluster.shutdown().await;
 }
@@ -690,18 +665,13 @@ async fn test_follower_crash_and_rejoin() {
     cluster.recover_node(follower).await.unwrap();
     info!(follower, "Follower rejoined");
 
-    // Wait for catch-up
-    tokio::time::sleep(Duration::from_secs(2)).await;
-
-    // Follower should have all data
-    assert!(
-        verify_test_data(&cluster, follower, 30, "follower_crash").await,
-        "Should have pre-crash data"
-    );
-    assert!(
-        verify_test_data(&cluster, follower, 20, "during_follower_down").await,
-        "Should have data written during downtime"
-    );
+    // Wait for catch-up and verify follower has all data
+    eventually(Duration::from_secs(10), || async {
+        verify_test_data(&cluster, follower, 30, "follower_crash").await
+            && verify_test_data(&cluster, follower, 20, "during_follower_down").await
+    })
+    .await
+    .expect("Follower should have pre-crash data and data written during downtime");
 
     cluster.shutdown().await;
 }
@@ -754,11 +724,12 @@ async fn test_multiple_node_sequential_crash() {
         tokio::time::sleep(Duration::from_secs(1)).await;
     }
 
-    // Wait for full catch-up
-    tokio::time::sleep(Duration::from_secs(2)).await;
-
-    // Verify all nodes have consistent data
-    cluster.verify_consistency().await.unwrap();
+    // Wait for full catch-up and verify consistency
+    eventually(Duration::from_secs(10), || async {
+        cluster.verify_consistency().await.is_ok()
+    })
+    .await
+    .expect("All nodes should have consistent data after sequential crashes");
 
     cluster.shutdown().await;
 }
@@ -800,13 +771,15 @@ async fn test_minority_crash_continues_serving() {
         "Writes should succeed with minority crashed"
     );
 
-    // Recover crashed nodes
+    // Recover crashed nodes and verify consistency
     cluster.recover_node(followers[0]).await.unwrap();
     cluster.recover_node(followers[1]).await.unwrap();
-    tokio::time::sleep(Duration::from_secs(2)).await;
 
-    // All nodes should have the data
-    cluster.verify_consistency().await.unwrap();
+    eventually(Duration::from_secs(10), || async {
+        cluster.verify_consistency().await.is_ok()
+    })
+    .await
+    .expect("All nodes should have the data after minority crash recovery");
 
     cluster.shutdown().await;
 }
@@ -868,11 +841,14 @@ async fn test_majority_crash_recovery() {
         "Data should survive majority crash"
     );
 
-    // Recover remaining crashed node
+    // Recover remaining crashed node and verify consistency
     cluster.recover_node(followers[1]).await.unwrap();
-    tokio::time::sleep(Duration::from_secs(2)).await;
 
-    cluster.verify_consistency().await.unwrap();
+    eventually(Duration::from_secs(10), || async {
+        cluster.verify_consistency().await.is_ok()
+    })
+    .await
+    .expect("Data should be consistent after majority crash recovery");
 
     cluster.shutdown().await;
 }
@@ -911,12 +887,14 @@ async fn test_recovery_during_migration() {
         .await
         .unwrap();
 
-    // Recover
+    // Recover and verify consistency
     cluster.recover_node(leader).await.unwrap();
-    tokio::time::sleep(Duration::from_secs(2)).await;
 
-    // Verify consistency
-    cluster.verify_consistency().await.unwrap();
+    eventually(Duration::from_secs(10), || async {
+        cluster.verify_consistency().await.is_ok()
+    })
+    .await
+    .expect("Data should be consistent after recovery during migration");
 
     cluster.shutdown().await;
 }
@@ -958,11 +936,14 @@ async fn test_client_reconnect_after_leader_change() {
     let result2 = cluster.read_from_leader("reconnect_key_2").await.unwrap();
     assert_eq!(result2, Some("value2".to_string()));
 
-    // Recover original leader
+    // Recover original leader and verify consistency
     cluster.recover_node(original_leader).await.unwrap();
-    tokio::time::sleep(Duration::from_secs(2)).await;
 
-    cluster.verify_consistency().await.unwrap();
+    eventually(Duration::from_secs(10), || async {
+        cluster.verify_consistency().await.is_ok()
+    })
+    .await
+    .expect("Data should be consistent after client reconnect");
 
     cluster.shutdown().await;
 }
@@ -1041,15 +1022,14 @@ async fn test_in_flight_request_during_crash() {
         .await
         .unwrap();
 
-    // Recover
+    // Recover and verify initial data is consistent
     cluster.recover_node(leader).await.unwrap();
-    tokio::time::sleep(Duration::from_secs(2)).await;
 
-    // Initial data should be consistent
-    assert!(
-        verify_test_data(&cluster, new_leader, 10, "inflight").await,
-        "Pre-crash data should be preserved"
-    );
+    eventually(Duration::from_secs(10), || async {
+        verify_test_data(&cluster, new_leader, 10, "inflight").await
+    })
+    .await
+    .expect("Pre-crash data should be preserved");
 
     cluster.shutdown().await;
 }
@@ -1094,15 +1074,17 @@ async fn test_rolling_restart_preserves_data() {
         tokio::time::sleep(Duration::from_secs(1)).await;
     }
 
-    // Wait for cluster to stabilize
+    // Wait for cluster to stabilize and verify data is preserved
     let _ = cluster
         .wait_for_leader(Duration::from_secs(10))
         .await
         .unwrap();
-    tokio::time::sleep(Duration::from_secs(2)).await;
 
-    // Data should be preserved
-    cluster.verify_consistency().await.unwrap();
+    eventually(Duration::from_secs(10), || async {
+        cluster.verify_consistency().await.is_ok()
+    })
+    .await
+    .expect("Data should be preserved after rolling restart");
 
     cluster.shutdown().await;
 }
@@ -1150,10 +1132,12 @@ async fn test_network_partition_and_heal() {
     }
     info!("Healed partition");
 
-    tokio::time::sleep(Duration::from_secs(2)).await;
-
-    // All nodes should have consistent data
-    cluster.verify_consistency().await.unwrap();
+    // Wait for healed nodes to catch up
+    eventually(Duration::from_secs(10), || async {
+        cluster.verify_consistency().await.is_ok()
+    })
+    .await
+    .expect("All nodes should have consistent data after partition heal");
 
     cluster.shutdown().await;
 }
@@ -1209,8 +1193,11 @@ async fn test_random_crash_sequence() {
     }
 
     // Final consistency check
-    tokio::time::sleep(Duration::from_secs(2)).await;
-    cluster.verify_consistency().await.unwrap();
+    eventually(Duration::from_secs(10), || async {
+        cluster.verify_consistency().await.is_ok()
+    })
+    .await
+    .expect("Data should be consistent after random crash sequence");
 
     cluster.shutdown().await;
 }
@@ -1248,12 +1235,14 @@ async fn test_crash_with_concurrent_writes() {
     // Continue writing under new leader
     write_test_data(&cluster, 10, "after_concurrent_crash").await;
 
-    // Recover original leader
+    // Recover original leader and verify consistency
     cluster.recover_node(leader).await.unwrap();
-    tokio::time::sleep(Duration::from_secs(2)).await;
 
-    // Verify consistency
-    cluster.verify_consistency().await.unwrap();
+    eventually(Duration::from_secs(10), || async {
+        cluster.verify_consistency().await.is_ok()
+    })
+    .await
+    .expect("Data should be consistent after concurrent writes crash");
 
     cluster.shutdown().await;
 }
@@ -1287,16 +1276,13 @@ async fn test_metrics_after_recovery() {
         .await
         .unwrap();
     cluster.recover_node(leader).await.unwrap();
-    tokio::time::sleep(Duration::from_secs(2)).await;
 
-    // Applied index should be at least what it was
-    let index_after = cluster.get_applied_index(leader).unwrap();
-    assert!(
-        index_after >= index_before,
-        "Applied index should be preserved: before={}, after={}",
-        index_before,
-        index_after
-    );
+    // Wait for recovery and verify applied index is preserved
+    eventually(Duration::from_secs(10), || async {
+        cluster.get_applied_index(leader).unwrap_or(0) >= index_before
+    })
+    .await
+    .expect("Applied index should be preserved after recovery");
 
     cluster.shutdown().await;
 }
@@ -1323,10 +1309,12 @@ async fn test_raft_state_consistency() {
         }
     }
 
-    tokio::time::sleep(Duration::from_secs(1)).await;
-
-    // Verify all running nodes have consistent data
-    cluster.verify_consistency().await.unwrap();
+    // Wait for snapshots and verify all running nodes have consistent data
+    eventually(Duration::from_secs(10), || async {
+        cluster.verify_consistency().await.is_ok()
+    })
+    .await
+    .expect("All running nodes should have consistent data");
 
     // Get applied indices - they should be close
     let mut indices: Vec<(u64, u64)> = Vec::new();
@@ -1379,17 +1367,14 @@ async fn test_snapshot_metadata_integrity() {
         .await
         .unwrap();
     cluster.recover_node(leader).await.unwrap();
-    tokio::time::sleep(Duration::from_secs(2)).await;
 
-    // Verify recovery used snapshot correctly
-    let recovered_index = cluster.get_applied_index(leader).unwrap();
-    assert!(
-        recovered_index >= applied_index,
-        "Recovered index should be at least snapshot index"
-    );
-
-    // Data should be consistent
-    cluster.verify_consistency().await.unwrap();
+    // Wait for recovery and verify snapshot was used correctly
+    eventually(Duration::from_secs(10), || async {
+        let recovered_index = cluster.get_applied_index(leader).unwrap_or(0);
+        recovered_index >= applied_index && cluster.verify_consistency().await.is_ok()
+    })
+    .await
+    .expect("Recovered index should be at least snapshot index and data should be consistent");
 
     cluster.shutdown().await;
 }

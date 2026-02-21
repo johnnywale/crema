@@ -221,7 +221,10 @@ impl SnapshotHeader {
     }
 }
 
-/// A single entry in the snapshot
+/// A single entry in the snapshot (on-disk checkpoint format).
+///
+/// **Note**: Expiration times are stored in **nanoseconds** since Unix epoch.
+/// This differs from `RaftSnapshotEntry` which uses milliseconds.
 #[derive(Debug, Clone)]
 pub struct SnapshotEntry {
     /// Entry key
@@ -230,8 +233,8 @@ pub struct SnapshotEntry {
     /// Entry value
     pub value: Vec<u8>,
 
-    /// Absolute expiration time (Unix timestamp in nanoseconds)
-    pub expires_at: Option<u64>,
+    /// Absolute expiration time (Unix timestamp in **nanoseconds**).
+    pub expires_at_ns: Option<u64>,
 }
 
 impl SnapshotEntry {
@@ -240,7 +243,7 @@ impl SnapshotEntry {
         Self {
             key,
             value,
-            expires_at: None,
+            expires_at_ns: None,
         }
     }
 
@@ -254,13 +257,13 @@ impl SnapshotEntry {
         Self {
             key,
             value,
-            expires_at: Some(expires_nanos),
+            expires_at_ns: Some(expires_nanos),
         }
     }
 
     /// Calculate the remaining TTL from now
     pub fn remaining_ttl(&self) -> Option<Duration> {
-        self.expires_at.and_then(|expires_nanos| {
+        self.expires_at_ns.and_then(|expires_nanos| {
             let now_nanos = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .unwrap_or_default()
@@ -276,7 +279,7 @@ impl SnapshotEntry {
 
     /// Check if the entry has expired
     pub fn is_expired(&self) -> bool {
-        self.expires_at.is_some_and(|expires_nanos| {
+        self.expires_at_ns.is_some_and(|expires_nanos| {
             let now_nanos = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .unwrap_or_default()
@@ -290,7 +293,7 @@ impl SnapshotEntry {
         4 + self.key.len() + // key length + key
         4 + self.value.len() + // value length + value
         1 + // has_expiration flag
-        if self.expires_at.is_some() { 8 } else { 0 } + // expires_at
+        if self.expires_at_ns.is_some() { 8 } else { 0 } + // expires_at
         4 // entry CRC
     }
 
@@ -307,7 +310,7 @@ impl SnapshotEntry {
         buf.extend_from_slice(&self.value);
 
         // Expiration
-        if let Some(expires) = self.expires_at {
+        if let Some(expires) = self.expires_at_ns {
             buf.push(1);
             buf.extend_from_slice(&expires.to_le_bytes());
         } else {
@@ -364,7 +367,7 @@ impl SnapshotEntry {
         let has_expiration = *buf.get(pos).ok_or(FormatError::UnexpectedEof)? != 0;
         pos += 1;
 
-        let expires_at = if has_expiration {
+        let expires_at_ns = if has_expiration {
             let expires_bytes: [u8; 8] = buf
                 .get(pos..pos + 8)
                 .ok_or(FormatError::UnexpectedEof)?
@@ -401,7 +404,7 @@ impl SnapshotEntry {
             Self {
                 key,
                 value,
-                expires_at,
+                expires_at_ns,
             },
             pos,
         ))
@@ -483,7 +486,7 @@ mod tests {
         assert_eq!(consumed, bytes.len());
         assert_eq!(parsed.key, b"key");
         assert_eq!(parsed.value, b"value");
-        assert!(parsed.expires_at.is_none());
+        assert!(parsed.expires_at_ns.is_none());
     }
 
     #[test]
@@ -494,7 +497,7 @@ mod tests {
         let bytes = entry.to_bytes();
         let (parsed, _) = SnapshotEntry::from_bytes(&bytes).unwrap();
 
-        assert!(parsed.expires_at.is_some());
+        assert!(parsed.expires_at_ns.is_some());
         assert!(!parsed.is_expired());
         assert!(parsed.remaining_ttl().is_some());
     }

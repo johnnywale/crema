@@ -110,7 +110,7 @@ impl SnapshotWriter {
     ///
     /// Entries are written immediately (streaming) rather than buffered.
     pub fn write_entry(&mut self, entry: &SnapshotEntry) -> Result<(), FormatError> {
-        self.write_raw_entry(&entry.key, &entry.value, entry.expires_at)
+        self.write_raw_entry(&entry.key, &entry.value, entry.expires_at_ns)
     }
 
     /// Write a key-value pair directly from slices without intermediate allocation.

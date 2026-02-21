@@ -761,26 +761,27 @@ impl NodeMessageRouter {
                 biased;
 
                 _ = background_reconnect_fut, if connection.is_none() && last_connection_failure.is_some() => {
-                    debug!(peer_id, "Attempting background reconnection");
-                    metrics.background_reconnect_attempts.fetch_add(1, Ordering::Relaxed);
-
-                    connection = Self::establish_connection_with_retry(
-                        peer_id, addr, &config, &metrics, &semaphore
+                    Self::handle_background_reconnect(
+                        peer_id, addr, &mut connection, &config, &metrics, &semaphore,
+                        &mut last_connection_failure,
                     ).await;
-
-                    if connection.is_some() {
-                        info!(peer_id, "Background reconnection successful");
-                        last_connection_failure = None;
-                    } else {
-                        debug!(peer_id, "Background reconnection failed, will retry");
-                        last_connection_failure = Some(Instant::now());
-                    }
                 }
 
                 _ = retry_timeout_fut, if !pending_retry.is_empty() && connection.is_some() => {
-                    if let Some(msg) = pending_retry.pop_front() {
-                        metrics.pending_retries.fetch_sub(1, Ordering::Relaxed);
-                        last_activity = Instant::now();
+                    Self::handle_pending_retry(
+                        peer_id, addr, &mut pending_retry, &mut connection, &mut buffer,
+                        &config, &metrics, &semaphore, &mut last_activity,
+                        &mut last_connection_failure,
+                    ).await;
+                }
+
+                Some(msg) = high_priority_rx.recv() => {
+                    last_activity = Instant::now();
+                    if let Some(msg) = Self::ensure_connection_or_queue_retry(
+                        peer_id, addr, msg, &mut connection, &mut pending_retry,
+                        &config, &metrics, &semaphore, &mut last_connection_failure,
+                        "High-priority",
+                    ).await {
                         Self::process_message(
                             peer_id, addr, msg, &mut connection, &mut buffer,
                             &config, &metrics, &semaphore, MessagePriority::High,
@@ -789,80 +790,29 @@ impl NodeMessageRouter {
                     }
                 }
 
-                Some(msg) = high_priority_rx.recv() => {
-                    last_activity = Instant::now();
-
-                    if connection.is_none() {
-                        debug!(peer_id, "High-priority message triggered connection attempt");
-                        connection = Self::establish_connection_with_retry(
-                            peer_id, addr, &config, &metrics, &semaphore
-                        ).await;
-
-                        if connection.is_none() {
-                            last_connection_failure = Some(Instant::now());
-                            if pending_retry.len() < config.max_pending_retries {
-                                pending_retry.push_back(msg);
-                                metrics.pending_retries.fetch_add(1, Ordering::Relaxed);
-                                debug!(peer_id, pending_count = pending_retry.len(),
-                                    "High-priority message queued for retry");
-                            } else {
-                                metrics.messages_dropped_queue_full.fetch_add(1, Ordering::Relaxed);
-                                metrics.messages_failed.fetch_add(1, Ordering::Relaxed);
-                                warn!(peer_id, "Pending retry queue full, high-priority message dropped");
-                            }
-                            continue;
-                        } else {
-                            last_connection_failure = None;
-                        }
-                    }
-
-                    Self::process_message(
-                        peer_id, addr, msg, &mut connection, &mut buffer,
-                        &config, &metrics, &semaphore, MessagePriority::High,
-                        &mut last_connection_failure,
-                    ).await;
-                }
-
                 Some(msg) = normal_priority_rx.recv(), if high_priority_rx.is_empty() => {
                     last_activity = Instant::now();
-
-                    if connection.is_none() {
-                        connection = Self::establish_connection_with_retry(
-                            peer_id, addr, &config, &metrics, &semaphore
-                        ).await;
-
-                        if connection.is_none() {
-                            last_connection_failure = Some(Instant::now());
-                            if pending_retry.len() < config.max_pending_retries {
-                                pending_retry.push_back(msg);
-                                metrics.pending_retries.fetch_add(1, Ordering::Relaxed);
-                                debug!(peer_id, pending_count = pending_retry.len(),
-                                    "Message queued for retry");
-                            } else {
-                                metrics.messages_dropped_queue_full.fetch_add(1, Ordering::Relaxed);
-                                metrics.messages_failed.fetch_add(1, Ordering::Relaxed);
-                                warn!(peer_id, "Pending retry queue full, message dropped");
+                    if let Some(msg) = Self::ensure_connection_or_queue_retry(
+                        peer_id, addr, msg, &mut connection, &mut pending_retry,
+                        &config, &metrics, &semaphore, &mut last_connection_failure,
+                        "Normal",
+                    ).await {
+                        if batch_delay.is_some() {
+                            batch_buffer.push(msg);
+                            if batch_buffer.len() >= config.batch_max_messages {
+                                Self::process_batch(
+                                    peer_id, addr, &mut batch_buffer, &mut connection,
+                                    &mut buffer, &config, &metrics, &semaphore,
+                                    &mut last_connection_failure,
+                                ).await;
                             }
-                            continue;
                         } else {
-                            last_connection_failure = None;
-                        }
-                    }
-
-                    if batch_delay.is_some() {
-                        batch_buffer.push(msg);
-                        if batch_buffer.len() >= config.batch_max_messages {
-                            Self::process_batch(
-                                peer_id, addr, &mut batch_buffer, &mut connection, &mut buffer,
-                                &config, &metrics, &semaphore, &mut last_connection_failure,
+                            Self::process_message(
+                                peer_id, addr, msg, &mut connection, &mut buffer,
+                                &config, &metrics, &semaphore, MessagePriority::Normal,
+                                &mut last_connection_failure,
                             ).await;
                         }
-                    } else {
-                        Self::process_message(
-                            peer_id, addr, msg, &mut connection, &mut buffer,
-                            &config, &metrics, &semaphore, MessagePriority::Normal,
-                            &mut last_connection_failure,
-                        ).await;
                     }
                 }
 
@@ -874,65 +824,236 @@ impl NodeMessageRouter {
                 }
 
                 _ = idle_timeout_fut, if connection.is_some() => {
-                    debug!(peer_id, "Connection idle timeout, closing");
-                    if let Some(mut conn) = connection.take() {
-                        let _ = conn.stream.shutdown().await;
-                        metrics.active_connections.fetch_sub(1, Ordering::Relaxed);
-                    }
+                    Self::handle_idle_timeout(peer_id, &mut connection, &metrics).await;
                 }
 
                 Some(WorkerCommand::Stop(ack)) = control_rx.recv() => {
-                    debug!(peer_id, "Flushing remaining messages before stop");
-
-                    if !batch_buffer.is_empty() {
-                        Self::process_batch(
-                            peer_id, addr, &mut batch_buffer, &mut connection, &mut buffer,
-                            &config, &metrics, &semaphore, &mut last_connection_failure,
-                        ).await;
-                    }
-
-                    while let Some(msg) = pending_retry.pop_front() {
-                        metrics.pending_retries.fetch_sub(1, Ordering::Relaxed);
-                        Self::process_message(
-                            peer_id, addr, msg, &mut connection, &mut buffer,
-                            &config, &metrics, &semaphore, MessagePriority::High,
-                            &mut last_connection_failure,
-                        ).await;
-                    }
-
-                    let flush_timeout = tokio::time::sleep(Duration::from_secs(1));
-                    tokio::pin!(flush_timeout);
-
-                    loop {
-                        tokio::select! {
-                            Some(msg) = high_priority_rx.recv() => {
-                                Self::process_message(
-                                    peer_id, addr, msg, &mut connection, &mut buffer,
-                                    &config, &metrics, &semaphore, MessagePriority::High,
-                                    &mut last_connection_failure,
-                                ).await;
-                            }
-                            Some(msg) = normal_priority_rx.recv() => {
-                                Self::process_message(
-                                    peer_id, addr, msg, &mut connection, &mut buffer,
-                                    &config, &metrics, &semaphore, MessagePriority::Normal,
-                                    &mut last_connection_failure,
-                                ).await;
-                            }
-                            _ = &mut flush_timeout => {
-                                warn!(peer_id, "Flush timeout, forcing stop");
-                                break;
-                            }
-                            else => break,
-                        }
-                    }
-
+                    Self::handle_stop(
+                        peer_id, addr, &mut high_priority_rx, &mut normal_priority_rx,
+                        &mut batch_buffer, &mut pending_retry, &mut connection, &mut buffer,
+                        &config, &metrics, &semaphore, &mut last_connection_failure,
+                    ).await;
                     let _ = ack.send(());
                     break;
                 }
             }
         }
 
+        Self::cleanup_on_exit(peer_id, &mut connection, &mut pending_retry, &metrics).await;
+    }
+
+    /// Attempt a background reconnection when disconnected.
+    async fn handle_background_reconnect(
+        peer_id: NodeId,
+        addr: SocketAddr,
+        connection: &mut Option<TiedConnection>,
+        config: &TransportConfig,
+        metrics: &Arc<TransportMetrics>,
+        semaphore: &Arc<Semaphore>,
+        last_connection_failure: &mut Option<Instant>,
+    ) {
+        debug!(peer_id, "Attempting background reconnection");
+        metrics
+            .background_reconnect_attempts
+            .fetch_add(1, Ordering::Relaxed);
+
+        *connection =
+            Self::establish_connection_with_retry(peer_id, addr, config, metrics, semaphore).await;
+
+        if connection.is_some() {
+            info!(peer_id, "Background reconnection successful");
+            *last_connection_failure = None;
+        } else {
+            debug!(peer_id, "Background reconnection failed, will retry");
+            *last_connection_failure = Some(Instant::now());
+        }
+    }
+
+    /// Process the next pending retry message.
+    #[allow(clippy::too_many_arguments)]
+    async fn handle_pending_retry(
+        peer_id: NodeId,
+        addr: SocketAddr,
+        pending_retry: &mut VecDeque<PendingMessage>,
+        connection: &mut Option<TiedConnection>,
+        buffer: &mut BytesMut,
+        config: &TransportConfig,
+        metrics: &Arc<TransportMetrics>,
+        semaphore: &Arc<Semaphore>,
+        last_activity: &mut Instant,
+        last_connection_failure: &mut Option<Instant>,
+    ) {
+        if let Some(msg) = pending_retry.pop_front() {
+            metrics.pending_retries.fetch_sub(1, Ordering::Relaxed);
+            *last_activity = Instant::now();
+            Self::process_message(
+                peer_id,
+                addr,
+                msg,
+                connection,
+                buffer,
+                config,
+                metrics,
+                semaphore,
+                MessagePriority::High,
+                last_connection_failure,
+            )
+            .await;
+        }
+    }
+
+    /// Ensure a connection exists before sending a message, or queue it for retry.
+    ///
+    /// Returns `Some(msg)` if the connection is ready and the caller should process
+    /// the message, or `None` if the message was queued for retry (caller should
+    /// `continue` the loop).
+    #[allow(clippy::too_many_arguments)]
+    async fn ensure_connection_or_queue_retry(
+        peer_id: NodeId,
+        addr: SocketAddr,
+        msg: PendingMessage,
+        connection: &mut Option<TiedConnection>,
+        pending_retry: &mut VecDeque<PendingMessage>,
+        config: &TransportConfig,
+        metrics: &Arc<TransportMetrics>,
+        semaphore: &Arc<Semaphore>,
+        last_connection_failure: &mut Option<Instant>,
+        label: &str,
+    ) -> Option<PendingMessage> {
+        if connection.is_none() {
+            if label == "High-priority" {
+                debug!(
+                    peer_id,
+                    "High-priority message triggered connection attempt"
+                );
+            }
+            *connection =
+                Self::establish_connection_with_retry(peer_id, addr, config, metrics, semaphore)
+                    .await;
+
+            if connection.is_none() {
+                *last_connection_failure = Some(Instant::now());
+                if pending_retry.len() < config.max_pending_retries {
+                    pending_retry.push_back(msg);
+                    metrics.pending_retries.fetch_add(1, Ordering::Relaxed);
+                    debug!(
+                        peer_id,
+                        pending_count = pending_retry.len(),
+                        "{label} message queued for retry"
+                    );
+                } else {
+                    metrics
+                        .messages_dropped_queue_full
+                        .fetch_add(1, Ordering::Relaxed);
+                    metrics.messages_failed.fetch_add(1, Ordering::Relaxed);
+                    warn!(peer_id, "Pending retry queue full, {label} message dropped");
+                }
+                return None;
+            } else {
+                *last_connection_failure = None;
+            }
+        }
+        Some(msg)
+    }
+
+    /// Close an idle connection.
+    async fn handle_idle_timeout(
+        peer_id: NodeId,
+        connection: &mut Option<TiedConnection>,
+        metrics: &Arc<TransportMetrics>,
+    ) {
+        debug!(peer_id, "Connection idle timeout, closing");
+        if let Some(mut conn) = connection.take() {
+            let _ = conn.stream.shutdown().await;
+            metrics.active_connections.fetch_sub(1, Ordering::Relaxed);
+        }
+    }
+
+    /// Graceful shutdown: flush batches, retries, and remaining channel messages.
+    #[allow(clippy::too_many_arguments)]
+    async fn handle_stop(
+        peer_id: NodeId,
+        addr: SocketAddr,
+        high_priority_rx: &mut mpsc::Receiver<PendingMessage>,
+        normal_priority_rx: &mut mpsc::Receiver<PendingMessage>,
+        batch_buffer: &mut Vec<PendingMessage>,
+        pending_retry: &mut VecDeque<PendingMessage>,
+        connection: &mut Option<TiedConnection>,
+        buffer: &mut BytesMut,
+        config: &TransportConfig,
+        metrics: &Arc<TransportMetrics>,
+        semaphore: &Arc<Semaphore>,
+        last_connection_failure: &mut Option<Instant>,
+    ) {
+        debug!(peer_id, "Flushing remaining messages before stop");
+
+        if !batch_buffer.is_empty() {
+            Self::process_batch(
+                peer_id,
+                addr,
+                batch_buffer,
+                connection,
+                buffer,
+                config,
+                metrics,
+                semaphore,
+                last_connection_failure,
+            )
+            .await;
+        }
+
+        while let Some(msg) = pending_retry.pop_front() {
+            metrics.pending_retries.fetch_sub(1, Ordering::Relaxed);
+            Self::process_message(
+                peer_id,
+                addr,
+                msg,
+                connection,
+                buffer,
+                config,
+                metrics,
+                semaphore,
+                MessagePriority::High,
+                last_connection_failure,
+            )
+            .await;
+        }
+
+        let flush_timeout = tokio::time::sleep(Duration::from_secs(1));
+        tokio::pin!(flush_timeout);
+
+        loop {
+            tokio::select! {
+                Some(msg) = high_priority_rx.recv() => {
+                    Self::process_message(
+                        peer_id, addr, msg, connection, buffer,
+                        config, metrics, semaphore, MessagePriority::High,
+                        last_connection_failure,
+                    ).await;
+                }
+                Some(msg) = normal_priority_rx.recv() => {
+                    Self::process_message(
+                        peer_id, addr, msg, connection, buffer,
+                        config, metrics, semaphore, MessagePriority::Normal,
+                        last_connection_failure,
+                    ).await;
+                }
+                _ = &mut flush_timeout => {
+                    warn!(peer_id, "Flush timeout, forcing stop");
+                    break;
+                }
+                else => break,
+            }
+        }
+    }
+
+    /// Clean up connection and pending retries on worker exit.
+    async fn cleanup_on_exit(
+        peer_id: NodeId,
+        connection: &mut Option<TiedConnection>,
+        pending_retry: &mut VecDeque<PendingMessage>,
+        metrics: &Arc<TransportMetrics>,
+    ) {
         if let Some(mut conn) = connection.take() {
             let _ = conn.stream.shutdown().await;
             metrics.active_connections.fetch_sub(1, Ordering::Relaxed);

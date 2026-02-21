@@ -739,7 +739,7 @@ impl CheckpointManager {
             if entry.is_expired() {
                 debug!(
                     key = %key_preview,
-                    expires_at = entry.expires_at,
+                    expires_at_ns = entry.expires_at_ns,
                     "CHECKPOINT: Skipping expired entry during snapshot load"
                 );
                 skipped_expired += 1;

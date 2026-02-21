@@ -362,11 +362,3 @@ struct NodeConfig {
     memberlist_addr: SocketAddr,
     dashboard_port: u16,
 }
-
-/// Simple timestamp without chrono dependency
-fn chrono_lite_timestamp() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs()
-}
