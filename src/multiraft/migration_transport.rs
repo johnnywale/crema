@@ -628,11 +628,6 @@ impl TimestampedLeaderHint {
     fn is_stale(&self) -> bool {
         self.updated_at.elapsed() > LEADER_HINT_MAX_AGE
     }
-
-    /// Refresh the timestamp without changing the leader.
-    fn refresh(&mut self) {
-        self.updated_at = Instant::now();
-    }
 }
 
 /// This implementation can work in two modes:

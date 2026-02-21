@@ -225,8 +225,7 @@ impl SlotControlPlane {
 
         // Combine node_id (upper 8 bits) with local sequence (lower 24 bits)
         let node_id = self.config.node_id as u32;
-        let shard_id = (node_id << 24) | (local_seq & 0x00FF_FFFF);
-        shard_id
+        (node_id << 24) | (local_seq & 0x00FF_FFFF)
     }
 
     /// Create a control plane from a snapshot.

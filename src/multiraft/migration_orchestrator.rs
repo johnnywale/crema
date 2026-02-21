@@ -383,7 +383,8 @@ impl MigrationOrchestrator {
     /// that after a restart the new coordinator will have a higher term.
     pub async fn set_coordinator_term_persistent(&self, term: u64) -> Result<()> {
         // Persist BEFORE applying in memory (crash safety)
-        if let Some(store) = self.persistent_store.read().clone() {
+        let store = self.persistent_store.read().clone();
+        if let Some(store) = store {
             store.save_coordinator_term(term).await?;
         }
 
@@ -416,7 +417,8 @@ impl MigrationOrchestrator {
         let new_term = self.coordinator_term.load(Ordering::SeqCst) + 1;
 
         // Persist BEFORE applying in memory (crash safety)
-        if let Some(store) = self.persistent_store.read().clone() {
+        let store = self.persistent_store.read().clone();
+        if let Some(store) = store {
             store.save_coordinator_term(new_term).await?;
         }
 

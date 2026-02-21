@@ -61,15 +61,4 @@ impl DashboardConfig {
     pub fn socket_addr(&self) -> Result<SocketAddr, std::net::AddrParseError> {
         format!("{}:{}", self.bind_addr, self.port).parse()
     }
-
-    /// Get the socket address, panicking if invalid.
-    /// Use this only in contexts where invalid config would be a bug.
-    pub fn socket_addr_or_panic(&self) -> SocketAddr {
-        self.socket_addr().unwrap_or_else(|e| {
-            panic!(
-                "Invalid dashboard address '{}:{}': {}",
-                self.bind_addr, self.port, e
-            )
-        })
-    }
 }

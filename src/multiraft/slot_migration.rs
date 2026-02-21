@@ -3202,7 +3202,7 @@ impl MigrationDataAccessor for ShardMigrationDataAccessor {
                 storage.enable_slot_indexing();
             }
 
-            let (keys, next_cursor) = storage.scan_slot_keys(slot_id as u16, cursor, limit);
+            let (keys, next_cursor) = storage.scan_slot_keys(slot_id, cursor, limit);
 
             return Ok((
                 keys.into_iter().map(|k| k.to_vec()).collect(),

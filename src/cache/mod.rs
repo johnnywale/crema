@@ -29,6 +29,16 @@ use tracing::{debug, info, warn};
 /// Maps request_id -> (response sender, creation time for cleanup).
 type PendingForwardsMap = Arc<DashMap<u64, (oneshot::Sender<Result<Option<Bytes>>>, Instant)>>;
 
+/// Type alias for checkpoint initialization result.
+/// Contains (snapshot_for_recovery, checkpoint_manager).
+type CheckpointInitResult = (
+    Option<(
+        crate::checkpoint::SnapshotInfo,
+        Arc<crate::checkpoint::CheckpointManager>,
+    )>,
+    Option<Arc<crate::checkpoint::CheckpointManager>>,
+);
+
 /// The main distributed cache instance.
 ///
 /// This provides a strongly consistent distributed cache backed by Raft consensus.
@@ -89,8 +99,6 @@ impl DistributedCache {
     /// 6. Start memberlist gossip (if enabled)
     /// 7. Initialize Multi-Raft coordinator (if enabled)
     pub async fn new(mut config: CacheConfig) -> Result<Self> {
-        use crate::checkpoint::CheckpointManager;
-
         // Validate configuration
         if let Err(e) = config.validate() {
             return Err(Error::Config(e));
@@ -119,73 +127,8 @@ impl DistributedCache {
             }
         }
 
-        // Check for existing snapshot BEFORE creating Raft node
-        // This allows us to set the correct applied index in raft-rs
-        // Only do recovery when using persistent storage (RocksDB), not in-memory
-        #[cfg(feature = "rocksdb-storage")]
-        let uses_persistent_storage = matches!(
-            config.raft.storage_type,
-            crate::config::RaftStorageType::RocksDb(_)
-        );
-        #[cfg(not(feature = "rocksdb-storage"))]
-        let uses_persistent_storage = false;
-
-        let (recovered_index, checkpoint_manager) =
-            if config.checkpoint.enabled && uses_persistent_storage {
-                match CheckpointManager::new(config.checkpoint.clone(), storage.clone()) {
-                    Ok(manager) => {
-                        let manager = Arc::new(manager);
-                        // Find latest snapshot and get its index
-                        match manager.find_latest_snapshot() {
-                            Ok(Some(info)) => {
-                                info!(
-                                    node_id = config.node_id,
-                                    path = %info.path.display(),
-                                    raft_index = info.raft_index,
-                                    raft_term = info.raft_term,
-                                    "Found existing snapshot for recovery"
-                                );
-                                (Some((info, manager.clone())), Some(manager))
-                            }
-                            Ok(None) => {
-                                debug!(node_id = config.node_id, "No existing snapshot found");
-                                (None, Some(manager))
-                            }
-                            Err(e) => {
-                                warn!(
-                                    node_id = config.node_id,
-                                    error = %e,
-                                    "Failed to find snapshot"
-                                );
-                                (None, Some(manager))
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        warn!(
-                            node_id = config.node_id,
-                            error = %e,
-                            "Failed to create checkpoint manager"
-                        );
-                        (None, None)
-                    }
-                }
-            } else if config.checkpoint.enabled {
-                // Checkpointing enabled but using in-memory storage - create manager but don't recover
-                match CheckpointManager::new(config.checkpoint.clone(), storage.clone()) {
-                    Ok(manager) => (None, Some(Arc::new(manager))),
-                    Err(e) => {
-                        warn!(
-                            node_id = config.node_id,
-                            error = %e,
-                            "Failed to create checkpoint manager"
-                        );
-                        (None, None)
-                    }
-                }
-            } else {
-                (None, None)
-            };
+        // Initialize checkpoint manager and look for existing snapshots to recover from
+        let (recovered_index, checkpoint_manager) = Self::init_checkpoint(&config, &storage);
 
         // Create Raft config with correct applied index for recovery
         let mut raft_config = config.raft.clone();
@@ -428,230 +371,7 @@ impl DistributedCache {
             CacheRouter::single(storage.clone(), raft.clone())
         };
 
-        // Set up shard message handlers if per-shard Raft is enabled and initialized
-        // This enables ShardRaft message routing for replication
-        if router.is_multi_raft() {
-            if let Some(coordinator) = router.coordinator() {
-                if coordinator.is_per_shard_raft_enabled() {
-                    // 1. Set the transport on the shard forwarder so it can forward requests
-                    // to shard leaders on other nodes
-                    coordinator
-                        .shard_forwarder()
-                        .set_transport(raft.transport().clone());
-
-                    info!(
-                        node_id = config.node_id,
-                        "Shard forwarder transport initialized"
-                    );
-
-                    // 2. Set up ShardRaft message handler (CRITICAL for replication)
-                    if let Some(manager) = coordinator.shard_raft_manager() {
-                        let multiplexer = manager.transport().clone();
-                        let shard_handler: ShardMessageHandler =
-                            Arc::new(move |shard_msg| multiplexer.handle_shard_message(shard_msg));
-                        handler.set_shard_handler(shard_handler);
-
-                        info!(
-                            node_id = config.node_id,
-                            "Per-shard Raft message handler installed"
-                        );
-                    }
-
-                    // 3. Set up handler for ShardForwardedCommand messages (leader forwarding)
-                    let coord_for_forward = coordinator.clone();
-                    let node_id = config.node_id;
-
-                    let forward_handler: ShardForwardHandler = Arc::new(move |fwd_cmd| {
-                        let coord = coord_for_forward.clone();
-                        Box::pin(async move {
-                            let shard_id = fwd_cmd.shard_id;
-                            let command = fwd_cmd.command;
-                            let request_id = fwd_cmd.request_id;
-                            let origin = fwd_cmd.origin_node_id;
-
-                            tracing::debug!(
-                                shard_id,
-                                request_id,
-                                origin,
-                                "Processing ShardForwardedCommand"
-                            );
-
-                            // Get the shard and execute the command
-                            if let Some(shard) = coord.get_shard(shard_id) {
-                                match &command {
-                                    crate::types::CacheCommand::Put {
-                                        key,
-                                        value,
-                                        expires_at_ms,
-                                    } => {
-                                        let key = bytes::Bytes::from(key.clone());
-                                        let value = bytes::Bytes::from(value.clone());
-
-                                        let result = if let Some(exp_ms) = expires_at_ms {
-                                            let now_ms = std::time::SystemTime::now()
-                                                .duration_since(std::time::UNIX_EPOCH)
-                                                .unwrap_or_default()
-                                                .as_millis()
-                                                as u64;
-                                            if *exp_ms > now_ms {
-                                                let ttl = std::time::Duration::from_millis(
-                                                    *exp_ms - now_ms,
-                                                );
-                                                shard.put_with_ttl(key, value, ttl).await
-                                            } else {
-                                                Ok(())
-                                            }
-                                        } else {
-                                            shard.put(key, value).await
-                                        };
-
-                                        match result {
-                                            Ok(()) => (true, None, None),
-                                            Err(e) => (false, None, Some(e.to_string())),
-                                        }
-                                    }
-                                    crate::types::CacheCommand::Delete { key } => {
-                                        match shard.delete(key).await {
-                                            Ok(()) => (true, None, None),
-                                            Err(e) => (false, None, Some(e.to_string())),
-                                        }
-                                    }
-                                    crate::types::CacheCommand::Get { key } => {
-                                        let value = shard.get(key).await.map(|b| b.to_vec());
-                                        (true, value, None)
-                                    }
-                                    crate::types::CacheCommand::Clear => {
-                                        shard.clear().await;
-                                        (true, None, None)
-                                    }
-                                }
-                            } else {
-                                tracing::warn!(
-                                    node_id,
-                                    shard_id,
-                                    "Received ShardForwardedCommand for unknown shard"
-                                );
-                                (false, None, Some(format!("shard {} not found", shard_id)))
-                            }
-                        })
-                    });
-
-                    handler.set_shard_forward_handler(forward_handler);
-                    info!(
-                        node_id = config.node_id,
-                        "Shard forward command handler installed"
-                    );
-
-                    // 4. Set up handler for ShardForwardResponse messages
-                    let coord_for_response = coordinator.clone();
-                    let response_handler: ShardForwardResponseHandler = Arc::new(move |response| {
-                        coord_for_response
-                            .shard_forwarder()
-                            .handle_response(response);
-                    });
-                    handler.set_shard_forward_response_handler(response_handler);
-                    info!(
-                        node_id = config.node_id,
-                        "Shard forward response handler installed"
-                    );
-
-                    // 5. Set up handler for ShardCreationBroadcast messages (cluster-wide shard sync)
-                    let coord_for_broadcast = coordinator.clone();
-                    let broadcast_handler: ShardCreationBroadcastHandler = Arc::new(
-                        move |broadcast| {
-                            let coord = coord_for_broadcast.clone();
-                            let request_id = broadcast.request_id;
-                            Box::pin(async move {
-                                match coord.handle_shard_creation_broadcast(broadcast).await {
-                                    Ok(ack) => ack,
-                                    Err(e) => {
-                                        tracing::warn!(error = %e, "Failed to handle shard creation broadcast");
-                                        crate::network::rpc::ShardCreationAck {
-                                            request_id,
-                                            success: false,
-                                            local_epoch: 0,
-                                            error: Some(e.to_string()),
-                                        }
-                                    }
-                                }
-                            })
-                        },
-                    );
-                    handler.set_shard_creation_broadcast_handler(broadcast_handler);
-                    info!(
-                        node_id = config.node_id,
-                        "Shard creation broadcast handler installed"
-                    );
-
-                    // 5b. Set up handler for ShardRemovalBroadcast messages (cluster-wide shard removal sync)
-                    let coord_for_removal = coordinator.clone();
-                    let removal_handler: ShardRemovalBroadcastHandler = Arc::new(
-                        move |broadcast| {
-                            let coord = coord_for_removal.clone();
-                            let request_id = broadcast.request_id;
-                            Box::pin(async move {
-                                match coord.handle_shard_removal_broadcast(broadcast).await {
-                                    Ok(ack) => ack,
-                                    Err(e) => {
-                                        tracing::warn!(error = %e, "Failed to handle shard removal broadcast");
-                                        crate::network::rpc::ShardRemovalAck {
-                                            request_id,
-                                            success: false,
-                                            local_epoch: 0,
-                                            error: Some(e.to_string()),
-                                        }
-                                    }
-                                }
-                            })
-                        },
-                    );
-                    handler.set_shard_removal_broadcast_handler(removal_handler);
-                    info!(
-                        node_id = config.node_id,
-                        "Shard removal broadcast handler installed"
-                    );
-
-                    // 6. Set up handler for GetTopology messages (cluster state catch-up)
-                    let coord_for_topology = coordinator.clone();
-                    let topology_handler: GetTopologyHandler =
-                        Arc::new(move |request| coord_for_topology.handle_get_topology(request));
-                    handler.set_get_topology_handler(topology_handler);
-                    info!(node_id = config.node_id, "Get topology handler installed");
-
-                    // 7. Set up handler for GetShardInfo messages (dashboard cluster comparison)
-                    let coord_for_shard_info = coordinator.clone();
-                    let shard_info_handler: GetShardInfoHandler = Arc::new(move |request| {
-                        coord_for_shard_info.handle_get_shard_info(request)
-                    });
-                    handler.set_get_shard_info_handler(shard_info_handler);
-                    info!(node_id = config.node_id, "Get shard info handler installed");
-
-                    // 8. Set up handler for SlotScanRequest messages (cross-node slot migration)
-                    let coord_for_slot_scan = coordinator.clone();
-                    let slot_scan_handler: SlotScanHandler = Arc::new(move |request| {
-                        coord_for_slot_scan.handle_slot_scan_request(request)
-                    });
-                    handler.set_slot_scan_handler(slot_scan_handler);
-                    info!(node_id = config.node_id, "Slot scan handler installed");
-
-                    // 9. Set up handler for SlotScanResponse messages (routes to coordinator)
-                    let coord_for_slot_scan_response = coordinator.clone();
-                    let slot_scan_response_handler: SlotScanResponseHandler =
-                        Arc::new(move |response| {
-                            coord_for_slot_scan_response.handle_slot_scan_response(response)
-                        });
-                    handler.set_slot_scan_response_handler(slot_scan_response_handler);
-                    info!(
-                        node_id = config.node_id,
-                        "Slot scan response handler installed"
-                    );
-                }
-            }
-        }
-
-        info!(node_id = config.node_id, "Distributed cache started");
-
-        Ok(Self {
+        let cache = Self {
             router,
             storage,
             raft,
@@ -665,7 +385,86 @@ impl DistributedCache {
             pending_forwards,
             next_forward_id: AtomicU64::new(1),
             message_handler: handler,
-        })
+        };
+
+        // Set up shard message handlers if per-shard Raft is enabled and initialized.
+        // This enables ShardRaft message routing for replication.
+        cache.setup_shard_message_handler();
+
+        info!(node_id = cache.config.node_id, "Distributed cache started");
+
+        Ok(cache)
+    }
+
+    /// Initialize checkpoint manager and look for existing snapshots.
+    ///
+    /// Returns `(recovered_index, checkpoint_manager)` where `recovered_index`
+    /// contains snapshot info and checkpoint manager if a snapshot was found for recovery.
+    fn init_checkpoint(config: &CacheConfig, storage: &Arc<CacheStorage>) -> CheckpointInitResult {
+        use crate::checkpoint::CheckpointManager;
+
+        #[cfg(feature = "rocksdb-storage")]
+        let uses_persistent_storage = matches!(
+            config.raft.storage_type,
+            crate::config::RaftStorageType::RocksDb(_)
+        );
+        #[cfg(not(feature = "rocksdb-storage"))]
+        let uses_persistent_storage = false;
+
+        if config.checkpoint.enabled && uses_persistent_storage {
+            match CheckpointManager::new(config.checkpoint.clone(), storage.clone()) {
+                Ok(manager) => {
+                    let manager = Arc::new(manager);
+                    match manager.find_latest_snapshot() {
+                        Ok(Some(info)) => {
+                            info!(
+                                node_id = config.node_id,
+                                path = %info.path.display(),
+                                raft_index = info.raft_index,
+                                raft_term = info.raft_term,
+                                "Found existing snapshot for recovery"
+                            );
+                            (Some((info, manager.clone())), Some(manager))
+                        }
+                        Ok(None) => {
+                            debug!(node_id = config.node_id, "No existing snapshot found");
+                            (None, Some(manager))
+                        }
+                        Err(e) => {
+                            warn!(
+                                node_id = config.node_id,
+                                error = %e,
+                                "Failed to find snapshot"
+                            );
+                            (None, Some(manager))
+                        }
+                    }
+                }
+                Err(e) => {
+                    warn!(
+                        node_id = config.node_id,
+                        error = %e,
+                        "Failed to create checkpoint manager"
+                    );
+                    (None, None)
+                }
+            }
+        } else if config.checkpoint.enabled {
+            // Checkpointing enabled but using in-memory storage - create manager but don't recover
+            match CheckpointManager::new(config.checkpoint.clone(), storage.clone()) {
+                Ok(manager) => (None, Some(Arc::new(manager))),
+                Err(e) => {
+                    warn!(
+                        node_id = config.node_id,
+                        error = %e,
+                        "Failed to create checkpoint manager"
+                    );
+                    (None, None)
+                }
+            }
+        } else {
+            (None, None)
+        }
     }
 
     /// Run the memberlist event processing loop.
@@ -2409,397 +2208,379 @@ impl CacheMessageHandler {
     }
 }
 
+impl CacheMessageHandler {
+    /// Handle per-shard Raft messages, queuing if handler isn't set yet (startup race).
+    fn handle_shard_raft(&self, shard_msg: crate::network::rpc::ShardRaftMessage) {
+        if let Some(handler) = self.shard_handler.read().as_ref() {
+            if let Err(e) = handler(shard_msg) {
+                warn!(
+                    node_id = self.node_id,
+                    error = %e,
+                    "Failed to handle shard Raft message"
+                );
+            }
+        } else {
+            // Handler not set yet (startup race) - queue the message for later processing.
+            // Limit queue size to prevent memory issues. Raft will retry from sender side.
+            const MAX_PENDING_SHARD_MESSAGES: usize = 1000;
+            let mut pending = self.pending_shard_messages.lock();
+            if pending.len() < MAX_PENDING_SHARD_MESSAGES {
+                debug!(
+                    node_id = self.node_id,
+                    shard_id = shard_msg.shard_id,
+                    pending_count = pending.len() + 1,
+                    "Queuing shard Raft message (handler not yet set)"
+                );
+                pending.push(shard_msg);
+            } else {
+                warn!(
+                    node_id = self.node_id,
+                    shard_id = shard_msg.shard_id,
+                    "Dropping shard Raft message - pending queue full (handler not set)"
+                );
+            }
+        }
+    }
+
+    /// Handle shard forwarded commands with TTL checking and async response.
+    fn handle_shard_forwarded_command(&self, fwd_cmd: crate::network::rpc::ShardForwardedCommand) {
+        let request_id = fwd_cmd.request_id;
+        let origin_node_id = fwd_cmd.origin_node_id;
+        let ttl = fwd_cmd.ttl;
+
+        // TTL check to prevent infinite forwarding loops
+        if ttl == 0 {
+            warn!(
+                node_id = self.node_id,
+                request_id,
+                shard_id = fwd_cmd.shard_id,
+                origin = origin_node_id,
+                "ShardForwardedCommand TTL expired, rejecting to prevent infinite loop"
+            );
+            let transport = self.raft.transport().clone();
+            let response =
+                Message::ShardForwardResponse(crate::network::rpc::ShardForwardResponse::error(
+                    request_id,
+                    "TTL expired - forwarding loop detected",
+                ));
+            tokio::spawn(async move {
+                if let Err(e) = transport.send_message(origin_node_id, response).await {
+                    warn!(error = %e, "Failed to send TTL expired response");
+                }
+            });
+            return;
+        }
+
+        if let Some(handler) = self.shard_forward_handler.read().clone() {
+            let transport = self.raft.transport().clone();
+            let node_id = self.node_id;
+
+            debug!(
+                node_id,
+                request_id,
+                origin = origin_node_id,
+                shard_id = fwd_cmd.shard_id,
+                ttl,
+                "Handling ShardForwardedCommand"
+            );
+
+            tokio::spawn(async move {
+                let (success, value, error) = handler(fwd_cmd).await;
+
+                let response =
+                    Message::ShardForwardResponse(crate::network::rpc::ShardForwardResponse {
+                        request_id,
+                        success,
+                        error,
+                        value,
+                        leader_hint: None,
+                    });
+
+                if let Err(e) = transport.send_message(origin_node_id, response).await {
+                    warn!(
+                        node_id, request_id, origin = origin_node_id,
+                        error = %e, "Failed to send ShardForwardResponse"
+                    );
+                }
+            });
+        } else {
+            warn!(
+                node_id = self.node_id,
+                shard_id = fwd_cmd.shard_id,
+                request_id = fwd_cmd.request_id,
+                "Received ShardForwardedCommand but no handler is set"
+            );
+        }
+    }
+
+    /// Handle a shard creation broadcast by spawning an async task to process and ack.
+    fn handle_shard_creation_broadcast(
+        &self,
+        broadcast: crate::network::rpc::ShardCreationBroadcast,
+    ) {
+        if let Some(handler) = self.shard_creation_broadcast_handler.read().clone() {
+            let transport = self.raft.transport().clone();
+            let node_id = self.node_id;
+            let request_id = broadcast.request_id;
+            let origin = broadcast.originator_node;
+
+            tokio::spawn(async move {
+                let ack = handler(broadcast).await;
+                let response = Message::ShardCreationAck(ack);
+                if let Err(e) = transport.send_message(origin, response).await {
+                    warn!(
+                        node_id, request_id, origin,
+                        error = %e, "Failed to send ShardCreationAck"
+                    );
+                }
+            });
+        } else {
+            warn!(
+                node_id = self.node_id,
+                request_id = broadcast.request_id,
+                "Received ShardCreationBroadcast but no handler is set"
+            );
+        }
+    }
+
+    /// Handle a shard removal broadcast by spawning an async task to process and ack.
+    fn handle_shard_removal_broadcast(
+        &self,
+        broadcast: crate::network::rpc::ShardRemovalBroadcast,
+    ) {
+        if let Some(handler) = self.shard_removal_broadcast_handler.read().clone() {
+            let transport = self.raft.transport().clone();
+            let node_id = self.node_id;
+            let request_id = broadcast.request_id;
+            let origin = broadcast.originator_node;
+
+            tokio::spawn(async move {
+                let ack = handler(broadcast).await;
+                let response = Message::ShardRemovalAck(ack);
+                if let Err(e) = transport.send_message(origin, response).await {
+                    warn!(
+                        node_id, request_id, origin,
+                        error = %e, "Failed to send ShardRemovalAck"
+                    );
+                }
+            });
+        } else {
+            warn!(
+                node_id = self.node_id,
+                request_id = broadcast.request_id,
+                "Received ShardRemovalBroadcast but no handler is set"
+            );
+        }
+    }
+}
+
 impl MessageHandler for CacheMessageHandler {
     fn handle(&self, msg: Message) -> Option<Message> {
-        // Handle ForwardResponse separately - complete pending forwards
-        if let Message::ForwardResponse(ref response) = msg {
-            if let Some((_, (tx, _))) = self.pending_forwards.remove(&response.request_id) {
-                let result = if response.success {
-                    // Convert Option<Vec<u8>> to Option<Bytes>
-                    Ok(response.value.as_ref().map(|v| Bytes::from(v.clone())))
+        match msg {
+            Message::ForwardResponse(ref response) => {
+                if let Some((_, (tx, _))) = self.pending_forwards.remove(&response.request_id) {
+                    let result = if response.success {
+                        Ok(response.value.as_ref().map(|v| Bytes::from(v.clone())))
+                    } else {
+                        Err(Error::RemoteError(
+                            response
+                                .error
+                                .clone()
+                                .unwrap_or_else(|| "unknown error".to_string()),
+                        ))
+                    };
+                    debug!(
+                        node_id = self.node_id,
+                        request_id = response.request_id,
+                        success = response.success,
+                        has_value = response.value.is_some(),
+                        "FORWARD: Completing pending forward"
+                    );
+                    let _ = tx.send(result);
                 } else {
-                    Err(Error::RemoteError(
-                        response
-                            .error
-                            .clone()
-                            .unwrap_or_else(|| "unknown error".to_string()),
-                    ))
-                };
+                    warn!(
+                        node_id = self.node_id,
+                        request_id = response.request_id,
+                        "FORWARD: Received response for unknown request ID"
+                    );
+                }
+                None
+            }
+
+            Message::ShardRaft(shard_msg) => {
+                self.handle_shard_raft(shard_msg);
+                None
+            }
+
+            Message::ShardForwardedCommand(fwd_cmd) => {
+                self.handle_shard_forwarded_command(fwd_cmd);
+                None
+            }
+
+            Message::ShardForwardResponse(ref response) => {
                 debug!(
                     node_id = self.node_id,
                     request_id = response.request_id,
                     success = response.success,
-                    has_value = response.value.is_some(),
-                    "FORWARD: Completing pending forward"
+                    "Received ShardForwardResponse"
                 );
-                let _ = tx.send(result);
-            } else {
-                warn!(
-                    node_id = self.node_id,
-                    request_id = response.request_id,
-                    "FORWARD: Received response for unknown request ID"
-                );
-            }
-            return None;
-        }
-
-        // Handle per-shard Raft messages
-        if let Message::ShardRaft(shard_msg) = msg {
-            if let Some(handler) = self.shard_handler.read().as_ref() {
-                if let Err(e) = handler(shard_msg) {
-                    warn!(
-                        node_id = self.node_id,
-                        error = %e,
-                        "Failed to handle shard Raft message"
-                    );
-                }
-            } else {
-                // Handler not set yet (startup race) - queue the message for later processing.
-                // This typically only happens during the brief window between network server
-                // starting and coordinator initialization completing.
-                //
-                // Limit queue size to prevent memory issues. If handler is never set (e.g.,
-                // Multi-Raft disabled), messages will be dropped once queue is full.
-                // This is acceptable as Raft will retry from the sender side.
-                const MAX_PENDING_SHARD_MESSAGES: usize = 1000;
-                let mut pending = self.pending_shard_messages.lock();
-                if pending.len() < MAX_PENDING_SHARD_MESSAGES {
-                    debug!(
-                        node_id = self.node_id,
-                        shard_id = shard_msg.shard_id,
-                        pending_count = pending.len() + 1,
-                        "Queuing shard Raft message (handler not yet set)"
-                    );
-                    pending.push(shard_msg);
+                if let Some(handler) = self.shard_forward_response_handler.read().as_ref() {
+                    handler(response);
                 } else {
                     warn!(
                         node_id = self.node_id,
-                        shard_id = shard_msg.shard_id,
-                        "Dropping shard Raft message - pending queue full (handler not set)"
+                        request_id = response.request_id,
+                        "Received ShardForwardResponse but no handler is set"
                     );
                 }
-            }
-            return None;
-        }
-
-        // Handle shard forwarded commands (for per-shard Raft Phase 2)
-        if let Message::ShardForwardedCommand(fwd_cmd) = msg {
-            let request_id = fwd_cmd.request_id;
-            let origin_node_id = fwd_cmd.origin_node_id;
-            let ttl = fwd_cmd.ttl;
-
-            // TTL check to prevent infinite forwarding loops
-            if ttl == 0 {
-                warn!(
-                    node_id = self.node_id,
-                    request_id = request_id,
-                    shard_id = fwd_cmd.shard_id,
-                    origin = origin_node_id,
-                    "ShardForwardedCommand TTL expired, rejecting to prevent infinite loop"
-                );
-                let transport = self.raft.transport().clone();
-                let response = Message::ShardForwardResponse(
-                    crate::network::rpc::ShardForwardResponse::error(
-                        request_id,
-                        "TTL expired - forwarding loop detected",
-                    ),
-                );
-                tokio::spawn(async move {
-                    if let Err(e) = transport.send_message(origin_node_id, response).await {
-                        warn!(error = %e, "Failed to send TTL expired response");
-                    }
-                });
-                return None;
+                None
             }
 
-            if let Some(handler) = self.shard_forward_handler.read().clone() {
-                let transport = self.raft.transport().clone();
-                let node_id = self.node_id;
-
+            Message::ShardCreationBroadcast(broadcast) => {
                 debug!(
-                    node_id = node_id,
-                    request_id = request_id,
-                    origin = origin_node_id,
-                    shard_id = fwd_cmd.shard_id,
-                    ttl = ttl,
-                    "Handling ShardForwardedCommand"
-                );
-
-                // Spawn task to process the forwarded command and send response
-                tokio::spawn(async move {
-                    let (success, value, error) = handler(fwd_cmd).await;
-
-                    let response =
-                        Message::ShardForwardResponse(crate::network::rpc::ShardForwardResponse {
-                            request_id,
-                            success,
-                            error,
-                            value,
-                            leader_hint: None,
-                        });
-
-                    if let Err(e) = transport.send_message(origin_node_id, response).await {
-                        warn!(
-                            node_id = node_id,
-                            request_id = request_id,
-                            origin = origin_node_id,
-                            error = %e,
-                            "Failed to send ShardForwardResponse"
-                        );
-                    }
-                });
-            } else {
-                warn!(
                     node_id = self.node_id,
-                    shard_id = fwd_cmd.shard_id,
-                    request_id = fwd_cmd.request_id,
-                    "Received ShardForwardedCommand but no handler is set"
+                    request_id = broadcast.request_id,
+                    shard_id = broadcast.shard_id,
+                    originator = broadcast.originator_node,
+                    "Received ShardCreationBroadcast"
                 );
+                self.handle_shard_creation_broadcast(broadcast);
+                None
             }
-            return None;
-        }
 
-        // Handle shard forward responses (complete pending forwards)
-        if let Message::ShardForwardResponse(ref response) = msg {
-            debug!(
-                node_id = self.node_id,
-                request_id = response.request_id,
-                success = response.success,
-                "Received ShardForwardResponse"
-            );
+            Message::ShardCreationAck(ref ack) => {
+                debug!(
+                    node_id = self.node_id,
+                    request_id = ack.request_id,
+                    success = ack.success,
+                    peer_epoch = ack.local_epoch,
+                    "Received ShardCreationAck"
+                );
+                None
+            }
 
-            if let Some(handler) = self.shard_forward_response_handler.read().as_ref() {
-                handler(response);
-            } else {
-                warn!(
+            Message::ShardRemovalBroadcast(broadcast) => {
+                debug!(
+                    node_id = self.node_id,
+                    request_id = broadcast.request_id,
+                    shard_id = broadcast.shard_id,
+                    originator = broadcast.originator_node,
+                    "Received ShardRemovalBroadcast"
+                );
+                self.handle_shard_removal_broadcast(broadcast);
+                None
+            }
+
+            Message::ShardRemovalAck(ref ack) => {
+                debug!(
+                    node_id = self.node_id,
+                    request_id = ack.request_id,
+                    success = ack.success,
+                    peer_epoch = ack.local_epoch,
+                    "Received ShardRemovalAck"
+                );
+                None
+            }
+
+            Message::GetTopology(request) => {
+                debug!(
+                    node_id = self.node_id,
+                    request_id = request.request_id,
+                    requesting_node = request.requesting_node,
+                    "Received GetTopology request"
+                );
+                if let Some(handler) = self.get_topology_handler.read().clone() {
+                    Some(Message::TopologyResponse(handler(request)))
+                } else {
+                    warn!(
+                        node_id = self.node_id,
+                        "Received GetTopology but no handler is set"
+                    );
+                    None
+                }
+            }
+
+            Message::TopologyResponse(ref response) => {
+                debug!(
                     node_id = self.node_id,
                     request_id = response.request_id,
-                    "Received ShardForwardResponse but no handler is set"
+                    epoch = response.current_epoch,
+                    shards = response.shard_ids.len(),
+                    "Received TopologyResponse"
                 );
+                None
             }
-            return None;
-        }
 
-        // Handle shard creation broadcasts
-        if let Message::ShardCreationBroadcast(broadcast) = msg {
-            debug!(
-                node_id = self.node_id,
-                request_id = broadcast.request_id,
-                shard_id = broadcast.shard_id,
-                originator = broadcast.originator_node,
-                "Received ShardCreationBroadcast"
-            );
-
-            if let Some(handler) = self.shard_creation_broadcast_handler.read().clone() {
-                let transport = self.raft.transport().clone();
-                let node_id = self.node_id;
-                let request_id = broadcast.request_id;
-                let origin = broadcast.originator_node;
-
-                // Spawn task to process broadcast and send response
-                tokio::spawn(async move {
-                    let ack = handler(broadcast).await;
-                    let response = Message::ShardCreationAck(ack);
-
-                    if let Err(e) = transport.send_message(origin, response).await {
-                        warn!(
-                            node_id = node_id,
-                            request_id = request_id,
-                            origin = origin,
-                            error = %e,
-                            "Failed to send ShardCreationAck"
-                        );
-                    }
-                });
-            } else {
-                warn!(
+            Message::GetShardInfo(request) => {
+                debug!(
                     node_id = self.node_id,
-                    request_id = broadcast.request_id,
-                    "Received ShardCreationBroadcast but no handler is set"
+                    request_id = request.request_id,
+                    requesting_node = request.requesting_node,
+                    "Received GetShardInfo request"
                 );
+                if let Some(handler) = self.get_shard_info_handler.read().clone() {
+                    Some(Message::ShardInfoResponse(handler(request)))
+                } else {
+                    warn!(
+                        node_id = self.node_id,
+                        "Received GetShardInfo but no handler is set"
+                    );
+                    None
+                }
             }
-            return None;
-        }
 
-        // Handle shard creation acks (just log for now - fire-and-forget broadcast)
-        if let Message::ShardCreationAck(ref ack) = msg {
-            debug!(
-                node_id = self.node_id,
-                request_id = ack.request_id,
-                success = ack.success,
-                peer_epoch = ack.local_epoch,
-                "Received ShardCreationAck"
-            );
-            // Acks are currently fire-and-forget, no action needed
-            return None;
-        }
-
-        // Handle shard removal broadcasts
-        if let Message::ShardRemovalBroadcast(broadcast) = msg {
-            debug!(
-                node_id = self.node_id,
-                request_id = broadcast.request_id,
-                shard_id = broadcast.shard_id,
-                originator = broadcast.originator_node,
-                "Received ShardRemovalBroadcast"
-            );
-
-            if let Some(handler) = self.shard_removal_broadcast_handler.read().clone() {
-                let transport = self.raft.transport().clone();
-                let node_id = self.node_id;
-                let request_id = broadcast.request_id;
-                let origin = broadcast.originator_node;
-
-                // Spawn task to process broadcast and send response
-                tokio::spawn(async move {
-                    let ack = handler(broadcast).await;
-                    let response = Message::ShardRemovalAck(ack);
-
-                    if let Err(e) = transport.send_message(origin, response).await {
-                        warn!(
-                            node_id = node_id,
-                            request_id = request_id,
-                            origin = origin,
-                            error = %e,
-                            "Failed to send ShardRemovalAck"
-                        );
-                    }
-                });
-            } else {
-                warn!(
+            Message::ShardInfoResponse(ref response) => {
+                debug!(
                     node_id = self.node_id,
-                    request_id = broadcast.request_id,
-                    "Received ShardRemovalBroadcast but no handler is set"
+                    request_id = response.request_id,
+                    responding_node = response.responding_node,
+                    shards = response.shards.len(),
+                    "Received ShardInfoResponse"
                 );
+                None
             }
-            return None;
-        }
 
-        // Handle shard removal acks (just log for now - fire-and-forget broadcast)
-        if let Message::ShardRemovalAck(ref ack) = msg {
-            debug!(
-                node_id = self.node_id,
-                request_id = ack.request_id,
-                success = ack.success,
-                peer_epoch = ack.local_epoch,
-                "Received ShardRemovalAck"
-            );
-            // Acks are currently fire-and-forget, no action needed
-            return None;
-        }
-
-        // Handle topology requests
-        if let Message::GetTopology(request) = msg {
-            debug!(
-                node_id = self.node_id,
-                request_id = request.request_id,
-                requesting_node = request.requesting_node,
-                "Received GetTopology request"
-            );
-
-            if let Some(handler) = self.get_topology_handler.read().clone() {
-                let response = handler(request);
-                return Some(Message::TopologyResponse(response));
-            } else {
-                warn!(
+            Message::SlotScanRequest(request) => {
+                debug!(
                     node_id = self.node_id,
-                    "Received GetTopology but no handler is set"
+                    request_id = request.request_id,
+                    shard_id = request.shard_id,
+                    slot_id = request.slot_id,
+                    "Received SlotScanRequest"
                 );
+                if let Some(handler) = self.slot_scan_handler.read().clone() {
+                    Some(Message::SlotScanResponse(handler(request)))
+                } else {
+                    warn!(
+                        node_id = self.node_id,
+                        "Received SlotScanRequest but no handler is set"
+                    );
+                    None
+                }
             }
-            return None;
-        }
 
-        // Handle topology responses (just log for now - handled by caller)
-        if let Message::TopologyResponse(ref response) = msg {
-            debug!(
-                node_id = self.node_id,
-                request_id = response.request_id,
-                epoch = response.current_epoch,
-                shards = response.shard_ids.len(),
-                "Received TopologyResponse"
-            );
-            // Responses are handled by the requesting side via send_raw_message_with_response
-            return None;
-        }
-
-        // Handle shard info requests (for dashboard cluster comparison)
-        if let Message::GetShardInfo(request) = msg {
-            debug!(
-                node_id = self.node_id,
-                request_id = request.request_id,
-                requesting_node = request.requesting_node,
-                "Received GetShardInfo request"
-            );
-
-            if let Some(handler) = self.get_shard_info_handler.read().clone() {
-                let response = handler(request);
-                return Some(Message::ShardInfoResponse(response));
-            } else {
-                warn!(
+            Message::SlotScanResponse(response) => {
+                debug!(
                     node_id = self.node_id,
-                    "Received GetShardInfo but no handler is set"
+                    request_id = response.request_id,
+                    success = response.success,
+                    keys = response.keys.len(),
+                    "Received SlotScanResponse"
                 );
+                if let Some(handler) = self.slot_scan_response_handler.read().clone() {
+                    handler(response);
+                } else {
+                    warn!(
+                        node_id = self.node_id,
+                        "Received SlotScanResponse but no handler is set"
+                    );
+                }
+                None
             }
-            return None;
+
+            // All other messages (Raft, Client, Ping, Migration, etc.) go to RaftNode
+            other => self.raft.handle_message(other),
         }
-
-        // Handle shard info responses (just log - handled by caller)
-        if let Message::ShardInfoResponse(ref response) = msg {
-            debug!(
-                node_id = self.node_id,
-                request_id = response.request_id,
-                responding_node = response.responding_node,
-                shards = response.shards.len(),
-                "Received ShardInfoResponse"
-            );
-            return None;
-        }
-
-        // Handle slot scan requests (for cross-node slot migration)
-        if let Message::SlotScanRequest(request) = msg {
-            debug!(
-                node_id = self.node_id,
-                request_id = request.request_id,
-                shard_id = request.shard_id,
-                slot_id = request.slot_id,
-                "Received SlotScanRequest"
-            );
-
-            if let Some(handler) = self.slot_scan_handler.read().clone() {
-                let response = handler(request);
-                return Some(Message::SlotScanResponse(response));
-            } else {
-                warn!(
-                    node_id = self.node_id,
-                    "Received SlotScanRequest but no handler is set"
-                );
-            }
-            return None;
-        }
-
-        // Handle slot scan responses (routed to coordinator)
-        if let Message::SlotScanResponse(response) = msg {
-            debug!(
-                node_id = self.node_id,
-                request_id = response.request_id,
-                success = response.success,
-                keys = response.keys.len(),
-                "Received SlotScanResponse"
-            );
-
-            if let Some(handler) = self.slot_scan_response_handler.read().clone() {
-                handler(response);
-            } else {
-                warn!(
-                    node_id = self.node_id,
-                    "Received SlotScanResponse but no handler is set"
-                );
-            }
-            return None;
-        }
-
-        // All other messages go to RaftNode
-        self.raft.handle_message(msg)
     }
 }
 

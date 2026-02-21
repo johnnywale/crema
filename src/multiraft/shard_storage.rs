@@ -113,7 +113,7 @@ pub async fn create_dir_all_durable_async(path: impl AsRef<Path>) -> std::io::Re
     let path = path.as_ref().to_path_buf();
     tokio::task::spawn_blocking(move || create_dir_all_durable(&path))
         .await
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?
+        .map_err(std::io::Error::other)?
 }
 
 impl ShardStorageConfig {
@@ -370,11 +370,12 @@ impl ShardStorageManager {
     ///
     /// This is the preferred method as it uses non-blocking I/O.
     pub async fn register_shard_async(&self, config: &ShardConfig) {
-        let mut states = self.shard_states.write();
-        states
-            .entry(config.shard_id)
-            .or_insert_with(|| Arc::new(ShardStorageState::new()));
-        drop(states); // Release lock before async operation
+        {
+            let mut states = self.shard_states.write();
+            states
+                .entry(config.shard_id)
+                .or_insert_with(|| Arc::new(ShardStorageState::new()));
+        }
 
         // Ensure shard snapshot directory exists using async I/O
         let shard_dir = self.shard_snapshots_dir(config.shard_id);

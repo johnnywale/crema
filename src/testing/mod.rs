@@ -212,7 +212,15 @@ impl PortAllocator {
     }
 }
 
-pub static PORT_ALLOCATOR: Lazy<PortAllocator> = Lazy::new(|| PortAllocator::new(17000));
+pub static PORT_ALLOCATOR: Lazy<PortAllocator> = Lazy::new(|| {
+    // Offset the starting port by the process ID to avoid cross-process collisions.
+    // nextest runs each test in a separate process, so each gets its own PORT_ALLOCATOR.
+    // Without this offset, two tests starting simultaneously would both try port 17000.
+    let pid = std::process::id();
+    let offset = (pid % 10000) as u16; // Spread across a 10k port range
+    let start = 17000 + offset;
+    PortAllocator::new(start)
+});
 
 /// Convenience function to allocate a single available port.
 pub fn allocate_port() -> u16 {
@@ -685,10 +693,12 @@ impl MigrationTestHarness {
                 .unwrap_or(false)
         })
         .await
-        .expect(&format!(
-            "Shard {} should elect a leader within {:?}",
-            shard_id, timeout
-        ));
+        .unwrap_or_else(|_| {
+            panic!(
+                "Shard {} should elect a leader within {:?}",
+                shard_id, timeout
+            )
+        });
     }
 
     /// Start slot migration on all caches (idempotent — safe to call multiple times).
@@ -871,10 +881,7 @@ impl MigrationTestHarness {
             || async { self.migration_diagnostics() },
         )
         .await
-        .expect(&format!(
-            "All slots should finish migrating off shard {}",
-            shard_id
-        ));
+        .unwrap_or_else(|_| panic!("All slots should finish migrating off shard {}", shard_id));
     }
 
     /// Wait for most migrations to complete (completed>0, active<=max_active).
@@ -937,7 +944,7 @@ impl MigrationTestHarness {
         let remove_result = self.caches[0]
             .remove_shard(shard_id)
             .await
-            .expect(&format!("Remove shard {} should succeed", shard_id));
+            .unwrap_or_else(|_| panic!("Remove shard {} should succeed", shard_id));
         self.wait_for_slots_off_shard(shard_id, Duration::from_secs(45))
             .await;
         self.wait_for_migration_complete(Duration::from_secs(30))
@@ -1086,6 +1093,7 @@ struct StuckSlotDiagnostic {
 }
 
 /// System-wide migration context for diagnostic reports.
+#[derive(Default)]
 struct MigrationSystemContext {
     migrator_running: Option<bool>,
     active_migrations: usize,
@@ -1093,19 +1101,6 @@ struct MigrationSystemContext {
     failed_migrations: usize,
     by_phase: HashMap<String, usize>,
     entries_per_shard: Vec<(u32, u64)>,
-}
-
-impl Default for MigrationSystemContext {
-    fn default() -> Self {
-        Self {
-            migrator_running: None,
-            active_migrations: 0,
-            completed_migrations: 0,
-            failed_migrations: 0,
-            by_phase: HashMap::new(),
-            entries_per_shard: Vec::new(),
-        }
-    }
 }
 
 /// Reusable post-migration validation for slot migration tests.

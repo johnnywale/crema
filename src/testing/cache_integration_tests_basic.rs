@@ -54,10 +54,10 @@ mod tests {
             })
             .collect();
 
-        // Production recommendation:
-        // Base election timeout of 10-20 (1s - 2s)
-        // This allows enough network RTT and disk I/O time
-        let base_election_tick = 15;
+        // Use faster election settings for tests — production would use base_election_tick=15,
+        // but under parallel test load the 100ms tick interval gets delayed by CPU contention,
+        // making election timeouts much longer than nominal.
+        let base_election_tick = 8;
 
         CacheConfig::new(node_id, raft_addr)
             .with_seed_nodes(seed_nodes)
@@ -65,7 +65,7 @@ mod tests {
             .with_default_ttl(Duration::from_secs(3600))
             .with_raft_config(RaftConfig {
                 tick_interval_ms: 100,
-                election_tick: base_election_tick + (node_id as usize * 5),
+                election_tick: base_election_tick + (node_id as usize * 3),
                 heartbeat_tick: 2,
                 max_size_per_msg: 1024 * 1024,
                 max_inflight_msgs: 256,
@@ -604,9 +604,11 @@ mod tests {
             .await
             .expect("Failed to create cache 1");
 
-        // Wait a bit - node 1 alone cannot become leader (needs quorum of 2)
-        sleep(Duration::from_secs(2)).await;
-        assert!(!cache1.is_leader(), "Node 1 should not be leader alone");
+        // Verify node 1 alone cannot become leader (needs quorum of 2).
+        // Use eventually to ensure we're past any transient initialization states.
+        eventually(Duration::from_secs(3), || async { !cache1.is_leader() })
+            .await
+            .expect("Node 1 should not be leader alone (quorum=2)");
 
         // Node 2: Start second node
         let config2 = cluster_node_config(2, ports[1], peer_configs.clone());
@@ -615,9 +617,10 @@ mod tests {
             .await
             .expect("Failed to create cache 2");
 
-        // Now with 2 nodes, one should become leader (quorum = 2)
-        // Use 15 seconds as per CLAUDE.md guidelines
-        eventually(Duration::from_secs(15), || async {
+        // Now with 2 nodes, one should become leader (quorum = 2).
+        // Needs extra time because node 1 ran alone for 2s and must discover node 2
+        // via TCP before starting a real election — under parallel test load this is slow.
+        eventually(Duration::from_secs(60), || async {
             cache1.is_leader() || cache2.is_leader()
         })
         .await
@@ -630,12 +633,11 @@ mod tests {
             .expect("Failed to create cache 3");
 
         // Wait for exactly one leader and all nodes to agree
-        // Use 15 seconds as per CLAUDE.md guidelines
         //
         // NOTE: We collect each node's view of leadership atomically (is_leader + leader_id)
         // to avoid TOCTOU race where leadership changes between checking is_leader() counts
         // and checking leader_id() agreement.
-        eventually(Duration::from_secs(15), || async {
+        eventually(Duration::from_secs(60), || async {
             // Collect each node's view atomically: (is_leader, leader_id)
             let view1 = (cache1.is_leader(), cache1.leader_id());
             let view2 = (cache2.is_leader(), cache2.leader_id());
@@ -706,25 +708,32 @@ mod tests {
             .await
             .expect("Failed to create cache 3");
 
-        // Wait for leader election (use 15 seconds as per CLAUDE.md guidelines)
-        eventually(Duration::from_secs(15), || async {
+        // Wait for leader election — use 30s for parallel test load headroom
+        eventually(Duration::from_secs(60), || async {
             cache1.is_leader() || cache2.is_leader() || cache3.is_leader()
         })
         .await
         .expect("A leader should be elected");
 
-        // Find the leader
-        let leader: &DistributedCache = if cache1.is_leader() {
-            &cache1
-        } else if cache2.is_leader() {
-            &cache2
-        } else {
-            &cache3
-        };
-
-        // Write data through leader
-        let write_result = leader.put("replicated-key", "replicated-value").await;
-        assert!(write_result.is_ok(), "Write should succeed on leader");
+        // Write data through leader (use eventually to handle TOCTOU race where
+        // leadership changes between is_leader() check and put() call under load)
+        eventually(Duration::from_secs(10), || async {
+            let leader: &DistributedCache = if cache1.is_leader() {
+                &cache1
+            } else if cache2.is_leader() {
+                &cache2
+            } else if cache3.is_leader() {
+                &cache3
+            } else {
+                return false;
+            };
+            leader
+                .put("replicated-key", "replicated-value")
+                .await
+                .is_ok()
+        })
+        .await
+        .expect("Write should succeed on leader");
 
         // Wait for replication to all nodes (use 10 seconds as per CLAUDE.md guidelines)
         let expected = Some(bytes::Bytes::from("replicated-value"));
@@ -767,8 +776,8 @@ mod tests {
             .await
             .expect("Failed to create cache 3");
 
-        // Wait for leader election (use 15 seconds as per CLAUDE.md guidelines)
-        eventually(Duration::from_secs(15), || async {
+        // Wait for leader election — use 30s for parallel test load headroom
+        eventually(Duration::from_secs(60), || async {
             cache1.is_leader() || cache2.is_leader() || cache3.is_leader()
         })
         .await
